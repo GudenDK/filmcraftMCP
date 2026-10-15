@@ -15,11 +15,13 @@ use http_body_util::{BodyExt, Full, Limited};
 use hyper::body::Incoming;
 use rmcp::ServerHandler as _;
 use rmcp::model::ProtocolVersion;
+use rmcp::transport::streamable_http_server::SessionManager as _;
 use rmcp::transport::streamable_http_server::session::local::LocalSessionManager;
 use serde_json::{Value, json};
 
 use super::limits::{AuthFailures, Log};
-use super::{HttpBody, MAX_BODY, MAX_SESSIONS, MCP_PATH, Mcp};
+use super::sessions::{Duplicate, Sessions, hold};
+use super::{HttpBody, MAX_BODY, MCP_PATH, Mcp};
 use crate::FilmcraftMcp;
 
 /// Request headers a listed browser origin may send (answer to its CORS preflight).
@@ -35,7 +37,10 @@ pub(super) struct Gate {
     /// For `get_tool` (the tool router), to answer unknown `tools/call` names.
     pub(super) tools: FilmcraftMcp,
     pub(super) mcp: Mcp,
-    pub(super) sessions: Arc<LocalSessionManager>,
+    /// rmcp's sessions, to close the ones [`Self::sessions`] retires.
+    pub(super) rmcp_sessions: Arc<LocalSessionManager>,
+    /// The sessions' traffic (clients before 2026-07-28, when `legacy_session_mode`).
+    pub(super) sessions: Arc<Sessions>,
     pub(super) legacy_session_mode: bool,
     pub(super) body_timeout: Duration,
     pub(super) auth: AuthFailures,
@@ -95,15 +100,33 @@ impl Gate {
         self.check_token(peer, req.headers())?;
         self.check_host(&req)?;
         self.check_origin(req.headers())?;
-        if req.method() != Method::POST {
-            return Ok(self.mcp.handle(req).await); // GET = SSE stream, DELETE = end the session, others 405
+        let session = session_id(req.headers());
+        match *req.method() {
+            Method::POST => {}
+            // a session's SSE stream: in flight while it is open
+            Method::GET => {
+                let flight = session.and_then(|id| self.sessions.begin(&id, None).ok().flatten());
+                let r = self.mcp.handle(req).await;
+                return Ok(match flight {
+                    Some(f) => hold(r, f),
+                    None => r,
+                });
+            }
+            Method::DELETE => {
+                let r = self.mcp.handle(req).await;
+                if let Some(id) = session.filter(|_| r.status().is_success()) {
+                    self.sessions.ended(&id);
+                }
+                return Ok(r);
+            }
+            _ => return Ok(self.mcp.handle(req).await), // 405
         }
         check_accept_and_type(req.headers())?;
-        self.post(req).await
+        self.post(peer, req, session).await
     }
 
     /// A POST that passed the header checks: read and parse its body, then hand it to rmcp.
-    async fn post(&self, req: Request<Incoming>) -> Result<Response<HttpBody>, Refusal> {
+    async fn post(&self, peer: SocketAddr, req: Request<Incoming>, session: Option<String>) -> Result<Response<HttpBody>, Refusal> {
         let (parts, body) = req.into_parts();
         let bytes = match tokio::time::timeout(self.body_timeout, Limited::new(body, MAX_BODY).collect()).await {
             Ok(Ok(c)) => c.to_bytes(),
@@ -118,19 +141,7 @@ impl Gate {
             Err(e) => return Ok(jsonrpc_error(StatusCode::BAD_REQUEST, Value::Null, -32700, format!("parse error: {e}"))),
         };
         let method = msg.get("method").and_then(Value::as_str);
-        if self.legacy_session_mode
-            && method == Some("initialize")
-            && !parts.headers.contains_key("mcp-session-id")
-            && self.sessions.sessions.read().await.len() >= MAX_SESSIONS
-        {
-            let id = msg.get("id").cloned().unwrap_or(Value::Null);
-            return Ok(jsonrpc_error(
-                StatusCode::SERVICE_UNAVAILABLE,
-                id,
-                -32000,
-                format!("too many MCP sessions ({MAX_SESSIONS}); end unused ones with DELETE"),
-            ));
-        }
+        let request_id = msg.get("id").filter(|id| !id.is_null() && method.is_some());
         // rmcp caches one schema lookup per distinct tools/call name, without bound, for messages
         // declaring MCP-Protocol-Version >= 2026-07-28 (SEP-2243 header checks; the same lexical
         // comparison and header as rmcp): only known tool names may reach it. A request gets
@@ -140,13 +151,55 @@ impl Gate {
         if checks_headers && method == Some("tools/call") {
             let name = msg.pointer("/params/name").and_then(Value::as_str).unwrap_or_default();
             if self.tools.get_tool(name).is_none() {
-                return Ok(match msg.get("id").filter(|id| !id.is_null()) {
+                return Ok(match request_id {
                     Some(id) => jsonrpc_error(StatusCode::OK, id.clone(), -32602, "tool not found".into()),
                     None => accepted(),
                 });
             }
         }
-        Ok(self.mcp.handle(Request::from_parts(parts, Full::new(bytes))).await)
+        // Sessions: an `initialize` without one may create one (room is made, or 503); a message
+        // in one counts as its use, and a request as in flight until its response ends.
+        let (mut reservation, mut flight) = (None, None);
+        if self.legacy_session_mode {
+            match (&session, method) {
+                (None, Some("initialize")) => match self.sessions.reserve() {
+                    Some((r, evict)) => {
+                        if let Some(old) = evict {
+                            let _ = self.rmcp_sessions.close_session(&old.as_str().into()).await;
+                            self.log.line(format_args!("closed the least recently used idle MCP session to make room for a new one"));
+                        }
+                        reservation = Some(r);
+                    }
+                    None => {
+                        self.log.event(peer.ip(), "sessions full", format_args!("refused an MCP session to {peer}: every session has a call in flight"));
+                        let id = request_id.cloned().unwrap_or(Value::Null);
+                        let mut r =
+                            jsonrpc_error(StatusCode::SERVICE_UNAVAILABLE, id, -32000, "too many MCP sessions with calls in flight; try again later".into());
+                        r.headers_mut().insert(header::RETRY_AFTER, HeaderValue::from_static("5"));
+                        return Ok(r);
+                    }
+                },
+                (Some(id), _) => match self.sessions.begin(id, request_id) {
+                    Ok(f) => flight = f,
+                    Err(Duplicate) => {
+                        let shown: String = request_id.map(Value::to_string).unwrap_or_default().chars().take(64).collect();
+                        let message = format!("Invalid Request: request id {shown} is already in flight in this session");
+                        return Ok(jsonrpc_error(StatusCode::BAD_REQUEST, request_id.cloned().unwrap_or(Value::Null), -32600, message));
+                    }
+                },
+                _ => {}
+            }
+        }
+        let r = self.mcp.handle(Request::from_parts(parts, Full::new(bytes))).await;
+        if let Some(reserved) = reservation
+            && let Some(id) = session_id(r.headers())
+        {
+            flight = Some(self.sessions.created(reserved, &id));
+        }
+        Ok(match flight {
+            Some(f) => hold(r, f),
+            None => r,
+        })
     }
 
     /// The answer to a refused request; logged (at most one line per peer and reason every few
@@ -225,6 +278,11 @@ impl Gate {
     fn origin_listed(&self, v: &HeaderValue) -> bool {
         v.to_str().ok().and_then(normalize_origin).is_some_and(|o| self.origins.contains(&o))
     }
+}
+
+/// The `Mcp-Session-Id` header.
+fn session_id(headers: &HeaderMap) -> Option<String> {
+    headers.get("mcp-session-id").and_then(|v| v.to_str().ok()).map(str::to_string)
 }
 
 /// rmcp's POST checks on `Accept` and `Content-Type`, with its wording.

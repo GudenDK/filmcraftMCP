@@ -723,33 +723,116 @@ async fn failed_authentications_get_a_peer_refused_for_a_while() {
     assert!(!l.contains(token), "{l}");
 }
 
-/// Sessions are capped: an `initialize` past the cap gets 503 until one ends.
+fn ping(id: u64) -> Value {
+    json!({"jsonrpc":"2.0","id":id,"method":"ping"})
+}
+
+/// A session's GET stream (server-to-client messages), held open until dropped.
+async fn open_stream(addr: SocketAddr, sid: &str) -> Reply {
+    let r = send(addr, "GET", &[("Accept", "text/event-stream"), ("Mcp-Session-Id", sid), ("MCP-Protocol-Version", "2025-06-18")], "").await;
+    assert_eq!(r.status, 200);
+    r
+}
+
+/// Sessions are capped (256; 3 here). A client that left without DELETE no longer holds a place
+/// for good: at the cap the least recently used idle session is closed for a new client, and only
+/// when every session has something in flight does `initialize` get 503.
 #[tokio::test(flavor = "multi_thread")]
-async fn sessions_are_capped() {
-    let srv = Server::start(Session::default(), HttpOptions::default()).await;
+async fn sessions_are_capped_and_idle_ones_make_room() {
+    let (log, lines) = log_capture();
+    let srv = Server::start_limited(demo(), HttpOptions { log, ..HttpOptions::default() }, Limits { sessions: 3, ..Limits::default() }).await;
     let initialize = json!({"jsonrpc":"2.0","id":0,"method":"initialize","params":{"protocolVersion":"2025-06-18","capabilities":{},"clientInfo":{"name":"t","version":"1"}}});
-    let mut first = None;
-    for _ in 0..MAX_SESSIONS {
-        let mut r = post(srv.addr, None, &[], &initialize).await;
-        assert_eq!(r.status, 200);
-        first.get_or_insert_with(|| r.header("mcp-session-id").unwrap().to_string());
-        r.reply().await;
+    let mut ids = Vec::new();
+    for _ in 0..3 {
+        ids.push(init(srv.addr, &[]).await.0);
+        tokio::time::sleep(Duration::from_millis(5)).await;
+    }
+    // full: the oldest idle session (ids[0]) makes room; its client must initialize again
+    let (d, _) = init(srv.addr, &[]).await;
+    assert_eq!(post(srv.addr, Some(&ids[0]), &[], &ping(1)).await.status, 404);
+    // a stream open on every session: none can make room
+    let mut streams = Vec::new();
+    for sid in [&ids[1], &ids[2], &d] {
+        streams.push(open_stream(srv.addr, sid).await);
     }
     let mut r = post(srv.addr, None, &[], &initialize).await;
-    assert_eq!(r.status, 503);
+    assert_eq!((r.status, r.header("retry-after")), (503, Some("5")));
     assert_eq!(r.next().await.unwrap()["error"]["code"], -32000);
-    let first = first.unwrap();
-    assert_eq!(send(srv.addr, "DELETE", &[("Mcp-Session-Id", &first)], "").await.status, 202);
-    let mut ok = false;
-    for _ in 0..50 {
-        // the session is removed once its worker has stopped
-        if post(srv.addr, None, &[], &initialize).await.status == 200 {
-            ok = true;
+    // ids[1]'s stream ends: it is idle again, and makes room
+    drop(streams.remove(0));
+    let mut made_room = false;
+    for _ in 0..100 {
+        let mut r = post(srv.addr, None, &[], &initialize).await;
+        if r.status == 200 {
+            r.reply().await;
+            made_room = true;
             break;
         }
         tokio::time::sleep(Duration::from_millis(20)).await;
     }
-    assert!(ok, "a session frees a slot when it ends");
+    assert!(made_room, "a session whose stream ended makes room");
+    assert_eq!(post(srv.addr, Some(&ids[1]), &[], &ping(2)).await.status, 404);
+    assert_eq!(post(srv.addr, Some(&ids[2]), &[], &ping(3)).await.status, 200, "busy sessions are kept");
+    // DELETE ends a session
+    assert_eq!(send(srv.addr, "DELETE", &[("Mcp-Session-Id", &d)], "").await.status, 202);
+    assert_eq!(post(srv.addr, Some(&d), &[], &ping(4)).await.status, 404);
+    let l = lines.lock().unwrap().join("\n");
+    assert!(l.contains("closed the least recently used idle MCP session"), "{l}");
+    assert!(l.contains("every session has a call in flight"), "{l}");
+}
+
+/// A session nobody uses (a client that went away without DELETE) is closed after
+/// `session_idle`; a session with something in flight (here its GET stream) is kept.
+#[tokio::test(flavor = "multi_thread")]
+async fn idle_sessions_are_closed_but_busy_ones_kept() {
+    let (log, lines) = log_capture();
+    let opts = HttpOptions { session_idle: Some(Duration::from_millis(400)), log, ..HttpOptions::default() };
+    let srv = Server::start_limited(demo(), opts, Limits { reap_every: Duration::from_millis(50), ..Limits::default() }).await;
+    let (idle, _) = init(srv.addr, &[]).await;
+    let (busy, _) = init(srv.addr, &[]).await;
+    let stream = open_stream(srv.addr, &busy).await;
+    tokio::time::sleep(Duration::from_millis(1000)).await;
+    assert_eq!(post(srv.addr, Some(&idle), &[], &ping(1)).await.status, 404, "the idle session was closed");
+    assert_eq!(post(srv.addr, Some(&busy), &[], &ping(2)).await.status, 200, "the one with a stream open was kept");
+    drop(stream);
+    tokio::time::sleep(Duration::from_millis(1000)).await;
+    assert_eq!(post(srv.addr, Some(&busy), &[], &ping(3)).await.status, 404, "and closed once idle");
+    assert!(lines.lock().unwrap().iter().any(|l| l.contains("MCP session(s) unused for")), "{:?}", lines.lock().unwrap());
+}
+
+/// A call that sends nothing for far longer than `session_idle` (an export without a
+/// `progressToken`) is not cut off: rmcp's own idle timeout is off, and the reaper skips sessions
+/// with a call in flight. Meanwhile its request id cannot be reused in the session (-32600, which
+/// used to leave the first call's stream open forever); other ids can, and it is free again after.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_long_quiet_call_outlives_the_idle_timeout() {
+    let dir = std::env::temp_dir().join(format!("filmcraft-mcp-http-quiet-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let out = dir.join("quiet.mp4");
+    let idle = Duration::from_millis(200);
+    let opts = HttpOptions { session_idle: Some(idle), ..HttpOptions::default() };
+    let srv = Server::start_limited(demo(), opts, Limits { reap_every: Duration::from_millis(25), ..Limits::default() }).await;
+    let (sid, _) = init(srv.addr, &[]).await;
+    let t0 = std::time::Instant::now();
+    let mut r = post(srv.addr, Some(&sid), &[], &export_call(7, &out.to_string_lossy(), 4.0, None, None)).await;
+    assert_eq!(r.status, 200);
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    let mut dup = post(srv.addr, Some(&sid), &[], &ping(7)).await;
+    assert_eq!(dup.status, 400);
+    let v = dup.next().await.unwrap();
+    assert_eq!((v["id"].as_u64(), v["error"]["code"].as_i64()), (Some(7), Some(-32600)), "{v}");
+    assert_eq!(post(srv.addr, Some(&sid), &[], &ping(8)).await.reply().await["id"], 8);
+    let done = r.reply().await;
+    assert_eq!((done["id"].as_u64(), &done["result"]["isError"]), (Some(7), &json!(false)), "{done}");
+    assert!(t0.elapsed() > idle * 3, "the export ran for several idle periods: {:?}", t0.elapsed());
+    assert!(out.exists());
+    assert_eq!(post(srv.addr, Some(&sid), &[], &ping(7)).await.reply().await["id"], 7, "the id is free again");
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn rmcp_idle_timeout_is_off() {
+    assert_eq!(session_manager().session_config.keep_alive, None);
 }
 
 #[test]

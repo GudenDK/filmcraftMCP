@@ -18,6 +18,7 @@
 
 mod gate;
 mod limits;
+mod sessions;
 
 use std::convert::Infallible;
 use std::future::Future;
@@ -50,8 +51,6 @@ pub const TOKEN_ENV: &str = "FILMCRAFT_MCP_TOKEN";
 pub const MIN_REMOTE_TOKEN_LEN: usize = 32;
 /// Largest request body read (the control channel's line limit; rmcp's default too).
 const MAX_BODY: usize = 4 << 20;
-/// Live sessions (pre-2026-07-28 clients); a further `initialize` gets 503.
-const MAX_SESSIONS: usize = 256;
 /// At most one log line per peer and reason this often.
 const LOG_EVERY: Duration = Duration::from_secs(10);
 /// Connections refused with a 503 at once; past this, further ones are closed unanswered.
@@ -75,6 +74,11 @@ pub(crate) struct Limits {
     pub(crate) auth_failures: u32,
     pub(crate) auth_window: Duration,
     pub(crate) auth_block: Duration,
+    /// Sessions (clients before 2026-07-28) at once. At the cap the least recently used idle one
+    /// is closed for a new one; when every one has something in flight, `initialize` gets 503.
+    pub(crate) sessions: usize,
+    /// How often idle sessions are looked for.
+    pub(crate) reap_every: Duration,
     /// How long shutdown waits for cancelled exports to delete their partial files and for
     /// connections to close.
     pub(crate) grace: Duration,
@@ -90,6 +94,8 @@ impl Default for Limits {
             auth_failures: 10,
             auth_window: Duration::from_secs(60),
             auth_block: Duration::from_secs(60),
+            sessions: 256,
+            reap_every: Duration::from_secs(30),
             grace: Duration::from_secs(15),
         }
     }
@@ -114,8 +120,9 @@ pub struct HttpOptions {
     pub legacy_session_mode: bool,
     /// Answer a single-message reply as `application/json` instead of an SSE stream.
     pub json_response: bool,
-    /// A session with no traffic for this long is dropped. An export without a `progressToken`
-    /// sends nothing while it runs, so keep this longer than the longest one.
+    /// A session (clients before 2026-07-28) with nothing in flight and no requests for this long
+    /// is closed; its client must `initialize` again. A call in flight keeps its session open
+    /// however long it runs. `None`: only to make room when the session cap is reached.
     pub session_idle: Option<Duration>,
     /// Where refused requests and failures are reported, one line each (default: stderr).
     pub log: Option<LogSink>,
@@ -129,7 +136,7 @@ impl Default for HttpOptions {
             allowed_origins: Vec::new(),
             legacy_session_mode: true,
             json_response: false,
-            session_idle: Some(Duration::from_secs(3600)),
+            session_idle: Some(Duration::from_secs(600)),
             log: None,
         }
     }
@@ -328,9 +335,7 @@ impl FilmcraftMcp {
             stop.cancel();
         });
 
-        let mut sessions = LocalSessionManager::default();
-        sessions.session_config.keep_alive = opts.session_idle;
-        let sessions = Arc::new(sessions);
+        let sessions = Arc::new(session_manager());
         // rmcp repeats the gate's Host and Origin checks with the same lists
         let config = StreamableHttpServerConfig::default()
             .with_allowed_hosts(hosts.clone())
@@ -360,13 +365,17 @@ impl FilmcraftMcp {
             origins,
             tools,
             mcp,
-            sessions: sessions.clone(),
+            rmcp_sessions: sessions.clone(),
+            sessions: sessions::Sessions::new(limits.sessions),
             legacy_session_mode: opts.legacy_session_mode,
             body_timeout: limits.body_timeout,
             auth: limits::AuthFailures::new(limits.auth_failures, limits.auth_window, limits.auth_block),
             log: limits::Log::new(opts.log, LOG_EVERY),
         });
         let conns = limits::Conns::new(limits.connections, limits.connections_per_peer);
+        if let Some(idle) = opts.session_idle {
+            tokio::spawn(reap_idle_sessions(gate.clone(), idle, limits.reap_every, ct.clone()));
+        }
         let refusing = Arc::new(tokio::sync::Semaphore::new(MAX_REFUSING));
 
         loop {
@@ -422,14 +431,43 @@ impl FilmcraftMcp {
         // The token ended every SSE stream and cancelled the stateless calls, but session workers
         // outlive it: close them, so their calls see `context.ct` cancelled (after rmcp's response
         // drain) and an export stops and deletes its partial output before the process exits.
-        let ids: Vec<_> = sessions.sessions.read().await.keys().cloned().collect();
-        for id in ids {
-            let _ = sessions.close_session(&id).await;
-        }
+        let close_all = async {
+            for id in gate.sessions.ids() {
+                let _ = sessions.close_session(&id.as_str().into()).await;
+            }
+        };
+        let _ = tokio::time::timeout_at(deadline, close_all).await;
         // Exports first: whatever still runs at the deadline has its partial output deleted.
         long_calls.drain(deadline).await;
         let _ = tokio::time::timeout_at(deadline, conns.all_closed()).await;
         Ok(())
+    }
+}
+
+/// rmcp's session store with its idle timeout off: it counts session events only, so it would cut
+/// off a long call that sends nothing (an export without a `progressToken`) and delete its output.
+/// [`reap_idle_sessions`] closes idle sessions instead, never one with something in flight.
+fn session_manager() -> LocalSessionManager {
+    let mut sessions = LocalSessionManager::default();
+    sessions.session_config.keep_alive = None;
+    sessions
+}
+
+/// Every `every`, close the sessions with nothing in flight that were not used for `idle`
+/// (clients that went away without `DELETE`), until `stop`.
+async fn reap_idle_sessions(gate: Arc<gate::Gate>, idle: Duration, every: Duration, stop: CancellationToken) {
+    loop {
+        tokio::select! {
+            _ = stop.cancelled() => return,
+            _ = tokio::time::sleep(every) => {}
+        }
+        let ids = gate.sessions.take_idle(idle);
+        for id in &ids {
+            let _ = gate.rmcp_sessions.close_session(&id.as_str().into()).await;
+        }
+        if !ids.is_empty() {
+            gate.log.line(format_args!("closed {} MCP session(s) unused for {} s", ids.len(), idle.as_secs()));
+        }
     }
 }
 
