@@ -108,14 +108,16 @@ are cancelled and sessions closed, and exports get time to delete their partial 
 3 s when Windows is closing the console, logging off or shutting down (it ends the process about
 5 s after telling it). That covers the exports clients started without `wait` (a headless
 `file.exportMedia` that returned `{job, path}`) as well: still running at the stop, they are
-cancelled and their output deleted; finished ones are kept. The output of an export still running
-at the end is deleted. Other engine jobs (the export queue, proxies, …) are not cancelled; they end
-with the process, so cancel a queue export with `jobs.cancel` first if you want its file gone. A second
-signal quits at once. Stdio mode (`mcp` without `--http`) stops on the same signals. Signals are
-watched from before the first line is printed, so one sent right after it still stops the server
-cleanly. On Linux a server started with `nohup` (SIGHUP ignored) keeps running when its terminal
-closes; macOS gives no way to tell, so there it stops: keep it running after logout with `tmux`,
-`screen` or a launchd job instead. Windows does not always tell a console program that loads
+cancelled and their output deleted; finished ones are kept. An export that finished just before the
+stop reached it is kept too, and one still waiting for the engine (another call holds it) gives up
+at once without starting. The output of an export still running at the end is deleted. Other
+engine jobs (the export queue, proxies, …) are not cancelled; they end with the process, so cancel
+a queue export with `jobs.cancel` first if you want its file gone. A second signal quits at once.
+Stdio mode (`mcp` without `--http`) stops on the same signals. Signals are watched from before the
+first line is printed, so one sent right after it still stops the server cleanly. On Linux a
+server started with `nohup` (SIGHUP ignored) keeps running when its terminal closes; macOS gives no
+way to tell, so there it stops: keep it running after logout with `tmux`, `screen` or a launchd job
+instead. Windows does not always tell a console program that loads
 graphics libraries (filmcraft-cli does) that the user is logging off or the system is shutting
 down; then the process ends without warning and a running export may leave its partial file, so
 stop the server before logging off.
@@ -548,7 +550,9 @@ driven one app can drive the others.
 
 `command_run {"id": "file.exportMedia", "params": {…, "wait": true}}` in headless mode blocks until
 the file is written. It uses the MCP progress and cancellation utilities, so a client can show
-progress and stop it:
+progress and stop it. A `command_batch` step that exports with `wait: true` runs the same way: its
+result is the same `{job, path, result, offlineMedia}`, the batch's progress token reports on through
+its exports (progress only increases), and a batch that is cancelled runs no more steps.
 
 - The export runs as the same background job `jobs.list` shows. The session is locked only for short
   polls, so other requests (`ping`, `doc_inspect`, `jobs.list`, …) are answered while it encodes.
@@ -564,13 +568,16 @@ progress and stop it:
   <job status>}` at most every 100 ms while frames advance. Without a token it sends none.
 - `notifications/cancelled` for the request stops the encode at the next batch (`jobs.cancel`),
   deletes the partial output (the movie, or the frames and caption sidecar written so far) and sends
-  no response, as the MCP cancellation utility asks. Over HTTP the progress notifications come on
-  the call's SSE stream, and a 2026-07-28 client cancels by closing that stream instead (see
-  [HTTP transport](#http-transport)).
+  no response, as the MCP cancellation utility asks. An export that finished before the cancel
+  reached it is whole, and kept. Over HTTP the progress notifications come on the call's SSE stream,
+  and a 2026-07-28 client cancels by closing that stream instead (see
+  [HTTP transport](#http-transport)). On stdio, closing the server's input (the first step of MCP's
+  stdio shutdown) cancels a running export at once, as a stop does: wait for an export's result
+  before you close it.
 - Without `wait` the command returns `{job, path}` at once, as before: poll `jobs.list` and stop it
   with `jobs.cancel` (which leaves the partial file). When the MCP server stops (or a stdio client
-  closes its input) while such an export runs, it is cancelled and its partial output deleted. Other exports (`file.exportFrame`, interchange formats, …) finish quickly and
-  ignore the token.
+  closes its input) while such an export runs, it is cancelled and its partial output deleted.
+  Other exports (`file.exportFrame`, interchange formats, …) finish quickly and ignore the token.
 - Bridge mode works the same way: the export runs as an app job (the app stays responsive and shows
   "Exporting… NN%" in its status bar) and the call returns when it is written, however long it
   takes. `filmcraft-cli --bridge … exec file.exportMedia … wait=true` blocks the same way.
