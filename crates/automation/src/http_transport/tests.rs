@@ -16,7 +16,7 @@ fn demo() -> Session {
 /// A server on 127.0.0.1:<free port>; dropping `stop` (or sending on it) shuts it down.
 struct Server {
     addr: SocketAddr,
-    stop: Option<tokio::sync::oneshot::Sender<()>>,
+    stop: Option<tokio::sync::oneshot::Sender<Stop>>,
     done: tokio::task::JoinHandle<Result<(), AutomationError>>,
     /// A clone of the server's handler (shares its backend and long-call count).
     mcp: FilmcraftMcp,
@@ -36,11 +36,9 @@ impl Server {
     }
     fn start_on(listener: tokio::net::TcpListener, s: Session, opts: HttpOptions, limits: Limits, stats: Arc<Stats>) -> Self {
         let addr = listener.local_addr().unwrap();
-        let (stop, rx) = tokio::sync::oneshot::channel::<()>();
+        let (stop, rx) = tokio::sync::oneshot::channel::<Stop>();
         let mcp = FilmcraftMcp::headless(s);
-        let done = tokio::spawn(mcp.clone().serve_with(listener, opts, limits, stats, async move {
-            let _ = rx.await;
-        }));
+        let done = tokio::spawn(mcp.clone().serve_with(listener, opts, limits, stats, async move { rx.await.unwrap_or(Stop::Graceful) }));
         Self { addr, stop: Some(stop), done, mcp }
     }
     fn host(&self) -> String {
@@ -917,7 +915,7 @@ async fn a_non_loopback_bind_needs_a_token() {
 async fn shutdown_returns() {
     let mut srv = Server::start(demo(), HttpOptions::default()).await;
     let (_sid, _) = init(srv.addr, &[]).await;
-    let _ = srv.stop.take().unwrap().send(());
+    let _ = srv.stop.take().unwrap().send(Stop::Graceful);
     let r = tokio::time::timeout(Duration::from_secs(20), &mut srv.done).await.expect("shut down in time").unwrap();
     assert!(r.is_ok(), "{r:?}");
     assert!(TcpStream::connect(srv.addr).await.is_err());
@@ -943,7 +941,7 @@ async fn shutdown_deletes_partial_exports_and_closes_the_port_at_once() {
     assert_eq!(srv.mcp.long_calls.count(), 1);
     // a connection that sends nothing keeps the server in its grace period for a while
     let _idle = TcpStream::connect(srv.addr).await.unwrap();
-    let _ = srv.stop.take().unwrap().send(());
+    let _ = srv.stop.take().unwrap().send(Stop::Graceful);
     tokio::time::sleep(Duration::from_millis(300)).await;
     assert!(TcpStream::connect(srv.addr).await.is_err(), "the port closes when shutdown starts");
     assert!(!srv.done.is_finished(), "still waiting for the open connection");
@@ -951,6 +949,35 @@ async fn shutdown_deletes_partial_exports_and_closes_the_port_at_once() {
     assert!(r.is_ok(), "{r:?}");
     assert!(!out.exists(), "the partial export is deleted");
     assert_eq!(srv.mcp.long_calls.count(), 0);
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// When the process is about to be killed (Windows: the console closing, logoff, shutdown), the
+/// server stops within the short grace, exports first: the partial file is deleted even though
+/// a connection is still open.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_hurried_stop_deletes_partial_exports_within_its_grace() {
+    let dir = std::env::temp_dir().join(format!("filmcraft-mcp-http-hurried-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let out = dir.join("partial.mp4");
+    let limits = Limits { hurried_grace: Duration::from_millis(1500), ..Limits::default() };
+    let mut srv = Server::start_limited(demo(), HttpOptions::default(), limits).await;
+    let (sid, _) = init(srv.addr, &[]).await;
+    let mut r = post(srv.addr, Some(&sid), &[], &export_call(1, &out.to_string_lossy(), 30.0, Some(json!("h")), None)).await;
+    loop {
+        let m = r.next().await.expect("progress");
+        assert_ne!(m["id"], 1, "finished before the stop: {m}");
+        if m["method"] == "notifications/progress" {
+            break;
+        }
+    }
+    let _idle = TcpStream::connect(srv.addr).await.unwrap(); // would hold a graceful stop for 5 s
+    let t0 = std::time::Instant::now();
+    let _ = srv.stop.take().unwrap().send(Stop::Hurried);
+    let r = tokio::time::timeout(Duration::from_secs(20), &mut srv.done).await.expect("stopped").unwrap();
+    assert!(r.is_ok(), "{r:?}");
+    assert!(t0.elapsed() < Duration::from_secs(3), "within the hurried grace: {:?}", t0.elapsed());
+    assert!(!out.exists(), "the partial export is deleted");
     let _ = std::fs::remove_dir_all(&dir);
 }
 
@@ -963,6 +990,21 @@ fn export_call(id: u64, path: &str, seconds: f64, token: Option<Value>, meta: Op
     }
     call["params"]["_meta"] = m;
     call
+}
+
+/// `jobs.list` once its last job has finished (a cancelled export may not have written its file
+/// yet when the file is checked, and stops later under load).
+async fn last_job_once_finished(addr: SocketAddr, sid: &str, first_id: u64) -> Value {
+    let t0 = std::time::Instant::now();
+    for id in first_id.. {
+        let jobs = tool_json(&call(addr, sid, id * 1000, "command_run", json!({"id": "jobs.list"})).await);
+        if jobs.as_array().and_then(|a| a.last()).is_some_and(|j| j["finished"] == true) {
+            return jobs;
+        }
+        assert!(t0.elapsed().as_secs() < 30, "the job did not stop: {jobs}");
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    unreachable!()
 }
 
 async fn wait_gone(path: &std::path::Path) {
@@ -1022,7 +1064,7 @@ async fn export_progress_and_cancel_over_http() {
     let c = post(srv.addr, Some(&sid), &[], &json!({"jsonrpc":"2.0","method":"notifications/cancelled","params":{"requestId":20}})).await;
     assert_eq!(c.status, 202);
     wait_gone(std::path::Path::new(&b)).await;
-    let jobs = tool_json(&call(srv.addr, &sid, 21, "command_run", json!({"id": "jobs.list"})).await);
+    let jobs = last_job_once_finished(srv.addr, &sid, 21).await;
     assert_eq!(jobs.as_array().and_then(|a| a.last()).map(|j| j["result"]["error"].clone()), Some(json!("cancelled")), "{jobs}");
     // no response for a cancelled request
     while let Some(m) = r.next().await {
@@ -1048,7 +1090,7 @@ async fn export_progress_and_cancel_over_http() {
     }
     drop(r);
     wait_gone(std::path::Path::new(&c)).await;
-    let jobs = tool_json(&call(srv.addr, &sid, 31, "command_run", json!({"id": "jobs.list"})).await);
+    let jobs = last_job_once_finished(srv.addr, &sid, 31).await;
     assert_eq!(jobs.as_array().and_then(|a| a.last()).map(|j| j["result"]["error"].clone()), Some(json!("cancelled")), "{jobs}");
     let _ = std::fs::remove_dir_all(&dir);
 }

@@ -57,6 +57,7 @@ impl LongCalls {
 
     /// Wait until no long call runs or `deadline` passes, then delete the partial output of those
     /// still running: the process is about to exit, and an export it stops leaves a truncated file.
+    /// The calls must have been cancelled already.
     pub(crate) async fn drain(&self, deadline: tokio::time::Instant) {
         while self.count() > 0 && tokio::time::Instant::now() < deadline {
             tokio::time::sleep(Duration::from_millis(50)).await;

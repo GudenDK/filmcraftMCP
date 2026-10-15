@@ -34,7 +34,7 @@ mod args;
 mod probe;
 
 use args::{Args, parse_value};
-use filmcraft_automation::BridgeClient;
+use filmcraft_automation::{BridgeClient, Stop};
 use filmcraft_engine::Session;
 use serde_json::{Value, json};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -505,11 +505,15 @@ async fn cli() {
             };
             let result = match http {
                 Some((addr, opts)) => serve_mcp_http(&a, server, addr, opts).await,
-                None => server.serve_stdio().await,
+                None => server.serve_stdio_until(stop_signal()).await,
             };
             if let Err(e) = result {
                 fail(format!("mcp: {e}"));
             }
+            // Don't wait on blocking work a cancelled call may still be doing (the runtime would on
+            // drop): the server has already given exports their grace, and on Windows a closing
+            // console's process is killed about 5 s after the event.
+            std::process::exit(i32::from(STDOUT_ERROR.load(Ordering::Relaxed)));
         }
         other => usage(format!("unknown subcommand `{other}`")),
     }
@@ -606,21 +610,68 @@ async fn serve_mcp_http(
             "filmcraft-cli: warning: {bound} is reachable from the network and HTTP is not encrypted: the token and every request travel in clear text. Prefer 127.0.0.1 with `ssh -L` or a TLS reverse proxy (--allow-host)."
         ));
     }
-    let shutdown = async {
-        // no signal handler (rare): serve until the process is killed
-        if tokio::signal::ctrl_c().await.is_err() {
-            std::future::pending::<()>().await;
-        }
-        diag(format_args!("filmcraft-cli: MCP server stopping (Ctrl+C again to quit at once)"));
-        tokio::spawn(async {
-            if tokio::signal::ctrl_c().await.is_ok() {
-                std::process::exit(130);
-            }
-        });
-    };
-    server.serve_http_listener(listener, opts, shutdown).await?;
+    server.serve_http_listener(listener, opts, stop_signal()).await?;
     diag(format_args!("filmcraft-cli: MCP server stopped"));
     Ok(())
+}
+
+/// Resolves when the process is asked to stop: Ctrl+C, SIGTERM or SIGHUP (kill, systemd, docker
+/// stop, a closed terminal), or on Windows Ctrl+Break, or the console closing, the user logging off
+/// or the system shutting down. Windows ends the process about 5 s after those last three, so the
+/// server hurries. A second signal quits at once.
+async fn stop_signal() -> Stop {
+    let (how, what) = first_signal().await;
+    let grace = how.grace().as_secs();
+    diag(format_args!("filmcraft-cli: MCP server stopping ({what}): cancelling calls, up to {grace} s for exports to clean up; Ctrl+C again quits at once"));
+    tokio::spawn(async {
+        first_signal().await;
+        std::process::exit(130);
+    });
+    how
+}
+
+/// A future that never resolves when its signal cannot be watched.
+async fn or_never<T>(watching: std::io::Result<T>, recv: impl AsyncFnOnce(T) -> Option<()>) {
+    let Ok(w) = watching else { return std::future::pending().await };
+    if recv(w).await.is_none() {
+        std::future::pending::<()>().await;
+    }
+}
+
+#[cfg(unix)]
+async fn first_signal() -> (Stop, &'static str) {
+    use tokio::signal::unix::{SignalKind, signal};
+    let ctrl_c = or_never(Ok(()), async |()| tokio::signal::ctrl_c().await.ok());
+    let term = or_never(signal(SignalKind::terminate()), async |mut s| s.recv().await);
+    let hup = or_never(signal(SignalKind::hangup()), async |mut s| s.recv().await);
+    tokio::select! {
+        _ = ctrl_c => (Stop::Graceful, "Ctrl+C"),
+        _ = term => (Stop::Graceful, "SIGTERM"),
+        _ = hup => (Stop::Graceful, "SIGHUP"),
+    }
+}
+
+#[cfg(windows)]
+async fn first_signal() -> (Stop, &'static str) {
+    use tokio::signal::windows;
+    let ctrl_c = or_never(windows::ctrl_c(), async |mut s| s.recv().await);
+    let ctrl_break = or_never(windows::ctrl_break(), async |mut s| s.recv().await);
+    let close = or_never(windows::ctrl_close(), async |mut s| s.recv().await);
+    let logoff = or_never(windows::ctrl_logoff(), async |mut s| s.recv().await);
+    let shutdown = or_never(windows::ctrl_shutdown(), async |mut s| s.recv().await);
+    tokio::select! {
+        _ = ctrl_c => (Stop::Graceful, "Ctrl+C"),
+        _ = ctrl_break => (Stop::Graceful, "Ctrl+Break"),
+        _ = close => (Stop::Hurried, "the console is closing"),
+        _ = logoff => (Stop::Hurried, "the user is logging off"),
+        _ = shutdown => (Stop::Hurried, "the system is shutting down"),
+    }
+}
+
+#[cfg(not(any(unix, windows)))]
+async fn first_signal() -> (Stop, &'static str) {
+    or_never(Ok(()), async |()| tokio::signal::ctrl_c().await.ok()).await;
+    (Stop::Graceful, "Ctrl+C")
 }
 
 /// The files an export wrote, from its result: `path` of a direct export, or each queued item's

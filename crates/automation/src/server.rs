@@ -1,5 +1,6 @@
 //! The MCP server. Tool names are snake_case.
 
+use std::future::Future;
 use std::sync::{Arc, Mutex, PoisonError};
 
 use base64::Engine as _;
@@ -12,7 +13,7 @@ use schemars::JsonSchema;
 use serde::Deserialize;
 use serde_json::{Value, json};
 
-use crate::{AutomationError, BridgeClient, png_rgba};
+use crate::{AutomationError, BridgeClient, Stop, png_rgba};
 
 pub enum Backend {
     Headless(Arc<Mutex<Session>>),
@@ -211,8 +212,15 @@ impl FilmcraftMcp {
         Self { backend: Arc::new(backend), tool_router: Self::tool_router(), view: Arc::new(tokio::sync::Mutex::new(())), long_calls: Arc::default() }
     }
 
+    /// Serve MCP on stdin/stdout until the client closes stdin.
     pub async fn serve_stdio(self) -> Result<(), AutomationError> {
-        self.serve_io(tokio::io::stdin(), tokio::io::stdout()).await
+        self.serve_stdio_until(std::future::pending::<()>()).await
+    }
+
+    /// [`Self::serve_stdio`], or until `stop` resolves (a signal): then calls in flight are
+    /// cancelled and exports delete their partial files (see [`Stop`]).
+    pub async fn serve_stdio_until<S: Into<Stop> + Send + 'static>(self, stop: impl Future<Output = S> + Send + 'static) -> Result<(), AutomationError> {
+        self.serve_io_until(tokio::io::stdin(), tokio::io::stdout(), stop).await
     }
 
     /// Serve MCP over any line stream. A line that isn't JSON gets a JSON-RPC parse error
@@ -222,6 +230,17 @@ impl FilmcraftMcp {
         self,
         input: impl tokio::io::AsyncRead + Unpin + Send + 'static,
         output: impl tokio::io::AsyncWrite + Unpin + Send + 'static,
+    ) -> Result<(), AutomationError> {
+        self.serve_io_until(input, output, std::future::pending::<()>()).await
+    }
+
+    /// [`Self::serve_io`] until the input ends or `stop` resolves. Either way the calls still in
+    /// flight are cancelled, and exports get [`Stop::grace`] to delete their partial files.
+    pub async fn serve_io_until<S: Into<Stop> + Send + 'static>(
+        self,
+        input: impl tokio::io::AsyncRead + Unpin + Send + 'static,
+        output: impl tokio::io::AsyncWrite + Unpin + Send + 'static,
+        stop: impl Future<Output = S> + Send + 'static,
     ) -> Result<(), AutomationError> {
         use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
         let (mut to_service, service_in) = tokio::io::duplex(1 << 20);
@@ -261,11 +280,37 @@ impl FilmcraftMcp {
                 }
             }
         });
-        let running = self.serve((service_in, service_out)).await.map_err(|e| AutomationError::Other(format!("MCP init: {e}")))?;
-        let r = running.waiting().await.map_err(|e| AutomationError::Other(e.to_string()));
+        let long_calls = self.long_calls.clone();
+        // watched from the start (a signal handler is installed when first polled), handshake included
+        let stop = async move { stop.await.into() };
+        tokio::pin!(stop);
+        let running = tokio::select! {
+            r = self.serve((service_in, service_out)) => r.map_err(|e| AutomationError::Other(format!("MCP init: {e}")))?,
+            _ = &mut stop => {
+                // stopped before the client initialized: nothing runs yet
+                reader.abort();
+                return Ok(());
+            }
+        };
+        let quit = running.cancellation_token();
+        // ending (input closed) drops the service, which cancels the calls still in flight
+        let waiting = running.waiting();
+        tokio::pin!(waiting);
+        let stopped: Result<Stop, _> = tokio::select! {
+            r = &mut waiting => Err(r),
+            s = &mut stop => Ok(s),
+        };
+        let (r, how) = match stopped {
+            Err(r) => (r, Stop::Graceful),
+            Ok(how) => {
+                quit.cancel();
+                (waiting.await, how)
+            }
+        };
         reader.abort();
-        let _ = writer.await;
-        r.map(|_| ())
+        let _ = tokio::time::timeout(how.grace(), writer).await;
+        long_calls.drain(crate::http_transport::deadline_after(how.grace())).await;
+        r.map(|_| ()).map_err(|e| AutomationError::Other(e.to_string()))
     }
 
     /// Run an engine command on whichever backend.
@@ -979,18 +1024,69 @@ mod tests {
             assert!(t0.elapsed().as_secs() < 30, "partial file still there");
             tokio::time::sleep(std::time::Duration::from_millis(50)).await;
         }
-        c.send(r#"{"jsonrpc":"2.0","id":5,"method":"tools/call","params":{"name":"command_run","arguments":{"id":"jobs.list"}}}"#).await;
-        let m = loop {
-            let m = c.next().await;
-            assert_ne!(m["id"], 4, "no response for a cancelled request: {m}");
-            if m["id"] == 5 {
-                break m;
+        // the file may not have existed yet: wait for the job itself to end (slow under load)
+        let (jobs, last) = loop {
+            let id = 5 + t0.elapsed().as_millis() as u64;
+            c.send(&json!({"jsonrpc":"2.0","id":id,"method":"tools/call","params":{"name":"command_run","arguments":{"id":"jobs.list"}}}).to_string()).await;
+            let m = loop {
+                let m = c.next().await;
+                assert_ne!(m["id"], 4, "no response for a cancelled request: {m}");
+                if m["id"] == id {
+                    break m;
+                }
+            };
+            let jobs: Value = serde_json::from_str(m["result"]["content"][0]["text"].as_str().unwrap()).unwrap();
+            let last = jobs.as_array().and_then(|a| a.last()).cloned().unwrap_or_default();
+            if last["finished"] == true {
+                break (jobs, last);
             }
+            assert!(t0.elapsed().as_secs() < 30, "the job did not stop: {jobs}");
+            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
         };
-        let jobs: Value = serde_json::from_str(m["result"]["content"][0]["text"].as_str().unwrap()).unwrap();
-        let last = jobs.as_array().and_then(|a| a.last()).cloned().unwrap_or_default();
         assert_eq!(last["result"]["error"], "cancelled", "{jobs}");
         assert!(!dir.join("b.mp4").exists());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// stdio stops when asked (a signal: SIGTERM, a closing console) or when the client closes its
+    /// input, mid-export either way: the export is cancelled and its partial file deleted before
+    /// `serve_io_until` returns, instead of the process dying with a truncated file on disk.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn stdio_stops_mid_export_without_leaving_a_partial_file() {
+        use tokio::io::{AsyncBufReadExt, AsyncWriteExt};
+        let dir = std::env::temp_dir().join(format!("filmcraft-mcp-stdio-stop-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        for (name, by_signal) in [("signal.mp4", true), ("eof.mp4", false)] {
+            let out = dir.join(name);
+            let (mut tx, server_in) = tokio::io::duplex(1 << 22);
+            let (server_out, rx) = tokio::io::duplex(1 << 22);
+            let (stop, stop_rx) = tokio::sync::oneshot::channel::<Stop>();
+            let done =
+                tokio::spawn(FilmcraftMcp::headless(demo()).serve_io_until(server_in, server_out, async move { stop_rx.await.unwrap_or(Stop::Graceful) }));
+            let mut rx = tokio::io::BufReader::new(rx).lines();
+            let mut next = async || -> Value { serde_json::from_str(&rx.next_line().await.unwrap().unwrap()).unwrap() };
+            let init = json!({"jsonrpc":"2.0","id":0,"method":"initialize","params":{"protocolVersion":"2025-06-18","capabilities":{},"clientInfo":{"name":"t","version":"1"}}});
+            tx.write_all(format!("{init}\n{}\n", json!({"jsonrpc":"2.0","method":"notifications/initialized"})).as_bytes()).await.unwrap();
+            assert_eq!(next().await["id"], 0);
+            let params = json!({"path": out.to_string_lossy(), "format": "h264", "width": 640, "height": 360, "audio": false, "range": "custom", "startSeconds": 0, "endSeconds": 30.0, "wait": true});
+            let call = json!({"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"command_run","arguments":{"id":"file.exportMedia","params":params},"_meta":{"progressToken":"p"}}});
+            tx.write_all(format!("{call}\n").as_bytes()).await.unwrap();
+            loop {
+                let m = next().await;
+                assert_ne!(m["id"], 1, "finished before the stop: {m}");
+                if m["method"] == "notifications/progress" {
+                    break;
+                }
+            }
+            if by_signal {
+                let _ = stop.send(Stop::Graceful);
+            } else {
+                drop(tx);
+            }
+            let r = tokio::time::timeout(std::time::Duration::from_secs(30), done).await.expect("stopped in time").unwrap();
+            assert!(r.is_ok(), "{r:?}");
+            assert!(!out.exists(), "{name}: the partial export is deleted");
+        }
         let _ = std::fs::remove_dir_all(&dir);
     }
 

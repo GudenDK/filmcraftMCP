@@ -43,7 +43,7 @@ use tokio_util::sync::CancellationToken;
 
 pub use limits::LogSink;
 
-use crate::{AutomationError, FilmcraftMcp};
+use crate::{AutomationError, FilmcraftMcp, Stop};
 
 /// The MCP endpoint path.
 pub const MCP_PATH: &str = "/mcp";
@@ -82,8 +82,9 @@ pub(crate) struct Limits {
     /// How often idle sessions are looked for.
     pub(crate) reap_every: Duration,
     /// How long shutdown waits for cancelled exports to delete their partial files and for
-    /// connections to close.
+    /// connections to close, after a graceful and a hurried [`Stop`].
     pub(crate) grace: Duration,
+    pub(crate) hurried_grace: Duration,
 }
 
 impl Default for Limits {
@@ -98,7 +99,8 @@ impl Default for Limits {
             auth_block: Duration::from_secs(60),
             sessions: 256,
             reap_every: Duration::from_secs(30),
-            grace: Duration::from_secs(15),
+            grace: Stop::Graceful.grace(),
+            hurried_grace: Stop::Hurried.grace(),
         }
     }
 }
@@ -292,8 +294,15 @@ pub(crate) struct Stats {
 }
 
 impl FilmcraftMcp {
-    /// Serve MCP over Streamable HTTP at `http://<addr>/mcp` until `shutdown` completes.
-    pub async fn serve_http(self, addr: SocketAddr, opts: HttpOptions, shutdown: impl Future<Output = ()> + Send + 'static) -> Result<(), AutomationError> {
+    /// Serve MCP over Streamable HTTP at `http://<addr>/mcp` until `shutdown` resolves: then the
+    /// port closes, calls in flight are cancelled, and exports get [`Stop::grace`] to delete
+    /// their partial files.
+    pub async fn serve_http<S: Into<Stop> + Send + 'static>(
+        self,
+        addr: SocketAddr,
+        opts: HttpOptions,
+        shutdown: impl Future<Output = S> + Send + 'static,
+    ) -> Result<(), AutomationError> {
         check_bind(addr, opts.token.as_deref())?;
         let listener = tokio::net::TcpListener::bind(addr).await.map_err(|e| AutomationError::Other(format!("cannot listen on {addr}: {e}")))?;
         self.serve_http_listener(listener, opts, shutdown).await
@@ -301,23 +310,23 @@ impl FilmcraftMcp {
 
     /// [`Self::serve_http`] on a bound listener (the caller can print the bound port first, and
     /// tests bind `127.0.0.1:0`).
-    pub async fn serve_http_listener(
+    pub async fn serve_http_listener<S: Into<Stop> + Send + 'static>(
         self,
         listener: tokio::net::TcpListener,
         opts: HttpOptions,
-        shutdown: impl Future<Output = ()> + Send + 'static,
+        shutdown: impl Future<Output = S> + Send + 'static,
     ) -> Result<(), AutomationError> {
         self.serve_with(listener, opts, Limits::default(), Arc::default(), shutdown).await
     }
 
     /// [`Self::serve_http_listener`] with these limits, counting into `stats`.
-    pub(crate) async fn serve_with(
+    pub(crate) async fn serve_with<S: Into<Stop> + Send + 'static>(
         self,
         listener: tokio::net::TcpListener,
         opts: HttpOptions,
         limits: Limits,
         stats: Arc<Stats>,
-        shutdown: impl Future<Output = ()> + Send + 'static,
+        shutdown: impl Future<Output = S> + Send + 'static,
     ) -> Result<(), AutomationError> {
         let bound = listener.local_addr().map_err(|e| AutomationError::Other(format!("listener: {e}")))?;
         let token = opts.token.filter(|t| !t.is_empty());
@@ -331,9 +340,11 @@ impl FilmcraftMcp {
         let hosts = accepted_hosts(bound, &extra_hosts);
 
         let ct = CancellationToken::new();
-        let stop = ct.clone();
+        let (stop, how) = (ct.clone(), Arc::new(std::sync::Mutex::new(Stop::Graceful)));
+        let stopped_how = how.clone();
         tokio::spawn(async move {
-            shutdown.await;
+            let s: Stop = shutdown.await.into();
+            *stopped_how.lock().unwrap_or_else(std::sync::PoisonError::into_inner) = s;
             stop.cancel();
         });
 
@@ -442,15 +453,19 @@ impl FilmcraftMcp {
 
         // Refuse new connections now rather than leave them hanging until the process exits.
         drop(listener);
-        let deadline = deadline_after(limits.grace);
+        let grace = match *how.lock().unwrap_or_else(std::sync::PoisonError::into_inner) {
+            Stop::Graceful => limits.grace,
+            Stop::Hurried => limits.hurried_grace,
+        };
+        let deadline = deadline_after(grace);
         // The token ended every SSE stream and cancelled the stateless calls, but session workers
         // outlive it: close them, so their calls see `context.ct` cancelled (after rmcp's response
         // drain) and an export stops and deletes its partial output before the process exits.
-        let close_all = async {
-            for id in gate.sessions.ids() {
-                let _ = sessions.close_session(&id.as_str().into()).await;
-            }
-        };
+        let ids = gate.sessions.ids();
+        let rmcp_sessions = &sessions;
+        let close_all = futures_util::future::join_all(ids.iter().map(|id| async move {
+            let _ = rmcp_sessions.close_session(&id.as_str().into()).await;
+        }));
         let _ = tokio::time::timeout_at(deadline, close_all).await;
         // Exports first: whatever still runs at the deadline has its partial output deleted.
         long_calls.drain(deadline).await;
@@ -487,7 +502,7 @@ async fn reap_idle_sessions(gate: Arc<gate::Gate>, idle: Duration, every: Durati
 }
 
 /// `d` from now (far in the future if that overflows).
-fn deadline_after(d: Duration) -> tokio::time::Instant {
+pub(crate) fn deadline_after(d: Duration) -> tokio::time::Instant {
     let now = tokio::time::Instant::now();
     now.checked_add(d).or_else(|| now.checked_add(Duration::from_secs(86_400 * 365))).unwrap_or(now)
 }

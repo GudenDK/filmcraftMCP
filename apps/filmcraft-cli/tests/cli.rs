@@ -107,6 +107,96 @@ fn mcp_http_serves_initialize() {
     assert!(reply.contains(r#""name":"filmcraft""#), "{reply}");
 }
 
+/// A spawned `filmcraft-cli`, killed when the test ends (also when it fails), with its stdout
+/// and stderr lines arriving on channels so a test never blocks on a silent child.
+struct Spawned {
+    child: std::process::Child,
+    stdin: Option<std::process::ChildStdin>,
+    out: std::sync::mpsc::Receiver<String>,
+    err: std::sync::mpsc::Receiver<String>,
+}
+
+impl Spawned {
+    fn new(args: &[&str]) -> Self {
+        use std::io::BufRead;
+        let mut child = Command::new(env!("CARGO_BIN_EXE_filmcraft-cli"))
+            .args(args)
+            .env_remove("FILMCRAFT_MCP_TOKEN")
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .expect("spawn filmcraft-cli");
+        let lines = |r: Box<dyn std::io::Read + Send>| {
+            let (tx, rx) = std::sync::mpsc::channel();
+            std::thread::spawn(move || {
+                for l in std::io::BufReader::new(r).lines().map_while(Result::ok) {
+                    let _ = tx.send(l);
+                }
+            });
+            rx
+        };
+        let out = lines(Box::new(child.stdout.take().unwrap()));
+        let err = lines(Box::new(child.stderr.take().unwrap()));
+        Self { stdin: child.stdin.take(), child, out, err }
+    }
+    fn line(rx: &std::sync::mpsc::Receiver<String>) -> String {
+        rx.recv_timeout(std::time::Duration::from_secs(60)).expect("a line in time")
+    }
+    /// Wait for the process to end; its status and the rest of stderr.
+    fn wait(&mut self) -> (std::process::ExitStatus, String) {
+        let t0 = std::time::Instant::now();
+        let status = loop {
+            if let Some(s) = self.child.try_wait().unwrap() {
+                break s;
+            }
+            assert!(t0.elapsed() < std::time::Duration::from_secs(30), "still running");
+            std::thread::sleep(std::time::Duration::from_millis(50));
+        };
+        let rest: Vec<String> = self.err.iter().collect();
+        (status, rest.join("\n"))
+    }
+}
+
+impl Drop for Spawned {
+    fn drop(&mut self) {
+        let _ = self.child.kill();
+        let _ = self.child.wait();
+    }
+}
+
+/// `mcp` stops cleanly on SIGTERM and SIGHUP (kill, systemd, docker stop, a closed terminal) as
+/// on Ctrl+C (SIGINT), instead of dying at once and leaving partial exports: it says so and exits
+/// 0, over HTTP and on stdio.
+#[cfg(unix)]
+#[test]
+fn mcp_stops_cleanly_on_sigterm_and_sighup() {
+    let initialize =
+        r#"{"jsonrpc":"2.0","id":0,"method":"initialize","params":{"protocolVersion":"2025-06-18","capabilities":{},"clientInfo":{"name":"t","version":"1"}}}"#;
+    for (signal, http) in [("TERM", true), ("HUP", true), ("INT", true), ("TERM", false)] {
+        let mut args = vec!["mcp", "--demo"];
+        if http {
+            args.extend(["--http", "127.0.0.1:0"]);
+        }
+        let mut p = Spawned::new(&args);
+        if http {
+            let banner = Spawned::line(&p.err);
+            assert!(banner.contains("http://127.0.0.1:"), "{banner}");
+        } else {
+            // up once it answers the handshake (stdin stays open: EOF would stop it too)
+            writeln!(p.stdin.as_mut().unwrap(), "{initialize}").unwrap();
+            let reply = Spawned::line(&p.out);
+            assert!(reply.contains(r#""id":0"#), "{reply}");
+        }
+        let kill = Command::new("kill").args([format!("-{signal}"), p.child.id().to_string()]).status().expect("run kill");
+        assert!(kill.success());
+        let (status, err) = p.wait();
+        assert_eq!(status.code(), Some(0), "SIG{signal}, http {http}: {err}");
+        let said = if signal == "INT" { "stopping (Ctrl+C)".to_string() } else { format!("stopping (SIG{signal})") };
+        assert!(err.contains(&said), "{err}");
+    }
+}
+
 #[test]
 fn version_after_global_options() {
     let want = format!("filmcraft-cli {}\n", env!("CARGO_PKG_VERSION"));

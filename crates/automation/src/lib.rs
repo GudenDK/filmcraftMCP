@@ -2,7 +2,8 @@
 //!
 //! The FilmCraft MCP server (official `rmcp` SDK): stdio ([`FilmcraftMcp::serve_stdio`]), or
 //! Streamable HTTP at `http://<addr>/mcp` ([`FilmcraftMcp::serve_http`], [`http_transport`]) where
-//! any number of clients share one backend.
+//! any number of clients share one backend. Both stop on a future the caller gives them
+//! ([`Stop`]), cancelling calls in flight and deleting partial exports.
 //!
 //! * **Headless** mode drives an in-process [`filmcraft_engine::Session`]: every engine command,
 //!   project/sequence inspection and frame rendering (PNG) — no window needed.
@@ -20,6 +21,34 @@ pub mod server;
 pub use bridge::BridgeClient;
 pub use http_transport::HttpOptions;
 pub use server::FilmcraftMcp;
+
+/// How a server stops once the future it was given to stop on resolves (`()` means
+/// [`Stop::Graceful`]): calls in flight are cancelled, and it waits a while for cancelled exports to
+/// delete their partial files; what one still running at the end wrote is deleted then.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Stop {
+    /// Asked to stop (Ctrl+C, SIGTERM): wait up to 15 s.
+    Graceful,
+    /// The process is about to be killed (on Windows: its console closing, the user logging off,
+    /// the system shutting down, each about 5 s before the kill): wait at most 3 s.
+    Hurried,
+}
+
+impl Stop {
+    /// How long to wait for cancelled calls.
+    pub fn grace(self) -> std::time::Duration {
+        std::time::Duration::from_secs(match self {
+            Stop::Graceful => 15,
+            Stop::Hurried => 3,
+        })
+    }
+}
+
+impl From<()> for Stop {
+    fn from((): ()) -> Self {
+        Stop::Graceful
+    }
+}
 
 #[derive(Debug, thiserror::Error)]
 pub enum AutomationError {
