@@ -454,24 +454,54 @@ pub fn stored_location_warning(path: &Path) -> Option<String> {
     if !cfg!(windows) {
         return None;
     }
-    let profile: Vec<String> =
-        ["USERPROFILE", "APPDATA", "LOCALAPPDATA"].iter().filter_map(|k| std::env::var(k).ok()).filter(|v| !v.trim().is_empty()).collect();
-    windows_exposure(&path.to_string_lossy(), &profile)
+    let profile: Vec<PathBuf> =
+        ["USERPROFILE", "APPDATA", "LOCALAPPDATA"].iter().filter_map(std::env::var_os).filter(|v| !v.is_empty()).map(PathBuf::from).collect();
+    windows_exposure(path, &profile)
+}
+
+/// What the server says about who can read a token it stored just now at `path`.
+pub fn created_privacy(path: &Path) -> &'static str {
+    privacy_note(cfg!(windows), stored_location_warning(path).is_some())
+}
+
+/// [`created_privacy`] on Windows (`windows`) or unix, for a file outside the user's profile
+/// (`outside`, Windows only; then a warning has said who else may read it).
+fn privacy_note(windows: bool, outside: bool) -> &'static str {
+    match (windows, outside) {
+        // mode 600
+        (false, _) => ", readable only by you",
+        // the profile's folders let only their user, SYSTEM and administrators in
+        (true, false) => ", in your user profile, where only you and administrators can read it",
+        (true, true) => "",
+    }
 }
 
 /// Nothing restricts a token file on Windows but its folder's permissions. Those of the user's
 /// profile folders (`profile`) are private, but a folder elsewhere, such as a portable install's
 /// `data` folder under `C:\`, usually lets every user of the PC read and change what is in it. A
-/// warning when `path` is outside `profile` (Windows paths: no case, either slash).
-fn windows_exposure(path: &str, profile: &[String]) -> Option<String> {
-    let norm = |s: &str| s.replace('/', "\\").trim_end_matches('\\').to_lowercase();
-    let p = norm(path);
-    let inside = profile.iter().map(|d| norm(d)).filter(|d| !d.is_empty()).any(|d| p.strip_prefix(&d).is_some_and(|rest| rest.starts_with('\\')));
+/// warning when `path` is outside `profile`. Both are compared as the file system names them where
+/// they exist (an 8.3 short name such as `C:\Users\RUNNER~1`, a junction, a `subst` drive or a
+/// link resolved), else as written; Windows paths: no case, either slash.
+fn windows_exposure(path: &Path, profile: &[PathBuf]) -> Option<String> {
+    let p = windows_name(path);
+    let inside = profile.iter().map(|d| windows_name(d)).filter(|d| !d.is_empty()).any(|d| p.strip_prefix(&d).is_some_and(|rest| rest.starts_with('\\')));
     (!inside).then(|| {
         format!(
-            "the stored token {path} is outside your user profile, so its folder's permissions decide who can read it: other users of this PC may be able to read or replace it. Keep it in your profile with --data-dir \"$env:APPDATA\\FilmCraft\", or set {TOKEN_ENV}"
+            "the stored token {} is outside your user profile, so its folder's permissions decide who can read it: other users of this PC may be able to read or replace it. Keep it in your profile with --data-dir \"$env:APPDATA\\FilmCraft\", or set {TOKEN_ENV}",
+            path.display()
         )
     })
+}
+
+/// `p` for comparing Windows paths: as the file system names it when it exists (canonical, without
+/// the `\\?\` prefix that gives), backslashes, no trailing one, lower case.
+fn windows_name(p: &Path) -> String {
+    let real = std::fs::canonicalize(p).map(|r| r.to_string_lossy().into_owned()).unwrap_or_else(|_| p.to_string_lossy().into_owned());
+    let real = match real.strip_prefix(r"\\?\UNC\") {
+        Some(share) => format!(r"\\{share}"),
+        None => real.strip_prefix(r"\\?\").map(str::to_string).unwrap_or(real),
+    };
+    real.replace('/', "\\").trim_end_matches('\\').to_lowercase()
 }
 
 /// Replace the token stored at `path` with a new random one, in one step: a reader sees the old
@@ -781,6 +811,12 @@ mod tests {
         t.len() == 64 && t.bytes().all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
     }
 
+    /// The warnings a private token at `path` gets: none, but on Windows the one for a folder
+    /// outside the user's profile, which the temporary folder may be (a custom `TEMP`).
+    fn location_only(path: &Path) -> Vec<String> {
+        stored_location_warning(path).into_iter().collect()
+    }
+
     #[test]
     fn generated_tokens_are_64_random_hex_digits() {
         let a = generate_token().unwrap();
@@ -800,7 +836,7 @@ mod tests {
         let dir = tmp.0.join("data").join("filmcraft");
         let path = dir.join(STORED_FILE);
         let first = load_or_create(&path).unwrap();
-        assert!(first.created && first.warnings.is_empty() && is_token(&first.token), "{first:?}");
+        assert!(first.created && first.warnings == location_only(&path) && is_token(&first.token), "{first:?}");
         assert_eq!(std::fs::read(&path).unwrap(), first.token.as_bytes(), "the file holds the token and no line break");
         assert_eq!(TempDir::names(&dir), [STORED_FILE]);
         #[cfg(unix)]
@@ -1158,18 +1194,48 @@ mod tests {
     /// so, without the token.
     #[test]
     fn a_stored_token_outside_the_windows_profile_is_warned_about() {
-        let profile = [r"C:\Users\Ann".to_string(), r"C:\Users\Ann\AppData\Roaming".to_string(), String::new()];
+        let profile = [r"C:\Users\Ann", r"C:\Users\Ann\AppData\Roaming", ""].map(PathBuf::from);
         for inside in [r"C:\Users\Ann\AppData\Roaming\FilmCraft\mcp-token", r"c:/users/ann/filmcraft/mcp-token", r"C:\Users\Ann\mcp-token"] {
-            assert_eq!(windows_exposure(inside, &profile), None, "{inside}");
+            assert_eq!(windows_exposure(Path::new(inside), &profile), None, "{inside}");
         }
         for outside in [r"C:\claude\FilmCraftMCP\filmcraft-0.8.0\data\mcp-token", r"C:\Users\Anne\mcp-token", r"D:\fc\mcp-token", r"C:\Users\mcp-token"] {
-            let w = windows_exposure(outside, &profile).unwrap_or_else(|| panic!("{outside}"));
+            let w = windows_exposure(Path::new(outside), &profile).unwrap_or_else(|| panic!("{outside}"));
             assert!(w.contains("outside your user profile") && w.contains("--data-dir") && w.contains(TOKEN_ENV), "{w}");
         }
-        assert!(windows_exposure(r"C:\x\mcp-token", &[]).is_some());
+        assert!(windows_exposure(Path::new(r"C:\x\mcp-token"), &[]).is_some());
         if !cfg!(windows) {
             assert_eq!(stored_location_warning(Path::new("/anywhere/mcp-token")), None);
         }
+    }
+
+    /// The profile check compares folders as the file system names them: one reached by another
+    /// name (on Windows an 8.3 short name such as the `C:\Users\RUNNER~1` of `%TEMP%` on GitHub's
+    /// runners, a junction or a `subst` drive; here a link) is still inside the profile. Raw
+    /// strings were compared, which gave a false warning, and tests that expected none failed on
+    /// such machines.
+    #[cfg(unix)]
+    #[test]
+    fn the_windows_profile_check_resolves_other_names_for_a_folder() {
+        let tmp = TempDir::new("profile-alias");
+        let profile = tmp.0.join("Users").join("Ann");
+        std::fs::create_dir_all(profile.join("AppData")).unwrap();
+        let alias = tmp.0.join("ANN~1");
+        std::os::unix::fs::symlink(&profile, &alias).unwrap();
+        let token = alias.join("AppData").join(STORED_FILE);
+        std::fs::write(&token, TOKEN).unwrap();
+        assert_eq!(windows_exposure(&token, std::slice::from_ref(&profile)), None, "the same folder by another name");
+        assert_eq!(windows_exposure(&profile.join("AppData").join(STORED_FILE), std::slice::from_ref(&alias)), None);
+        assert!(windows_exposure(&tmp.0.join(STORED_FILE), &[alias]).is_some(), "outside it all the same");
+    }
+
+    /// The server says who can read a token it just stored: on unix only you (mode 600); on
+    /// Windows, inside the profile, you and administrators (only the folder protects it there).
+    #[test]
+    fn the_privacy_note_says_who_can_read_a_new_token() {
+        assert_eq!(privacy_note(false, false), ", readable only by you");
+        let windows = privacy_note(true, false);
+        assert!(windows.contains("your user profile") && windows.contains("administrators") && !windows.contains("only by you"), "{windows}");
+        assert_eq!(privacy_note(true, true), "", "outside the profile a warning says who may read it");
     }
 
     #[test]

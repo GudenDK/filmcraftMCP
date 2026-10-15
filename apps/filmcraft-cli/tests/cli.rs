@@ -187,9 +187,9 @@ fn mcp_http_requires_the_stored_token_by_default() {
     assert!(lines[0].contains(&format!("bearer token required (the one stored in {shown}; `{print}` prints it)")), "{lines:?}");
     let made = lines.iter().find(|l| l.contains("made a new random MCP token")).unwrap_or_else(|| panic!("{lines:?}"));
     assert!(made.contains(&format!("stored it in {shown}")) && made.ends_with(&format!("; `{print}` prints it, `{print} --new` replaces it")), "{made}");
-    // (on Windows only when the folder is in the user's profile, as the temporary folder usually is)
-    #[cfg(unix)]
-    assert!(made.contains(&format!("stored it in {shown}, readable only by you;")), "{made}");
+    // on Windows the folder's permissions decide: in the user's profile, you and administrators
+    let private = if cfg!(windows) { ", in your user profile, where only you and administrators can read it;" } else { ", readable only by you;" };
+    assert!(made.contains(&format!("stored it in {shown}{private}")), "{made}");
     let paste = lines.last().unwrap();
     let read = if cfg!(windows) { format!("$((Get-Content -LiteralPath '{shown}' -TotalCount 1).Trim())") } else { format!("$(cat '{shown}')") };
     assert!(
@@ -279,15 +279,16 @@ fn the_stored_token_lives_in_the_per_user_data_directory() {
         ("APPDATA", home.path("appdata").display().to_string()),
     ];
     let env: Vec<(&str, &str)> = env.iter().map(|(k, v)| (*k, v.as_str())).collect();
+    // one component at a time: a path written with `/` is not what Windows prints, with `\`
     let want = if cfg!(target_os = "macos") {
-        home.path("home/Library/Application Support/FilmCraft/mcp-token")
+        home.path("home").join("Library").join("Application Support").join("FilmCraft").join("mcp-token")
     } else if cfg!(windows) {
-        home.path("appdata/FilmCraft/mcp-token")
+        home.path("appdata").join("FilmCraft").join("mcp-token")
     } else {
-        home.path("xdg/filmcraft/mcp-token")
+        home.path("xdg").join("filmcraft").join("mcp-token")
     };
     let o = cli_exit(&["mcp-token", "--path"], &env);
-    assert_eq!(String::from_utf8(o.stdout).unwrap(), want.display().to_string());
+    assert_eq!(std::path::PathBuf::from(String::from_utf8(o.stdout).unwrap()), want);
     assert!(!want.exists(), "--path stores nothing");
     let p = Spawned::with_env(&["mcp", "--demo", "--http", "127.0.0.1:0"], &env);
     let lines = banner(&p);
@@ -505,12 +506,14 @@ impl Spawned {
         Self::spawn(cmd)
     }
     /// `cmd` (filmcraft-cli, or a program that runs it) without `FILMCRAFT_MCP_TOKEN` unless set,
-    /// and in a folder of its own for the data directory and home unless set.
+    /// and in a folder of its own for the data directory and home unless set. Its user profile
+    /// (Windows) is the temporary folder, where every test folder is, unless set.
     fn spawn(mut cmd: Command) -> Self {
         use std::io::BufRead;
         let root = TempDir::new("spawned");
         let set = |k: &str| cmd.get_envs().any(|(n, _)| n == k);
         let (token_set, own) = (set("FILMCRAFT_MCP_TOKEN"), ["FILMCRAFT_DATA_DIR", "HOME", "XDG_DATA_HOME", "APPDATA", "LOCALAPPDATA"].map(|k| (k, !set(k))));
+        let profile_set = set("USERPROFILE");
         if !token_set {
             cmd.env_remove("FILMCRAFT_MCP_TOKEN");
         }
@@ -519,6 +522,9 @@ impl Spawned {
                 let dir = if k == "FILMCRAFT_DATA_DIR" { "data".to_string() } else { k.to_ascii_lowercase() };
                 cmd.env(k, root.path(&dir));
             }
+        }
+        if !profile_set {
+            cmd.env("USERPROFILE", std::env::temp_dir());
         }
         let mut child = cmd.stdin(Stdio::piped()).stdout(Stdio::piped()).stderr(Stdio::piped()).spawn().expect("spawn filmcraft-cli");
         let lines = |r: Box<dyn std::io::Read + Send>| {

@@ -736,7 +736,7 @@ async fn serve_mcp_http(
             "filmcraft-cli: made a new random MCP token and stored it in {}{}; `{print_it}` prints it, `{print_it} --new` replaces it",
             path.display(),
             // on Windows only the folder's permissions protect it (warned about above when they may not)
-            if token::stored_location_warning(path).is_none() { ", readable only by you" } else { "" }
+            token::created_privacy(path)
         )),
         token::Source::Off => diag(format_args!(
             "filmcraft-cli: warning: --no-token: any program on this machine, run by any user, can drive FilmCraft through this port; leave --no-token off to require the stored token"
