@@ -1341,10 +1341,14 @@ mod tests {
             mcp_token_command_for(&per_user.join(STORED_FILE), &unknown, false),
             "filmcraft-cli mcp-token --data-dir '/home/ann/.local/share/filmcraft'"
         );
-        // the running test program is no `filmcraft-cli` on PATH
-        let me = Program::current();
-        assert!(me.exe.is_some() && !me.on_path, "{:?}", me.exe);
-        assert!(!first_on_path(Path::new("/no/such/filmcraft-cli"), std::env::var_os("PATH").as_deref()));
+        // the running test program, without its own folder on PATH (cargo puts it there for tests
+        // on Windows: target\debug\deps, where the test program is): not on it
+        let exe = Program::current().exe.expect("the test program's path");
+        let own = exe.parent().and_then(|d| std::fs::canonicalize(d).ok());
+        let path = std::env::var_os("PATH").unwrap_or_default();
+        let others = std::env::join_paths(std::env::split_paths(&path).filter(|d| std::fs::canonicalize(d).ok() != own)).unwrap();
+        assert!(!first_on_path(&exe, Some(&others)), "{}", exe.display());
+        assert!(!first_on_path(Path::new("/no/such/filmcraft-cli"), Some(&path)));
     }
 
     /// The program found first on `PATH` is the one a shell runs by its name; relative entries
