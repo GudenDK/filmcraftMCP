@@ -452,14 +452,24 @@ fn is_link_refused(_e: &std::io::Error) -> bool {
 /// that cannot be told.
 #[cfg(unix)]
 fn my_uid(path: &Path) -> Option<u32> {
-    use std::os::unix::fs::MetadataExt as _;
-    let probe = |dir: &Path| {
-        let tmp = write_temp(dir, "").ok()?;
-        let uid = std::fs::symlink_metadata(&tmp).map(|m| m.uid());
-        let _ = std::fs::remove_file(&tmp);
-        uid.ok()
-    };
+    let probe = |dir: &Path| probe_uid(dir).ok();
     path.parent().filter(|d| !d.as_os_str().is_empty()).and_then(probe).or_else(|| probe(&std::env::temp_dir()))
+}
+
+/// The owner of a new file this process makes in `dir` (then removes), read from the file it
+/// opened, never by its name: another user who can write to `dir` could rename a file of theirs
+/// over that name in between, and their user id would be taken for this one's. A file made with
+/// `O_EXCL` is this process's, whatever is put in its place later.
+#[cfg(unix)]
+fn probe_uid(dir: &Path) -> std::io::Result<u32> {
+    use std::os::unix::fs::MetadataExt as _;
+    let (tmp, file) = write_temp(dir, "")?;
+    #[cfg(test)]
+    tests::probe_made(&tmp);
+    let uid = file.metadata().map(|m| m.uid());
+    drop(file);
+    let _ = std::fs::remove_file(&tmp);
+    uid
 }
 
 /// Windows has no user ids: the folder decides ([`windows_exposure`]).
@@ -568,7 +578,7 @@ pub fn replace_stored(path: &Path) -> Result<String, String> {
     let replaced = (|| {
         let dir = folder(path)?;
         create_private_dir(dir)?;
-        let tmp = write_temp(dir, &token)?;
+        let (tmp, _) = write_temp(dir, &token)?;
         std::fs::rename(&tmp, path).inspect_err(|_| {
             let _ = std::fs::remove_file(&tmp);
         })?;
@@ -604,9 +614,9 @@ fn create_token_file(path: &Path, token: &str) -> std::io::Result<()> {
     // never `AlreadyExists` for the folder (something that is no folder is in its place, such as a
     // dangling link): that would be taken for another process having stored the token first
     create_private_dir(dir).map_err(|e| std::io::Error::other(format!("cannot make the folder {}: {e}", dir.display())))?;
-    let tmp = write_temp(dir, token)?;
+    let (tmp, _) = write_temp(dir, token)?;
     let linked = match std::fs::hard_link(&tmp, path) {
-        Err(e) if e.kind() != std::io::ErrorKind::AlreadyExists => write_private(path, token),
+        Err(e) if e.kind() != std::io::ErrorKind::AlreadyExists => write_private(path, token).map(drop),
         r => r,
     };
     let _ = std::fs::remove_file(&tmp);
@@ -637,8 +647,9 @@ fn create_private_dir(dir: &Path) -> std::io::Result<()> {
     Ok(())
 }
 
-/// `token` in a new private file in `dir`, under a random name no other process uses.
-fn write_temp(dir: &Path, token: &str) -> std::io::Result<PathBuf> {
+/// `token` in a new private file in `dir`, under a random name no other process uses: its name,
+/// and the file as it was made (for writing).
+fn write_temp(dir: &Path, token: &str) -> std::io::Result<(PathBuf, std::fs::File)> {
     let mut taken = None;
     for _ in 0..8 {
         let mut salt = [0u8; 8];
@@ -646,15 +657,16 @@ fn write_temp(dir: &Path, token: &str) -> std::io::Result<PathBuf> {
         let tmp = dir.join(format!(".{STORED_FILE}.{}.tmp", hex(&salt)));
         match write_private(&tmp, token) {
             Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => taken = Some(e),
-            r => return r.map(|()| tmp),
+            r => return r.map(|file| (tmp, file)),
         }
     }
     Err(taken.unwrap_or_else(|| std::io::ErrorKind::AlreadyExists.into()))
 }
 
 /// A new file at `path` holding `token` without a line break, private on unix (0600), on disk
-/// when this returns. Never opens an existing file; removes its own on failure.
-fn write_private(path: &Path, token: &str) -> std::io::Result<()> {
+/// when this returns (the file it made, open for writing). Never opens an existing file; removes
+/// its own on failure.
+fn write_private(path: &Path, token: &str) -> std::io::Result<std::fs::File> {
     let mut opts = std::fs::OpenOptions::new();
     opts.write(true).create_new(true);
     #[cfg(unix)]
@@ -667,11 +679,12 @@ fn write_private(path: &Path, token: &str) -> std::io::Result<()> {
         file.write_all(token.as_bytes())?;
         file.sync_all()
     })();
-    if written.is_err() {
+    if let Err(e) = written {
         drop(file);
         let _ = std::fs::remove_file(path);
+        return Err(e);
     }
-    written
+    Ok(file)
 }
 
 /// Best effort: make a new name in `dir` durable (POSIX; Windows cannot open a folder this way).
@@ -1077,6 +1090,70 @@ mod tests {
         std::os::unix::fs::chown(&dir, Some(0), None).unwrap();
         assert!(load_or_create(&path).unwrap().warnings.iter().all(|w| !w.contains("belongs to")));
         assert_eq!(std::fs::read_dir(&dir).unwrap().filter_map(Result::ok).filter(|e| e.file_name().to_string_lossy().ends_with(".tmp")).count(), 0);
+    }
+
+    #[cfg(unix)]
+    std::thread_local! {
+        /// What happens between the making of a uid probe ([`my_uid`]) and the reading of its
+        /// owner, in this test thread: what another user who can write to the folder may do then.
+        static PROBE_HOOK: std::cell::RefCell<Option<Box<dyn Fn(&Path)>>> = const { std::cell::RefCell::new(None) };
+    }
+
+    /// A uid probe was made at `probe`.
+    #[cfg(unix)]
+    pub(super) fn probe_made(probe: &Path) {
+        PROBE_HOOK.with(|h| {
+            if let Some(f) = &*h.borrow() {
+                f(probe);
+            }
+        });
+    }
+
+    /// The user id the owner check compares with is that of the probe file this process made, read
+    /// from the file it opened, not by its name: another user who can write to the folder (one of
+    /// theirs, a shared or a mounted one) can rename a file of theirs over the probe in between
+    /// (inotify tells them its name). Their planted token then passed as one's own, with no word
+    /// said, and the warning about their folder went too: as root, their token drove FilmCraft
+    /// with root's file access. Needs root (to give files away); skipped otherwise.
+    #[cfg(unix)]
+    #[test]
+    fn a_file_renamed_over_the_uid_probe_makes_no_token_ones_own() {
+        use std::os::unix::fs::{MetadataExt as _, PermissionsExt as _};
+        let tmp = TempDir::new("probe-swap");
+        let dir = tmp.0.join("theirs");
+        std::fs::create_dir(&dir).unwrap();
+        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let me = std::fs::metadata(&dir).unwrap().uid();
+        let other = if me == 1000 { 1001 } else { 1000 };
+        if std::os::unix::fs::chown(&dir, Some(other), None).is_err() {
+            return; // only root can give a folder away
+        }
+        let path = dir.join(STORED_FILE);
+        let planted = "d".repeat(64);
+        std::fs::write(&path, &planted).unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).unwrap();
+        std::os::unix::fs::chown(&path, Some(other), None).unwrap();
+        // the other user renames a file of theirs over each probe
+        PROBE_HOOK.with(|h| {
+            *h.borrow_mut() = Some(Box::new(move |probe: &Path| {
+                let theirs = probe.with_extension("theirs");
+                std::fs::write(&theirs, "").unwrap();
+                std::os::unix::fs::chown(&theirs, Some(other), None).unwrap();
+                std::fs::rename(&theirs, probe).unwrap();
+            }));
+        });
+        let e = load_or_create(&path).unwrap_err();
+        assert!(e.unusable && e.message.contains("belongs to another user") && e.message.contains(&format!("uid {other}")), "{e:?}");
+        assert!(!e.message.contains(&planted));
+        // a token of one's own, made in their folder and read back: their folder is warned about
+        std::fs::remove_file(&path).unwrap();
+        let made = load_or_create(&path).unwrap();
+        let warned = |s: &Stored| s.warnings.iter().any(|w| w.contains("belongs to another user") && w.contains(&format!("uid {other}")));
+        assert!(made.created && warned(&made), "{made:?}");
+        let again = load_or_create(&path).unwrap();
+        assert!(!again.created && again.token == made.token && warned(&again), "{again:?}");
+        PROBE_HOOK.with(|h| *h.borrow_mut() = None);
+        assert_eq!(TempDir::names(&dir), [STORED_FILE], "no probe left behind");
     }
 
     /// A data folder that cannot be made because something that is no folder is in its place
