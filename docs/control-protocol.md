@@ -161,7 +161,14 @@ Ctrl), `Ctrl` (macOS ⌃), `Alt`, `Shift`. The dialog (Edit ▸ Keyboard Shortcu
 
 ## MCP
 `filmcraft-cli mcp` serves MCP on stdio: headless (in-process session; `--demo` / `--project p.fcproj`)
-or `--bridge 127.0.0.1:9876` to drive the running app. Tools: `command_list`, `command_run`,
+or `--bridge 127.0.0.1:9876` to drive the running app. With `--http 127.0.0.1:9877` it serves MCP
+over Streamable HTTP at `http://127.0.0.1:9877/mcp` instead, for any number of clients that share
+the one backend (`claude mcp add --transport http filmcraft-http http://127.0.0.1:9877/mcp`).
+Unlike this control channel, that endpoint speaks HTTP, so a web page can address it: it checks
+`Host` and `Origin` (a browser's request gets 403), listens on loopback only unless a bearer token
+is set (`FILMCRAFT_MCP_TOKEN` or `--token-file`), and with a token refuses every request without it
+(401). In bridge mode it puts the app behind those checks, so keep `--control` on loopback.
+Details: [agents.md § HTTP transport](agents.md#http-transport). Tools: `command_list`, `command_run`,
 `command_batch`, `doc_inspect`, `render_preview`, `project_inspect`, `sequence_inspect`, `media_import`,
 `render_frame`, `ui_inspect`, `ui_elements`, `ui_click`, `ui_drag`, `ui_key`, `ui_type`, `ui_screenshot`,
 `ui_control`; resources `filmcraft://document` and `filmcraft://commands`. `.mcp.json` registers both.

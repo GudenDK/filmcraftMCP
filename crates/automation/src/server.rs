@@ -36,6 +36,9 @@ fn join_error(e: tokio::task::JoinError) -> AutomationError {
 pub struct FilmcraftMcp {
     backend: Arc<Backend>,
     tool_router: ToolRouter<Self>,
+    /// Bridge `render_frame` at a time moves the live playhead and puts it back: one at a time,
+    /// so concurrent clients (HTTP) don't see each other's frame or restore the wrong playhead.
+    view: Arc<tokio::sync::Mutex<()>>,
 }
 
 #[derive(Debug, Default, Deserialize, JsonSchema)]
@@ -196,10 +199,13 @@ fn wrap(r: Result<Value, AutomationError>) -> Result<CallToolResult, McpError> {
 
 impl FilmcraftMcp {
     pub fn headless(session: Session) -> Self {
-        Self { backend: Arc::new(Backend::Headless(Arc::new(Mutex::new(session)))), tool_router: Self::tool_router() }
+        Self::with_backend(Backend::Headless(Arc::new(Mutex::new(session))))
     }
     pub fn bridge(addr: &str) -> Result<Self, AutomationError> {
-        Ok(Self { backend: Arc::new(Backend::Bridge(Arc::new(BridgeClient::new(addr)?))), tool_router: Self::tool_router() })
+        Ok(Self::with_backend(Backend::Bridge(Arc::new(BridgeClient::new(addr)?))))
+    }
+    fn with_backend(backend: Backend) -> Self {
+        Self { backend: Arc::new(backend), tool_router: Self::tool_router(), view: Arc::new(tokio::sync::Mutex::new(())) }
     }
 
     pub async fn serve_stdio(self) -> Result<(), AutomationError> {
@@ -443,6 +449,7 @@ impl FilmcraftMcp {
                 // The Program monitor shows the playhead's frame, so the live playhead has to move
                 // for the screenshot; put it (and the selection, which may follow it) back after,
                 // so the tool stays read-only (#114).
+                let _view = self.view.lock().await;
                 let before = match self.run("sequence.inspect", json!({})).await {
                     Ok(v) => v,
                     Err(e) => return Ok(fail(e)),
@@ -551,7 +558,10 @@ impl FilmcraftMcp {
 
 impl FilmcraftMcp {
     async fn screenshot(&self, b: &BridgeClient, panel: Option<String>, max: u32) -> Result<CallToolResult, McpError> {
-        let path = std::env::temp_dir().join(format!("filmcraft-mcp-{}.png", std::process::id()));
+        // one file per call: concurrent screenshots (several HTTP clients) must not share one
+        static SHOT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let n = SHOT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let path = std::env::temp_dir().join(format!("filmcraft-mcp-{}-{n}.png", std::process::id()));
         if let Err(e) = b.call("ui.screenshot", json!({"path": path.to_string_lossy(), "panel": panel})).await {
             return Ok(fail(e));
         }

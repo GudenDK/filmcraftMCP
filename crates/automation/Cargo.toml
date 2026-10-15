@@ -1,6 +1,6 @@
 [package]
 name = "filmcraft-automation"
-description = "MCP server (rmcp) over the FilmCraft engine, plus a bridge to the running app's control channel"
+description = "MCP server (rmcp; stdio or Streamable HTTP) over the FilmCraft engine, plus a bridge to the running app's control channel"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
@@ -15,8 +15,16 @@ filmcraft-time = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 thiserror = { workspace = true }
-rmcp = { version = "3.5", default-features = false, features = ["server", "macros", "transport-io"] }
+# 3.5.1: a tool's invalid-params error (strict arguments) stays an in-band JSON-RPC error over HTTP
+rmcp = { version = "3.5.1", default-features = false, features = ["server", "macros", "transport-io", "transport-streamable-http-server"] }
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "io-std", "sync", "net", "io-util", "time"] }
 base64 = "0.22"
 schemars = "1"
 image = { version = "0.25", default-features = false, features = ["png"] }
+# Streamable HTTP transport (`http_transport`): rmcp has the protocol layer but no listener
+hyper = { version = "1", default-features = false, features = ["server", "http1"] }
+hyper-util = { version = "0.1", default-features = false, features = ["tokio"] }
+http = "1"
+http-body-util = "0.1"
+bytes = "1"
+tokio-util = "0.7"

@@ -7,14 +7,16 @@ FilmCraft from an agent. Part 2 covers developing FilmCraft as an agent.
 
 ## 1. MCP server
 
-`filmcraft-cli mcp` serves MCP on stdio. It has two modes:
+`filmcraft-cli mcp` serves MCP on stdio, or over HTTP with `--http` (see
+[HTTP transport](#http-transport)). It has two modes:
 
 | Mode | Command | What it drives |
 |---|---|---|
 | Headless | `filmcraft-cli mcp --demo` or `--project p.fcproj` (neither = empty project) | an in-process engine session, no window |
 | Bridge | `filmcraft-cli mcp --bridge 127.0.0.1:9876` | the running desktop app started with `filmcraft --control 9876` |
 
-Headless mode also takes `--data-dir DIR` (user presets). Any other option is rejected (exit 2):
+Headless mode also takes `--data-dir DIR` (user presets). `--http`, `--token-file`,
+`--allow-origin` and `--allow-host` set up the HTTP transport. Any other option is rejected (exit 2):
 there are no folder-confinement flags such as `--automation-read-root`, so the server can read
 and write wherever the user can.
 
@@ -53,6 +55,97 @@ claude mcp add filmcraft -- "C:\Program Files\FilmCraft\filmcraft-cli.exe" mcp
 # Linux, or macOS with the CLI unzipped onto PATH
 claude mcp add filmcraft -- filmcraft-cli mcp
 ```
+
+### HTTP transport
+
+With `--http ADDR`, `filmcraft-cli mcp` serves MCP over
+[Streamable HTTP](https://modelcontextprotocol.io/specification/2026-07-28/basic/transports/streamable-http)
+at `http://ADDR/mcp` instead of stdio. You start it once and leave it running; clients connect by
+URL instead of each launching its own child process, as with the HTTP MCP servers for ComfyUI. It
+works with both modes, and the tools, resources and conventions are the same as on stdio:
+
+```sh
+filmcraft-cli mcp --demo --http 127.0.0.1:9877                    # headless engine
+filmcraft --control 9876 &                                        # or the live app ...
+filmcraft-cli mcp --bridge 127.0.0.1:9876 --http 127.0.0.1:9877   # ... over HTTP
+```
+
+```text
+filmcraft-cli: MCP (Streamable HTTP) on http://127.0.0.1:9877/mcp, driving a headless engine with the demo project; no token: any local process can connect. Ctrl+C stops it.
+```
+
+`ADDR` is `PORT`, `127.0.0.1:PORT`, `[::1]:PORT` or `localhost:PORT` (all loopback);
+`127.0.0.1:0` picks a free port, and the line above, on stderr, shows the real one. Ctrl+C stops the
+server: calls in flight are cancelled, exports delete their partial files (it waits up to 15 s for
+them), and a second Ctrl+C quits at once. A port that is taken exits 1 with a hint (on Windows,
+reserved port ranges show in `netsh int ipv4 show excludedportrange protocol=tcp`).
+
+**Every client shares one backend.** All clients drive the same engine session (headless) or the
+same app (bridge): one project, one undo history. An edit made by one client is what the next
+`doc_inspect` shows the others, `edit.undo` from one client can undo another's edit, and the steps of
+two clients' `command_batch` calls can interleave.
+
+**Connecting.** Use the URL with the client's HTTP transport:
+
+```sh
+claude mcp add --transport http filmcraft-http http://127.0.0.1:9877/mcp
+```
+
+```json
+{ "mcpServers": { "filmcraft-http": { "type": "http", "url": "http://127.0.0.1:9877/mcp" } } }
+```
+
+With a token, the client sends it in a header (Claude Code expands `${VAR}` in `.mcp.json`):
+
+```json
+{
+  "mcpServers": {
+    "filmcraft-http": {
+      "type": "http",
+      "url": "http://127.0.0.1:9877/mcp",
+      "headers": { "Authorization": "Bearer ${FILMCRAFT_MCP_TOKEN}" }
+    }
+  }
+}
+```
+
+The repository's `.mcp.json` keeps the stdio servers, which Claude Code starts by itself; an HTTP
+entry only connects while a server is running. Claude Desktop runs local servers over stdio, so use
+the stdio command there.
+
+**Security.** Over HTTP any program that can open a socket can reach the server, and the tools write
+files wherever the user can, so the endpoint is locked down by default:
+
+- It listens on a loopback address. Any other address (`0.0.0.0:9877`, a LAN IP) needs a token (else
+  exit 2), and a warning says that plain HTTP carries the token and every request in clear text:
+  prefer `ssh -L 9877:127.0.0.1:9877 host`, or a TLS reverse proxy with `--allow-host`.
+- `Host` must name the server (`127.0.0.1:<port>`, `localhost:<port>` or `[::1]:<port>`), so a web
+  page that rebinds its DNS name to 127.0.0.1 gets 403. `--allow-host NAME[:PORT]` (repeatable) adds
+  names: a LAN name, `host.docker.internal:<port>` for a client in Docker, a tunnel.
+- A request with an `Origin` header comes from a browser and gets 403, unless the origin is listed
+  with `--allow-origin` (repeatable, e.g. `--allow-origin http://localhost:6274` for MCP Inspector).
+  MCP clients send no `Origin`. No CORS headers are sent.
+- **Token.** Set `FILMCRAFT_MCP_TOKEN`, or pass `--token-file FILE` (its first line), and every
+  request (every method, before anything else) needs `Authorization: Bearer <token>`, else 401. The
+  token is compared in constant time and never printed. There is no `--token VALUE`: other users can
+  read a command line. Without a token, any local process (any user, on a shared machine) can drive
+  FilmCraft; use one on shared machines. Generate one with e.g. `openssl rand -hex 32`, or on Windows
+  `[guid]::NewGuid().ToString("N") + [guid]::NewGuid().ToString("N")` in PowerShell.
+- At most 64 connections and 256 sessions at once; request bodies up to 4 MiB (413 above).
+
+**Protocol details.**
+
+- Clients on MCP revisions before 2026-07-28 `initialize` and get an `Mcp-Session-Id`; `DELETE`
+  ends a session, and one idle for an hour is dropped (its requests then fail: initialize again).
+  2026-07-28 clients (current Claude Code) send self-contained requests and get no session.
+- Replies come as an SSE stream (`text/event-stream`) that carries the call's progress notifications
+  before its result; a request must `Accept` both `application/json` and `text/event-stream`.
+- A body that isn't JSON gets HTTP 400 with the `-32700` parse error (id `null`), as a bad line does
+  on stdio. A JSON-RPC batch (array) gets 415.
+- Cancelling a call: a session client posts `notifications/cancelled`; a 2026-07-28 client closes
+  the call's HTTP response (it has no other way: that revision has no session to address it to).
+  Either way an export stops and deletes its partial file (see Long exports below). Closing the
+  response of a session client's call does *not* cancel it.
 
 ### Tools
 
@@ -95,8 +188,9 @@ driven one app can drive the others.
   accepted ones (`unknown argument "filtr" for command_list; expected: enabled_only, filter`), not a
   silently ignored key. `command_run.params` goes to the command unchanged.
 - **Errors.** A failing command is an `isError` result with the engine's message. A line that is not
-  JSON gets a `-32700` parse error (id `null`) and the server keeps serving. A command that panics is
-  reported as `internal error: …`, and the session stays usable.
+  JSON gets a `-32700` parse error (id `null`) and the server keeps serving (over HTTP: a body that
+  is not JSON, with HTTP status 400). A command that panics is reported as `internal error: …`, and
+  the session stays usable.
 - **Resources.** `filmcraft://document` (the project tree and active sequence, as `doc_inspect`) and
   `filmcraft://commands` (the command catalog, as `command_list`), both `application/json`. For MCP
   2026-07-28 clients such as current Claude Code, list and read results carry the `ttlMs` and
@@ -122,7 +216,9 @@ progress and stop it:
   <job status>}` at most every 100 ms while frames advance. Without a token it sends none.
 - `notifications/cancelled` for the request stops the encode at the next batch (`jobs.cancel`),
   deletes the partial output (the movie, or the frames and caption sidecar written so far) and sends
-  no response, as the MCP cancellation utility asks.
+  no response, as the MCP cancellation utility asks. Over HTTP the progress notifications come on
+  the call's SSE stream, and a 2026-07-28 client cancels by closing that stream instead (see
+  [HTTP transport](#http-transport)).
 - Without `wait` the command returns `{job, path}` at once, as before: poll `jobs.list` and stop it
   with `jobs.cancel`. Other exports (`file.exportFrame`, interchange formats, …) finish quickly and
   ignore the token.

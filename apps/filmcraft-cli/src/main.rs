@@ -96,6 +96,11 @@ SUBCOMMANDS
                                 --image-sequence <media> is the first numbered still of a sequence
   bench-decode <media> [--frames N]
   mcp                           MCP server on stdio (headless, or --bridge to the live app)
+  mcp --http <ADDR>             MCP server over Streamable HTTP at http://ADDR/mcp instead: a
+                                long-running server any number of clients connect to by URL;
+                                they all share one project (or the one live app with --bridge).
+                                ADDR is PORT, 127.0.0.1:PORT, [::1]:PORT or localhost:PORT
+                                (loopback); a non-loopback address needs a token. Ctrl+C stops it
   help                          this text
   --version                     print the version
 
@@ -107,6 +112,12 @@ OPTIONS
   --bridge <127.0.0.1:PORT>     send commands to the running app (`filmcraft --control PORT`)
   --data-dir <dir>              FilmCraft data directory for user export presets (headless;
                                 default: the app's data directory)
+  --token-file <path>           mcp --http: require `Authorization: Bearer <token>`, the token
+                                read from this file (or set FILMCRAFT_MCP_TOKEN)
+  --allow-origin <origin>       mcp --http: let this browser origin call (repeatable; any other
+                                request with an Origin header is refused)
+  --allow-host <host[:port]>    mcp --http: also answer to this Host (repeatable; a LAN name,
+                                host.docker.internal:PORT, a tunnel)
   --keep-going                  `run`: report failing lines and continue
   --compact                     one-line JSON output
 
@@ -479,9 +490,10 @@ async fn cli() {
             diag(format_args!("rendered {}x{} in {:.1} ms → {out}", img.w, img.h, dt.as_secs_f64() * 1000.0));
         }
         "mcp" => {
-            if let Some(opt) = a.unknown_opt(&["--bridge", "--project", "--demo", "--data-dir"]) {
+            if let Some(opt) = a.unknown_opt(&["--bridge", "--project", "--demo", "--data-dir", "--http", "--token-file", "--allow-origin", "--allow-host"]) {
                 usage(format!("unknown mcp option `{opt}`"));
             }
+            let http = mcp_http_options(&a);
             let server = match a.opt("--bridge") {
                 Some(addr) => filmcraft_automation::FilmcraftMcp::bridge(addr).unwrap_or_else(|e| usage(e)),
                 None => match Backend::open(&a) {
@@ -489,12 +501,120 @@ async fn cli() {
                     Backend::Bridge(_) => usage("mcp: use --bridge ADDR to drive a running app"),
                 },
             };
-            if let Err(e) = server.serve_stdio().await {
+            let result = match http {
+                Some((addr, opts)) => serve_mcp_http(&a, server, addr, opts).await,
+                None => server.serve_stdio().await,
+            };
+            if let Err(e) = result {
                 fail(format!("mcp: {e}"));
             }
         }
         other => usage(format!("unknown subcommand `{other}`")),
     }
+}
+
+/// `mcp --http` settings: the listen address and the server options (usage error on bad ones), or
+/// `None` for stdio.
+fn mcp_http_options(a: &Args) -> Option<(std::net::SocketAddr, filmcraft_automation::HttpOptions)> {
+    use filmcraft_automation::http_transport::{TOKEN_ENV, check_bind, check_token, parse_listen_addr};
+    if !a.flag("--http") {
+        if let Some(o) = ["--token-file", "--allow-origin", "--allow-host"].into_iter().find(|o| a.flag(o)) {
+            usage(format!("mcp: {o} needs --http"));
+        }
+        return None;
+    }
+    let Some(addr) = a.opt("--http") else { usage("mcp: --http needs an address: PORT, 127.0.0.1:PORT, [::1]:PORT or localhost:PORT") };
+    let addr = parse_listen_addr(addr).unwrap_or_else(|e| usage(format!("mcp --http: {e}")));
+    let token = match a.opt("--token-file") {
+        Some(p) => Some(read_token_file(p).unwrap_or_else(|e| usage(format!("mcp --token-file {p}: {e}")))),
+        None => match std::env::var(TOKEN_ENV) {
+            Ok(t) => Some(t.trim().to_string()).filter(|t| !t.is_empty()),
+            Err(std::env::VarError::NotPresent) => None,
+            Err(std::env::VarError::NotUnicode(_)) => usage(format!("mcp: {TOKEN_ENV} is not valid text")),
+        },
+    };
+    if let Some(t) = &token {
+        check_token(t).unwrap_or_else(|e| usage(format!("mcp: {e}")));
+    }
+    check_bind(addr, token.as_deref()).unwrap_or_else(|e| usage(format!("mcp --http: {e}")));
+    let opts = filmcraft_automation::HttpOptions {
+        token,
+        allowed_origins: a.opt_all("--allow-origin").into_iter().map(String::from).collect(),
+        allowed_hosts: a.opt_all("--allow-host").into_iter().map(String::from).collect(),
+        ..Default::default()
+    };
+    Some((addr, opts))
+}
+
+/// The first line of a token file (at most 4 KiB), trimmed.
+fn read_token_file(path: &str) -> Result<String, String> {
+    use std::io::Read as _;
+    let mut s = String::new();
+    std::fs::File::open(path).and_then(|f| f.take(4097).read_to_string(&mut s)).map_err(|e| e.to_string())?;
+    if s.len() > 4096 {
+        return Err("larger than 4 KiB: not a token file".into());
+    }
+    Ok(s.lines().next().unwrap_or_default().trim().to_string())
+}
+
+/// Serve MCP over HTTP until Ctrl+C. The listener is bound here so the URL printed (stderr) has the
+/// real port (`--http 127.0.0.1:0` picks a free one).
+async fn serve_mcp_http(
+    a: &Args,
+    server: filmcraft_automation::FilmcraftMcp,
+    addr: std::net::SocketAddr,
+    opts: filmcraft_automation::HttpOptions,
+) -> Result<(), filmcraft_automation::AutomationError> {
+    let listener = match tokio::net::TcpListener::bind(addr).await {
+        Ok(l) => l,
+        Err(e) => {
+            let hint = match e.kind() {
+                std::io::ErrorKind::AddrInUse => " (another program uses this port: pick another with --http 127.0.0.1:<port>)",
+                // WSAEACCES 10013: Hyper-V / WSL / WinNAT reserve port ranges on Windows
+                std::io::ErrorKind::PermissionDenied => {
+                    " (the port may be reserved or privileged; on Windows see `netsh int ipv4 show excludedportrange protocol=tcp`; pick another port)"
+                }
+                _ => "",
+            };
+            fail(format!("mcp: cannot listen on {addr}: {e}{hint}"));
+        }
+    };
+    let bound = listener.local_addr().unwrap_or(addr);
+    let backend = match (a.opt("--bridge"), a.opt("--project")) {
+        (Some(b), _) => format!("the live app at {b}"),
+        (None, Some(p)) => format!("a headless engine with {p}"),
+        (None, None) if a.flag("--demo") => "a headless engine with the demo project".to_string(),
+        (None, None) => "a headless engine".to_string(),
+    };
+    let auth = match (&opts.token, a.opt("--token-file")) {
+        (None, _) => "no token: any local process can connect".to_string(),
+        (Some(_), Some(f)) => format!("bearer token required (from {f})"),
+        (Some(_), None) => format!("bearer token required (from {})", filmcraft_automation::http_transport::TOKEN_ENV),
+    };
+    diag(format_args!("filmcraft-cli: MCP (Streamable HTTP) on http://{bound}/mcp, driving {backend}; {auth}. Ctrl+C stops it."));
+    if opts.token.as_ref().is_some_and(|t| t.len() < 16) {
+        diag(format_args!("filmcraft-cli: warning: the MCP token is short; use 32+ random characters"));
+    }
+    if !bound.ip().is_loopback() {
+        diag(format_args!(
+            "filmcraft-cli: warning: {bound} is reachable from the network and HTTP is not encrypted: the token and every request travel in clear text. Prefer 127.0.0.1 with `ssh -L` or a TLS reverse proxy (--allow-host)."
+        ));
+    }
+    let shutdown = async {
+        // no signal handler (rare): serve until the process is killed
+        if tokio::signal::ctrl_c().await.is_err() {
+            std::future::pending::<()>().await;
+        }
+        diag(format_args!("filmcraft-cli: MCP server stopping (Ctrl+C again to quit at once)"));
+        tokio::spawn(async {
+            if tokio::signal::ctrl_c().await.is_ok() {
+                std::process::exit(130);
+            }
+        });
+    };
+    server.serve_http_listener(listener, opts, shutdown).await?;
+    diag(format_args!("filmcraft-cli: MCP server stopped"));
+    Ok(())
 }
 
 /// The files an export wrote, from its result: `path` of a direct export, or each queued item's

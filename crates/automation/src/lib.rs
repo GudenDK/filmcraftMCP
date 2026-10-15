@@ -1,6 +1,8 @@
 //! # filmcraft-automation
 //!
-//! The FilmCraft MCP server (official `rmcp` SDK, stdio transport).
+//! The FilmCraft MCP server (official `rmcp` SDK): stdio ([`FilmcraftMcp::serve_stdio`]), or
+//! Streamable HTTP at `http://<addr>/mcp` ([`FilmcraftMcp::serve_http`], [`http_transport`]) where
+//! any number of clients share one backend.
 //!
 //! * **Headless** mode drives an in-process [`filmcraft_engine::Session`]: every engine command,
 //!   project/sequence inspection and frame rendering (PNG) — no window needed.
@@ -11,10 +13,12 @@
 #![cfg_attr(not(test), deny(clippy::unwrap_used, clippy::expect_used, clippy::panic, clippy::unimplemented, clippy::todo, clippy::unreachable))]
 
 pub mod bridge;
+pub mod http_transport;
 pub mod long_job;
 pub mod server;
 
 pub use bridge::BridgeClient;
+pub use http_transport::HttpOptions;
 pub use server::FilmcraftMcp;
 
 #[derive(Debug, thiserror::Error)]

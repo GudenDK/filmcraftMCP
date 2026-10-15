@@ -5,6 +5,7 @@
 //! short polls, so other requests are answered while the export runs.
 
 use std::path::Path;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::{Duration, SystemTime};
 
 use rmcp::RoleServer;
@@ -19,6 +20,30 @@ pub const LONG_COMMANDS: &[&str] = &["file.exportMedia"];
 
 /// How often the job is polled (and at most how often progress is reported).
 const POLL: Duration = Duration::from_millis(100);
+
+/// Long calls running now, cancelled ones still cleaning up included (HTTP shutdown waits for them).
+static IN_FLIGHT: AtomicUsize = AtomicUsize::new(0);
+
+/// How many long calls are running, in this process.
+pub fn calls_in_flight() -> usize {
+    IN_FLIGHT.load(Ordering::Relaxed)
+}
+
+/// Counts one long call for as long as it lives.
+struct InFlight;
+
+impl InFlight {
+    fn enter() -> Self {
+        IN_FLIGHT.fetch_add(1, Ordering::Relaxed);
+        Self
+    }
+}
+
+impl Drop for InFlight {
+    fn drop(&mut self) {
+        IN_FLIGHT.fetch_sub(1, Ordering::Relaxed);
+    }
+}
 
 /// Whether `command_run {id, params}` is a long call this module runs.
 pub fn is_long(id: &str, params: &Value) -> bool {
@@ -51,6 +76,7 @@ impl FilmcraftMcp {
     /// Run `id` (a [`LONG_COMMANDS`] entry, `wait: true`) as a job, reporting progress and
     /// honouring cancellation.
     pub(crate) async fn run_long(&self, id: &str, mut params: Value, context: &RequestContext<RoleServer>) -> CallToolResult {
+        let _in_flight = InFlight::enter();
         let started = SystemTime::now();
         if let Some(p) = params.as_object_mut() {
             p.insert("wait".into(), json!(false));

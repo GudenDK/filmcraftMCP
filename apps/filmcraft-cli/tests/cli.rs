@@ -27,6 +27,70 @@ fn help_and_usage_errors() {
     assert_eq!(cli(&["mcp", "--bridge", "0.0.0.0:9876"]).status.code(), Some(2));
 }
 
+/// `mcp --http`: bad, missing or non-loopback addresses (without a token) and HTTP options without
+/// `--http` are usage errors; the help lists the options.
+#[test]
+fn mcp_http_usage_errors() {
+    let cli_no_token =
+        |args: &[&str]| Command::new(env!("CARGO_BIN_EXE_filmcraft-cli")).args(args).env_remove("FILMCRAFT_MCP_TOKEN").output().expect("spawn filmcraft-cli");
+    for args in [
+        &["mcp", "--http", "0.0.0.0:9000"][..],
+        &["mcp", "--http", "192.168.1.5:9000"],
+        &["mcp", "--http", "nonsense"],
+        &["mcp", "--http", "example.com:9000"],
+        &["mcp", "--http"],
+        &["mcp", "--token-file", "t.txt"],
+        &["mcp", "--allow-origin", "http://localhost:6274"],
+        &["mcp", "--http", "127.0.0.1:0", "--token-file", "/nonexistent/token"],
+    ] {
+        let o = cli_no_token(args);
+        assert_eq!(o.status.code(), Some(2), "{args:?}: {}", String::from_utf8_lossy(&o.stderr));
+    }
+    let o = Command::new(env!("CARGO_BIN_EXE_filmcraft-cli"))
+        .args(["mcp", "--http", "127.0.0.1:0"])
+        .env("FILMCRAFT_MCP_TOKEN", "has space")
+        .output()
+        .expect("spawn filmcraft-cli");
+    assert_eq!(o.status.code(), Some(2), "{}", String::from_utf8_lossy(&o.stderr));
+    let help = String::from_utf8_lossy(&cli(&["help"]).stdout).into_owned();
+    for want in ["mcp --http <ADDR>", "--token-file", "--allow-origin", "--allow-host", "FILMCRAFT_MCP_TOKEN"] {
+        assert!(help.contains(want), "help lacks {want}");
+    }
+}
+
+/// `mcp --demo --http 127.0.0.1:0` prints its URL on stderr and answers `initialize` there.
+#[test]
+fn mcp_http_serves_initialize() {
+    use std::io::{BufRead, BufReader, Read};
+    let mut child = Command::new(env!("CARGO_BIN_EXE_filmcraft-cli"))
+        .args(["mcp", "--demo", "--http", "127.0.0.1:0"])
+        .env_remove("FILMCRAFT_MCP_TOKEN")
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("spawn filmcraft-cli");
+    let mut line = String::new();
+    BufReader::new(child.stderr.take().unwrap()).read_line(&mut line).unwrap();
+    let addr = line.split("http://").nth(1).and_then(|r| r.split("/mcp").next()).unwrap_or_else(|| panic!("no URL in {line:?}")).to_string();
+    let body =
+        r#"{"jsonrpc":"2.0","id":0,"method":"initialize","params":{"protocolVersion":"2025-06-18","capabilities":{},"clientInfo":{"name":"t","version":"1"}}}"#;
+    let mut s = std::net::TcpStream::connect(&addr).unwrap();
+    write!(
+        s,
+        "POST /mcp HTTP/1.1\r\nHost: {addr}\r\nAccept: application/json, text/event-stream\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+        body.len()
+    )
+    .unwrap();
+    let mut reply = String::new();
+    s.read_to_string(&mut reply).unwrap();
+    let _ = child.kill();
+    let _ = child.wait();
+    assert!(reply.starts_with("HTTP/1.1 200"), "{reply}");
+    assert!(reply.to_ascii_lowercase().contains("mcp-session-id:"), "{reply}");
+    assert!(reply.contains(r#""name":"filmcraft""#), "{reply}");
+}
+
 #[test]
 fn version_after_global_options() {
     let want = format!("filmcraft-cli {}\n", env!("CARGO_PKG_VERSION"));
