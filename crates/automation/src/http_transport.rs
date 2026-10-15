@@ -74,8 +74,9 @@ pub(crate) struct Limits {
     /// that has not made a request past the token, `Host` and `Origin` checks is closed for a new
     /// one; when every one has, the new one gets a 503 and is closed.
     pub(crate) connections: u32,
-    /// Connections from one peer (an IPv4 address or an IPv6 /64; every loopback address is one,
-    /// this machine) at once, so that one address cannot hold them all.
+    /// Connections from one peer (an IPv4 address or an IPv6 /64) at once, so that one address
+    /// cannot hold them all. Not for this machine (every loopback address is one peer): local
+    /// clients, and those a tunnel or proxy on it relays, may use every connection.
     pub(crate) connections_per_peer: usize,
     /// How long a client may take to send a request's head; also how long a keep-alive
     /// connection may sit idle between requests.
@@ -592,7 +593,10 @@ async fn serve_connection(
         tokio::select! {
             _ = conn.as_mut() => {}
             // closed to make room for another connection: it never made a request that passed
-            _ = slot.made_room() => {}
+            _ = slot.made_room() => {
+                let why = "made room";
+                reporter.log.event(peer.ip(), why, format_args!("closed a connection from {peer} that had sent no accepted request, to make room for another"));
+            }
             _ = stop.cancelled() => {
                 conn.as_mut().graceful_shutdown();
                 let _ = tokio::time::timeout(Duration::from_secs(5), conn).await;

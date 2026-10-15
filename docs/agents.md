@@ -303,13 +303,17 @@ wherever the user can, so the endpoint is locked down by default:
 
 #### Limits and timeouts
 
-- **Connections.** At most 32 at once from one address (an IPv4 address, or an IPv6 /64) and 256
-  in all. Every loopback address (127.0.0.0/8, ::1) counts as one, this machine: local clients
-  share those 32. At a limit, the oldest connection that has not yet made a request past the
-  `Host`, `Origin` and token checks is closed to make room, so connections that send nothing (or
-  nothing valid) cannot lock out clients that have the token. Only when every connection there has
-  made such a request does a new one get `503 Service Unavailable` with `Retry-After: 1` and is
-  closed.
+- **Connections.** At most 256 at once, and at most 32 from one other address (an IPv4 address, or
+  an IPv6 /64). Every loopback address (127.0.0.0/8, ::1) counts as one, this machine, which may
+  use all 256: local clients, and every client a tunnel or proxy on this machine relays, come from
+  there. At a limit, the oldest connection that has not yet made a request past the `Host`,
+  `Origin` and token checks is closed to make room, so connections that send nothing (or nothing
+  valid) cannot lock out clients that have the token; the log says so (`closed a connection from
+  127.0.0.1:50122 that had sent no accepted request, to make room for another`). Only when every
+  connection there has made such a request does a new one get `503 Service Unavailable` with
+  `Retry-After: 1` and is closed. A connection the client resets before the server accepts it
+  costs nothing; if the system runs out of file descriptors or memory, the server logs it and
+  pauses accepting for 100 ms at a time.
 - **Slow and idle clients.** A request's line and headers must arrive within 10 s. A keep-alive
   connection with no request for 10 s is closed. A body must arrive within 30 s, else 408. Bodies
   are limited to 4 MiB (413 above).

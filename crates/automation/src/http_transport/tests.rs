@@ -692,48 +692,46 @@ async fn keep_alive_request(addr: SocketAddr) -> TcpStream {
     s
 }
 
-/// Connections are capped per peer (every loopback address is one: this machine) and in all.
-/// One that has sent nothing valid yet is closed to make room for a new one, oldest first, so
-/// that silent connections cannot lock clients out; only when every one has made a request that
-/// passed does a new one get a 503 it can retry. A client that sends nothing, an idle keep-alive
-/// connection and a body that never ends are dropped after a timeout.
+/// Connections are capped (per peer too, but this machine, every loopback address, may use them
+/// all). One that has sent nothing valid yet is closed to make room for a new one, oldest first,
+/// so that silent connections cannot lock clients out, and that is logged; only when every one has
+/// made a request that passed does a new one get a 503 it can retry. A client that sends nothing,
+/// an idle keep-alive connection and a body that never ends are dropped after a timeout.
 #[tokio::test(flavor = "multi_thread")]
-async fn connections_are_capped_per_peer_and_timed_out() {
+async fn connections_are_capped_and_timed_out() {
     within(async {
         let (log, lines) = log_capture();
         let limits = Limits {
             connections: 5,
-            connections_per_peer: 3,
+            connections_per_peer: 2,
             header_timeout: Duration::from_millis(1500),
             body_timeout: Duration::from_millis(500),
             ..Limits::default()
         };
         let srv = Server::start_limited(demo(), HttpOptions { log, ..HttpOptions::default() }, limits).await;
         let t0 = std::time::Instant::now();
-        // silent connections, from several loopback addresses where the system allows it
+        // silent connections, from several loopback addresses where the system allows it: more
+        // than the per-peer cap, which does not apply to this machine
         let mut silent = Vec::new();
-        for local in ["127.0.0.2", "127.0.0.3", "127.0.0.1"] {
+        for local in ["127.0.0.2", "127.0.0.3", "127.0.0.1", "127.0.0.2", "127.0.0.3"] {
             silent.push(match connect_from(local, srv.addr).await {
                 Some(s) => s,
                 None => TcpStream::connect(srv.addr).await.unwrap(),
             });
         }
-        // they fill this machine's share, but the oldest makes room for a client with a request
+        // they fill the server, but the oldest makes room for a client with a request
         let mut kept = vec![keep_alive_request(srv.addr).await];
         let mut b = [0u8; 1];
         assert_eq!(tokio::time::timeout(WAIT, silent[0].read(&mut b)).await.expect("closed in time").unwrap_or(0), 0);
         assert!(t0.elapsed() < Duration::from_millis(1400), "closed to make room, before the header timeout: {:?}", t0.elapsed());
-        // connections whose requests passed are kept: three fill the share (the other silent ones
+        // connections whose requests passed are kept: five fill the server (the other silent ones
         // make room), and one more gets a 503
-        for _ in 0..2 {
+        for _ in 0..4 {
             kept.push(keep_alive_request(srv.addr).await);
         }
         let refused = read_all(TcpStream::connect(srv.addr).await.unwrap()).await;
         assert!(refused.starts_with("HTTP/1.1 503 ") && refused.contains("Retry-After: 1\r\n") && refused.contains("Connection: close\r\n"), "{refused}");
         assert!(refused.ends_with("too many connections"), "{refused}");
-        if let Some(s) = connect_from("127.0.0.4", srv.addr).await {
-            assert!(read_all(s).await.starts_with("HTTP/1.1 503 "), "another loopback address is this machine too");
-        }
         assert!(t0.elapsed() < Duration::from_millis(1400), "the checks ran before the header timeout: {:?}", t0.elapsed());
         // the rest of the silent connections made room for the kept ones
         for s in silent.iter_mut().skip(1) {
@@ -754,8 +752,11 @@ async fn connections_are_capped_per_peer_and_timed_out() {
         let r = send_declaring(srv.addr, "POST", &[ACCEPT, JSON], 1000, "{\"jsonrpc\"").await;
         assert_eq!(r.status, 408);
         let l = lines.lock().unwrap().join("\n");
-        assert!(l.contains("refused a connection from 127.0.0.1:") && l.contains("503: too many connections from this address"), "{l}");
+        assert!(l.contains("refused a connection from 127.0.0.1:") && l.contains("503: too many connections"), "{l}");
         assert!(l.contains("408 Request Timeout"), "{l}");
+        // five connections made room: one line, rate limited (all loopback addresses are one peer)
+        assert_eq!(l.matches("that had sent no accepted request, to make room for another").count(), 1, "{l}");
+        assert!(l.contains("closed a connection from 127.0.0."), "{l}");
     })
     .await;
 }

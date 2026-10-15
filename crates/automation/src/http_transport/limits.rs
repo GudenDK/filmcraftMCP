@@ -52,7 +52,9 @@ fn lock<T>(m: &Mutex<T>) -> MutexGuard<'_, T> {
 /// yet made a request the server accepted (past the token, `Host` and `Origin` checks) is closed
 /// to make room, so that connections that send nothing, or nothing valid, cannot lock out clients
 /// that have the token, from another address or from the same one (every local client is
-/// 127.0.0.1). Only when every connection there has proven itself is the new one refused.
+/// 127.0.0.1). Only when every connection there has proven itself is the new one refused. This
+/// machine (the loopback peer) has no share of its own: every local client, and every client a
+/// tunnel or proxy on it relays, comes from there, so it may use every connection.
 pub(super) struct Conns {
     max: usize,
     per_peer: usize,
@@ -105,8 +107,9 @@ impl Conns {
     /// there is none.
     pub(super) fn open(self: &Arc<Self>, ip: IpAddr) -> Result<ConnSlot, &'static str> {
         let peer = peer_key(ip);
+        let per_peer = if peer.is_loopback() { self.max } else { self.per_peer };
         let mut open = lock(&self.inner);
-        if open.peers.get(&peer).copied().unwrap_or(0) >= self.per_peer && !open.make_room(|c| c.peer == peer) {
+        if open.peers.get(&peer).copied().unwrap_or(0) >= per_peer && !open.make_room(|c| c.peer == peer) {
             return Err("too many connections from this address");
         }
         if open.conns.len() >= self.max && !open.make_room(|_| true) {
@@ -333,22 +336,27 @@ mod tests {
     }
 
     /// Connections that send nothing from several loopback addresses cannot lock local clients
-    /// out: they are one peer, and the oldest of them make room.
+    /// out: they are one peer, and the oldest of them make room. This machine has no share of its
+    /// own (local clients, and those a tunnel relays, all come from it): it may use every
+    /// connection, but never take those that proved themselves.
     #[test]
     fn silent_local_connections_make_room() {
-        let conns = Conns::new(256, 32);
+        let conns = Conns::new(64, 8);
+        let proven = conns.open("10.0.0.1".parse().unwrap()).unwrap();
+        proven.trusted().store(true, Ordering::Relaxed);
         let mut silent = Vec::new();
         for i in 0..8u8 {
-            for _ in 0..32 {
+            for _ in 0..12 {
                 if let Ok(s) = conns.open(IpAddr::V4(Ipv4Addr::new(127, 0, 0, 2 + i))) {
                     silent.push(s);
                 }
             }
         }
         let open = |slots: &[ConnSlot]| slots.iter().filter(|s| !s.close.is_cancelled()).count();
-        assert_eq!((silent.len(), open(&silent), lock(&conns.inner).conns.len()), (256, 32, 32), "one share for this machine, the oldest closed");
+        assert_eq!((silent.len(), open(&silent), lock(&conns.inner).conns.len()), (96, 63, 64), "the oldest closed, the proven one kept");
+        assert!(!proven.close.is_cancelled());
         let client = conns.open(IpAddr::V4(Ipv4Addr::LOCALHOST)).unwrap();
-        assert_eq!(open(&silent), 31, "a silent one made room");
+        assert_eq!(open(&silent), 62, "a silent one made room");
         assert!(!client.close.is_cancelled());
     }
 
