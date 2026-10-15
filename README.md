@@ -253,7 +253,8 @@ cargo run --release -p filmcraft                           # the desktop app, wi
 cargo run --release -p filmcraft -- --control 9876         # plus the JSON-lines control server
 cargo run --release -p filmcraft-cli -- commands           # list every engine command
 cargo run --release -p filmcraft-cli -- mcp                # MCP server (headless, stdio)
-cargo run --release -p filmcraft-cli -- mcp --demo --http 127.0.0.1:9877   # ... over HTTP at /mcp
+cargo run --release -p filmcraft-cli -- mcp --demo --http 127.0.0.1:9877   # ... over HTTP at /mcp (bearer token required)
+cargo run --release -p filmcraft-cli -- mcp-token          # print that token (made and stored on first use)
 ```
 
 Japanese text in the interface and in titles comes from [craft-fonts](https://github.com/storytold/craft-fonts), an optional build input (release builds always include it; without it FilmCraft uses its own and the system's fonts):

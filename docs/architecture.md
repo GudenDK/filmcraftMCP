@@ -726,7 +726,7 @@ All of these dispatch the same command ids.
 | UI | `ui-egui` menus, shortcuts, panels | `menus::invoke` → engine or UI command |
 | CLI | `filmcraft-cli` | `exec <id> key=value…`, `run script.jsonl` (one `{"id","params"}` per line), `inspect`, `import`, `export`, `render`, `probe`; `--save`, `--bridge` |
 | Control channel | `filmcraft --control <port>` | JSON lines on loopback TCP: engine commands plus synthetic input, inspection and screenshots of the live UI |
-| MCP | `filmcraft-cli mcp` | MCP server on stdio, or with `--http ADDR` over Streamable HTTP at `http://ADDR/mcp` ([agents.md § HTTP transport](agents.md#http-transport)): headless in-process session, or `--bridge` to the control channel |
+| MCP | `filmcraft-cli mcp` | MCP server on stdio, or with `--http ADDR` over Streamable HTTP at `http://ADDR/mcp`, bearer token required (by default one stored in the data directory; `filmcraft-cli mcp-token`) ([agents.md § HTTP transport](agents.md#http-transport)): headless in-process session, or `--bridge` to the control channel |
 
 - **Automation ids.** Every interactive widget calls `app.auto.add(id, rect, label)` each frame
   (`crates/ui-egui/src/automation.rs`). Agents click by id, e.g. `tools.Razor`,

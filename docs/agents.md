@@ -15,8 +15,9 @@ FilmCraft from an agent. Part 2 covers developing FilmCraft as an agent.
 | Headless | `filmcraft-cli mcp --demo` or `--project p.fcproj` (neither = empty project) | an in-process engine session, no window |
 | Bridge | `filmcraft-cli mcp --bridge 127.0.0.1:9876` | the running desktop app started with `filmcraft --control 9876` |
 
-Headless mode also takes `--data-dir DIR` (user presets). `--http`, `--token-file`,
-`--allow-origin` and `--allow-host` set up the HTTP transport. Any other option is rejected (exit 2):
+Headless mode also takes `--data-dir DIR` (user presets; over HTTP also where the token is
+stored). `--http`, `--token-file`, `--no-token`, `--allow-origin` and `--allow-host` set up the
+HTTP transport. Any other option is rejected (exit 2):
 there are no folder-confinement flags such as `--automation-read-root`, so the server can read
 and write wherever the user can.
 
@@ -76,9 +77,15 @@ filmcraft --control 9876 &                                        # or the live 
 filmcraft-cli mcp --bridge 127.0.0.1:9876 --http 127.0.0.1:9877   # ... over HTTP
 ```
 
+Every request must carry a bearer token, on `127.0.0.1` too (see [The token](#the-token)). The
+first start makes a random one and stores it for your user; later starts use the same one. The
+server prints where it is, never the token itself, and the command that registers it with Claude
+Code:
+
 ```text
-filmcraft-cli: MCP (Streamable HTTP) on http://127.0.0.1:9877/mcp, driving a headless engine with the demo project; no token: any local process can connect. Ctrl+C stops it.
-filmcraft-cli: connect Claude Code with: claude mcp add --transport http --scope user filmcraft-http http://127.0.0.1:9877/mcp
+filmcraft-cli: MCP (Streamable HTTP) on http://127.0.0.1:9877/mcp, driving a headless engine with the demo project; bearer token required (the one stored in /home/me/.local/share/filmcraft/mcp-token; `filmcraft-cli mcp-token` prints it). Ctrl+C stops it.
+filmcraft-cli: made a new random MCP token and stored it in /home/me/.local/share/filmcraft/mcp-token, readable only by you; `filmcraft-cli mcp-token` prints it, `filmcraft-cli mcp-token --new` replaces it
+filmcraft-cli: connect Claude Code with: claude mcp add --transport http --scope user filmcraft-http http://127.0.0.1:9877/mcp --header "Authorization: Bearer $(cat '/home/me/.local/share/filmcraft/mcp-token')"
 ```
 
 `--http` is newer than the 0.8.0 release, whose `filmcraft-cli` stops with "unknown mcp option"
@@ -114,28 +121,91 @@ same app (bridge): one project, one undo history. An edit made by one client is 
 `doc_inspect` shows the others, `edit.undo` from one client can undo another's edit, and the steps of
 two clients' `command_batch` calls can interleave.
 
+#### The token
+
+Unless started with `--no-token` (below), the HTTP server requires `Authorization: Bearer <token>`
+on every request, in headless and bridge mode, on loopback addresses too: any program on the
+machine can open a socket to the port, and every tool writes files or drives the app. (Stdio mode
+has no token: the client starts the server itself and talks to it through a pipe no other program
+can reach.) The token is, first match wins:
+
+1. `FILMCRAFT_MCP_TOKEN`, when set and not empty;
+2. the first line of `--token-file FILE`;
+3. the token stored in the file `mcp-token` in FilmCraft's data directory.
+
+| Install | Stored token |
+|---|---|
+| Windows | `%APPDATA%\FilmCraft\mcp-token` (`C:\Users\<you>\AppData\Roaming\FilmCraft\mcp-token`) |
+| Windows, portable zip (`portable.txt` next to the program) | `data\mcp-token` in the program's folder |
+| macOS | `~/Library/Application Support/FilmCraft/mcp-token` |
+| Linux | `$XDG_DATA_HOME/filmcraft/mcp-token`, by default `~/.local/share/filmcraft/mcp-token` |
+| Linux, Flatpak | `~/.var/app/ai.storyteller.filmcraft/data/filmcraft/mcp-token` |
+
+`--data-dir DIR` (or `FILMCRAFT_DATA_DIR=DIR`) keeps it in `DIR/mcp-token` instead: give
+`mcp-token` the same option. It is the app's data directory (autosaves, presets; see
+[project files](project-files.md)), never the current folder. `filmcraft-cli mcp-token --path`
+prints where it is.
+
+- **Made on first use.** When the file is not there, the server (or `mcp-token`) stores 32 random
+  bytes from the operating system's random number generator as 64 hex digits, without a line
+  break. On Linux and macOS the file is readable only by you (mode 600), and a folder made for it
+  too (700); on Windows your profile folder is private to you (and administrators). It is
+  written in one step and never over or through anything already at that path. A file there is
+  read the way a `--token-file` is (and gets the same warning if other users can read it).
+  When the folder cannot be made or the file cannot be read, the server exits 1 and says what
+  to do: `--data-dir`, `--token-file`, `FILMCRAFT_MCP_TOKEN`, or `mcp-token --new` to replace a
+  file that holds no usable token.
+- **Print it.** `filmcraft-cli mcp-token` prints the stored token on stdout (making it if
+  needed), for scripts: `--header "Authorization: Bearer $(filmcraft-cli mcp-token)"`. Notes go
+  to stderr, so `$(...)` takes only the token. With `FILMCRAFT_MCP_TOKEN` set it still prints the
+  stored one, and says on stderr that the server uses the variable instead.
+- **Replace it.** `filmcraft-cli mcp-token --new` stores a new random token in one step (a file
+  read at the same time is the old one or the new one, never half of one) and prints it. A server
+  that is running keeps the old token until you restart it, and clients registered with the old
+  token get 401: register them again (`claude mcp remove filmcraft-http --scope user`, then the
+  `claude mcp add` line again).
+- **Never shown.** The server prints where the token comes from, never the token. It is
+  compared in constant time and never logged. There is no `--token VALUE` option, because other
+  users can read a command line.
+- **Your own token.** Set `FILMCRAFT_MCP_TOKEN`, or put it in a file for `--token-file`. A token
+  you make yourself should be 32+ random characters (`openssl rand -hex 32`; in PowerShell
+  `[guid]::NewGuid().ToString("N") + [guid]::NewGuid().ToString("N")`): off loopback, behind a
+  tunnel or proxy, and with `--allow-origin null`, a shorter one is refused (exit 2), and on
+  loopback it gets a warning.
+- **`--no-token`** turns the token off: then any program on the machine, run by any user, can
+  drive FilmCraft through the port, and the server warns about it. It is allowed only on a
+  loopback address, and not together with `--allow-host` (the names containers, tunnels, proxies
+  and other machines reach the server by), `--allow-origin null`, `--token-file` or a set
+  `FILMCRAFT_MCP_TOKEN`; each of those exits 2.
+
 #### Connecting clients
 
-**Claude Code.** Add the URL with the HTTP transport. `--scope user` makes it available in every
-project; the default scope is the current project only:
+**Claude Code.** Paste the `claude mcp add` line the server prints, in another terminal. It reads
+the token from where the server got it, so the token is never shown on screen: on Linux and macOS
+with `$(cat '…')` (bash, zsh and fish 3.4+), on Windows in PowerShell with
+`$(Get-Content -Raw '…')`, and with `$FILMCRAFT_MCP_TOKEN` (`$env:FILMCRAFT_MCP_TOKEN`) when the
+token came from that variable. `--scope user` makes it available in every project; the default
+scope is the current project only:
 
 ```sh
-claude mcp add --transport http --scope user filmcraft-http http://127.0.0.1:9877/mcp
+claude mcp add --transport http --scope user filmcraft-http http://127.0.0.1:9877/mcp \
+  --header "Authorization: Bearer $(cat ~/.local/share/filmcraft/mcp-token)"
 claude mcp list                     # filmcraft-http: ✔ Connected, while the server runs
 ```
 
-With a token (see Security below), add the header after the name and URL, as Claude Code's own
-examples do:
+`$(filmcraft-cli mcp-token)` in place of reading the file works too. The header goes after the name
+and URL, as in Claude Code's own examples. Claude Code stores it, token included, in its settings
+(`~/.claude.json`; `claude mcp get filmcraft-http` shows it), so the token is read once, when you
+add the server: after `mcp-token --new`, remove the server and add it again. While `claude mcp
+add` runs, the token is on its command line, where other users of a shared machine could see it;
+the `.mcp.json` below avoids that. If `claude mcp list` shows `Failed to connect` with a message
+about OAuth or Dynamic Client Registration (Claude Code 2.1: `Dynamic Client Registration
+rejected (HTTP 404)`), the server answered 401 because no token or a wrong one was sent, and
+Claude Code then tried to sign in with OAuth, which this server does not offer: remove the server
+and add it again with the header.
 
-```sh
-claude mcp add --transport http --scope user filmcraft-http http://127.0.0.1:9877/mcp --header "Authorization: Bearer <token>"
-```
-
-That stores the token in your Claude Code settings (`~/.claude.json`). In a shell where the
-variable is set, write `"Authorization: Bearer $FILMCRAFT_MCP_TOKEN"` (PowerShell:
-`"Authorization: Bearer $env:FILMCRAFT_MCP_TOKEN"`) so you do not have to paste it. To keep the
-token out of the settings file, register the server in a `.mcp.json` instead and let Claude Code
-fill it in from the environment when it starts:
+To keep the token out of the settings file, register the server in a `.mcp.json` instead and let
+Claude Code fill it in from the environment when it starts:
 
 ```json
 {
@@ -149,38 +219,46 @@ fill it in from the environment when it starts:
 }
 ```
 
-`${FILMCRAFT_MCP_TOKEN}` must then be set in the environment Claude Code starts in. On Windows,
-`$env:FILMCRAFT_MCP_TOKEN = "..."` lasts only for that PowerShell window. Store it for your user
-with `setx FILMCRAFT_MCP_TOKEN "<token>"`, then open a new terminal and start Claude Code (and the
-server) from there: `setx` does not change windows that are already open. Without the variable,
-`claude mcp list` warns that it is missing and Claude Code sends the text `${FILMCRAFT_MCP_TOKEN}`
-as the token: every request gets 401, and after 10 of them 429 for a minute.
+Then start Claude Code where `FILMCRAFT_MCP_TOKEN` holds the token:
+`export FILMCRAFT_MCP_TOKEN="$(filmcraft-cli mcp-token)"` in bash or zsh, or
+`$env:FILMCRAFT_MCP_TOKEN = (& filmcraft-cli.exe mcp-token)` in PowerShell, which lasts only for
+that window. A server started in the same environment reads the variable and so uses the same
+token. Without the variable, `claude mcp list` warns that it is missing and Claude Code sends the
+text `${FILMCRAFT_MCP_TOKEN}` as the token: every request gets 401, and after 10 of them 429 for a
+minute.
 
-The repository's `.mcp.json` keeps the stdio servers, which Claude Code starts by itself; an HTTP
-entry only connects while a server is running.
+The repository's `.mcp.json` keeps the stdio servers, which Claude Code starts by itself and which
+need no token; an HTTP entry only connects while a server is running.
 
-**Other clients.** Any client with the Streamable HTTP transport takes the same URL, as
-`{"type": "http", "url": "http://127.0.0.1:9877/mcp"}` or its equivalent. Claude Desktop runs local
+**Other clients.** Any client with the Streamable HTTP transport takes the same URL and the header
+`Authorization: Bearer <token>`, as `{"type": "http", "url": "http://127.0.0.1:9877/mcp",
+"headers": {"Authorization": "Bearer <token>"}}` or its equivalent. Claude Desktop runs local
 servers over stdio, so use the stdio command there. MCP Inspector needs no flag in its default
-proxy mode, where its own Node process makes the requests and sends no `Origin`. Only its direct
-mode, where the browser calls the server, needs `--allow-origin http://localhost:6274` (see
-Security).
+proxy mode, where its own Node process makes the requests and sends no `Origin`; give it the token
+as its bearer token. Only its direct mode, where the browser calls the server, needs
+`--allow-origin http://localhost:6274` (see Security).
 
 **Containers and sandboxes.**
 
 - A client in a Docker Desktop container (Windows, macOS) reaches the host as
   `host.docker.internal`, which Docker Desktop forwards to the host's loopback, so the server can
-  stay on `127.0.0.1`. Add `--allow-host host.docker.internal:9877` so its `Host` is accepted.
-  Every container on the machine can then connect: without a token the server warns about it.
+  stay on `127.0.0.1`. Add `--allow-host host.docker.internal:9877` so its `Host` is accepted,
+  and hand the client the token, e.g. through the environment for one that reads it from there:
+  `export FILMCRAFT_MCP_TOKEN="$(filmcraft-cli mcp-token)"`, then `docker run -e
+  FILMCRAFT_MCP_TOKEN …` (which passes the variable on without putting the token on the command
+  line). Every container on the machine can reach the port, so this cannot be combined with
+  `--no-token`.
   Docker Engine on Linux has no such name by default. There, run the client with `--network host`
-  and use `127.0.0.1`. Otherwise, listen on the bridge address (e.g. `--http 172.17.0.1:9877`,
-  which needs a token) and give the client `http://172.17.0.1:9877/mcp`. To use
-  `http://host.docker.internal:9877/mcp` there instead, start the client with
+  and use `127.0.0.1`. Otherwise, listen on the bridge address (e.g. `--http 172.17.0.1:9877`;
+  the stored token is long enough for that) and give the client `http://172.17.0.1:9877/mcp`. To
+  use `http://host.docker.internal:9877/mcp` there instead, start the client with
   `--add-host=host.docker.internal:host-gateway` and the server with
   `--allow-host host.docker.internal:9877` too, else its `Host` gets 403.
 - The Flatpak sandbox has no network by default. The server can listen inside it, but host clients
   cannot reach it until you grant network access:
-  `flatpak override --user --share=network ai.storyteller.filmcraft`.
+  `flatpak override --user --share=network ai.storyteller.filmcraft`. The token is stored in the
+  sandbox's data directory (table above);
+  `flatpak run --command=filmcraft-cli ai.storyteller.filmcraft mcp-token` prints it.
 
 **Bridge mode.** The token and the checks below protect only the HTTP endpoint. The app's
 `--control` port has no authentication of its own: any local process can connect to it and drive
@@ -198,7 +276,7 @@ MSVC build tools (Visual Studio Build Tools, "Desktop development with C++"):
 git clone --branch mcp-http https://github.com/GudenDK/filmcraftMCP.git filmcraft
 cd filmcraft
 cargo build --release -p filmcraft-cli -p filmcraft     # the first build takes a while
-& .\target\release\filmcraft-cli.exe help              # lists `mcp --http <ADDR>`
+& .\target\release\filmcraft-cli.exe help              # lists `mcp --http <ADDR>` and `mcp-token`
 ```
 
 Pick a port nothing else uses and Windows does not reserve. `9877` usually works; check with:
@@ -221,67 +299,68 @@ without the app instead. On `127.0.0.1` Windows Firewall does not ask anything, 
 outside the machine can connect. It asks about network access only when you listen on `0.0.0.0` or
 a LAN address; allow it on private networks only.
 
-In another terminal, connect Claude Code and check it:
+The first start makes the token and says where it stored it, normally
+`C:\Users\<you>\AppData\Roaming\FilmCraft\mcp-token` (in a portable FilmCraft folder, one with
+`portable.txt` next to the program: `data\mcp-token` there). Its last line is the command for
+Claude Code, which the server prints for PowerShell on Windows. Copy it into another PowerShell
+window (not cmd.exe: `$(...)` is PowerShell), then check the connection:
 
 ```powershell
-claude mcp add --transport http --scope user filmcraft-http http://127.0.0.1:9877/mcp
-claude mcp list
+claude mcp add --transport http --scope user filmcraft-http http://127.0.0.1:9877/mcp --header "Authorization: Bearer $(Get-Content -Raw 'C:\Users\<you>\AppData\Roaming\FilmCraft\mcp-token')"
+claude mcp list                     # filmcraft-http: ✔ Connected
 ```
 
-To require a token as well, store one for your user. This is optional on a single-user PC, since
-the server only accepts local connections, but use it when others share the machine:
-
-```powershell
-setx FILMCRAFT_MCP_TOKEN ([guid]::NewGuid().ToString("N") + [guid]::NewGuid().ToString("N"))
-```
-
-`setx` changes only windows opened later, so stop the server and close the open PowerShell windows
-(and Claude Code). In a new window, in the `filmcraft` folder, start the server as before: it reads
-`FILMCRAFT_MCP_TOKEN` by itself, and its first line now says `bearer token required`. In another
-new window, register Claude Code again with the token:
-
-```powershell
-claude mcp remove filmcraft-http --scope user
-claude mcp add --transport http --scope user filmcraft-http http://127.0.0.1:9877/mcp --header "Authorization: Bearer $env:FILMCRAFT_MCP_TOKEN"
-```
+The server keeps the same token across restarts, so this is needed once.
+`& .\target\release\filmcraft-cli.exe mcp-token` prints the token, and `mcp-token --new` replaces
+it: then restart the server and register Claude Code again (`claude mcp remove filmcraft-http
+--scope user`, then the `claude mcp add` line). To use a token of your own instead, store it for
+your user with `setx FILMCRAFT_MCP_TOKEN "<token>"`: it comes before the stored one, and the
+server's last line then reads it with `$env:FILMCRAFT_MCP_TOKEN`. `setx` changes only windows opened
+later, so open new ones for the server and for Claude Code. On a PC only you use, `--no-token`
+turns the token off instead, but then any program on the machine can drive FilmCraft (see
+[The token](#the-token)).
 
 #### Security
 
 Over HTTP any program that can open a socket can reach the server, and the tools write files
 wherever the user can, so the endpoint is locked down by default:
 
+- Every request needs the bearer token (see [The token](#the-token)), unless `--no-token`, which
+  only a loopback address without `--allow-host` or `--allow-origin null` takes.
 - It listens on a loopback address. Any other address (`0.0.0.0:9877`, a LAN IP) needs a token of at
-  least 32 characters (else exit 2), and a warning says that plain HTTP carries the token and every
-  request in clear text: prefer `ssh -L 9877:127.0.0.1:9877 host`, or a TLS reverse proxy with
-  `--allow-host`. On `0.0.0.0` the first lines show the loopback URL, the `Host` values accepted, and
-  the `--allow-host <ip>:<port>` LAN clients need (until then they get 403).
+  least 32 characters (the stored one has 64; a shorter `FILMCRAFT_MCP_TOKEN` or `--token-file`
+  exits 2), and a warning says that plain HTTP carries the token and every request in clear text:
+  prefer `ssh -L 9877:127.0.0.1:9877 host`, or a TLS reverse proxy with `--allow-host`. On
+  `0.0.0.0` the first lines show the loopback URL, the `Host` values accepted, and the
+  `--allow-host <ip>:<port>` LAN clients need (until then they get 403).
 - `Host` must name the server: `127.0.0.1:<port>`, `localhost:<port>`, `[::1]:<port>` or the address
   it listens on. A web page that rebinds its DNS name to 127.0.0.1 gets 403.
   `--allow-host NAME[:PORT]` (repeatable) adds names: a LAN name or IP, `host.docker.internal:<port>`,
   a tunnel. A name without a port matches every port. A malformed entry exits 2. A name that is
   not this machine (anything but `localhost`, a name ending in `.localhost`, 127.0.0.0/8, `[::1]`
   and `host.docker.internal`) means requests relayed from the network by a tunnel or reverse
-  proxy, so it needs a token of at least 32 characters (else exit 2), as a non-loopback address
-  does. Behind a proxy every request comes from the proxy's address (on this machine: 127.0.0.1,
-  like local clients), so the per-address limits (connections, wrong tokens) count them all
-  together; the first lines say so.
+  proxy, so it needs a token of at least 32 characters (exit 2 with `--no-token` or a shorter
+  one), as a non-loopback address does. Behind a proxy every request comes from the proxy's
+  address (on this machine: 127.0.0.1, like local clients), so the per-address limits
+  (connections, wrong tokens) count them all together; the first lines say so.
 - **Proxies and tunnels.** Anything that relays network traffic to the port (a reverse proxy,
   `cloudflared`, `ngrok`, `ssh -R`) lets whoever reaches it drive FilmCraft, also when it rewrites
   `Host` to `127.0.0.1:<port>` or `localhost:<port>` so that no `--allow-host` is needed: nginx's
   default `proxy_pass http://127.0.0.1:9877;` does that, and so does
-  `ngrok http 9877 --host-header=rewrite`. Always set a token of 32+ characters for it. A request
-  carrying a header that proxies and tunnels add (`Forwarded`, `X-Forwarded-For`,
-  `X-Forwarded-Host`, `X-Forwarded-Proto`, `X-Real-IP`, `Via`, `CF-Connecting-IP`,
-  `True-Client-IP`) gets 403 without one. nginx's default adds none of them, though, and `ssh -R`
-  relays plain TCP, so the server cannot always tell: the token is up to you.
+  `ngrok http 9877 --host-header=rewrite`. Keep the token on for it, and if it is your own, 32+
+  characters long. A request carrying a header that proxies and tunnels add (`Forwarded`,
+  `X-Forwarded-For`, `X-Forwarded-Host`, `X-Forwarded-Proto`, `X-Real-IP`, `Via`,
+  `CF-Connecting-IP`, `True-Client-IP`) gets 403 with `--no-token` or a shorter token. nginx's
+  default adds none of them, though, and `ssh -R` relays plain TCP, so the server cannot always
+  tell: never run `--no-token` behind one.
 - A request with an `Origin` header comes from a browser and gets 403, unless the origin is listed
   with `--allow-origin` (repeatable). MCP clients send no `Origin`. An entry is `scheme://host:port`
   with the port written out, exactly as the browser sends it: `http://localhost:6274` and
   `http://127.0.0.1:6274` are different origins. Wildcards (a `*` anywhere), an entry without a
   port (it would match every port), paths, fragments, user names, a trailing dot and spellings
   browsers rewrite before sending them (`127.1`, `0x7f.0.0.1`, an IPv6 zone id) exit 2. `null`
-  needs a token of 32+ characters (else exit 2): every sandboxed frame and `file:` page sends
-  it, so it lets any web page call.
+  needs a token of 32+ characters (exit 2 with `--no-token` or a shorter one): every sandboxed
+  frame and `file:` page sends it, so it lets any web page call.
 - A listed origin gets CORS headers, so a page there can call the server: its preflight
   (`OPTIONS` with `Access-Control-Request-Method`) gets 204 with `Access-Control-Allow-Origin`,
   `Access-Control-Allow-Methods: GET, POST, DELETE` and the MCP request headers
@@ -291,22 +370,19 @@ wherever the user can, so the endpoint is locked down by default:
   `Access-Control-Allow-Origin`, `Vary: Origin` and
   `Access-Control-Expose-Headers: Mcp-Session-Id, Mcp-Protocol-Version, WWW-Authenticate`. Other
   origins never get CORS headers.
-- **Token.** Set `FILMCRAFT_MCP_TOKEN`, or pass `--token-file FILE` (its first line), and every
-  request (every method, checked right after `Host`, `Origin` and the proxy headers) needs
-  `Authorization: Bearer <token>`, else 401. The
-  token is compared in constant time and never printed or logged. There is no `--token VALUE`:
-  other users can read a command line. Without a token, any local process (any user, on a shared
-  machine) can drive FilmCraft; use one on shared machines. Generate one with
-  `openssl rand -hex 32`, or in PowerShell with
-  `[guid]::NewGuid().ToString("N") + [guid]::NewGuid().ToString("N")`.
+- **Token.** Every request (every method, checked right after `Host`, `Origin` and the proxy
+  headers) needs `Authorization: Bearer <token>`, else 401. Where the token comes from, how to
+  print or replace it and what `--no-token` allows: [The token](#the-token).
 - **Token files.** They may be UTF-8 or ASCII, with or without a byte-order mark, or UTF-16 with
   one; line breaks and surrounding spaces are dropped. That covers Windows PowerShell 5.1's
   `'token' > token.txt` (UTF-16) and cmd's `echo`. A file with no usable first line exits 2 with
-  a message that never shows its content. A new token written as ASCII always works:
+  a message that never shows its content (a stored token file that cannot be read exits 1). A
+  new token written as ASCII always works:
   `Set-Content -Encoding ascii -Path $env:USERPROFILE\filmcraft-token.txt -Value ([guid]::NewGuid().ToString("N") + [guid]::NewGuid().ToString("N"))`
   in PowerShell, `(umask 077; openssl rand -hex 32 > token.txt)` elsewhere. On Linux and macOS a
-  token file that other users can read or change gets a warning (`chmod 600` it). On Windows,
-  your profile folder is readable only by you and administrators by default.
+  token file (the stored one too) that other users can read or change gets a warning
+  (`chmod 600` it). On Windows, your profile folder is readable only by you and administrators by
+  default.
 - After 10 wrong tokens within a minute, an address gets 429 (`Retry-After`) instead of 401 for its
   wrong tokens, for a minute. The right token still gets in: one of 32+ characters cannot be
   guessed anyway, and every local client connects from the same address (127.0.0.1), so a local

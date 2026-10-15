@@ -163,14 +163,19 @@ Ctrl), `Ctrl` (macOS ⌃), `Alt`, `Shift`. The dialog (Edit ▸ Keyboard Shortcu
 `filmcraft-cli mcp` serves MCP on stdio: headless (in-process session; `--demo` / `--project p.fcproj`)
 or `--bridge 127.0.0.1:9876` to drive the running app. With `--http 127.0.0.1:9877` it serves MCP
 over Streamable HTTP at `http://127.0.0.1:9877/mcp` instead, for any number of clients that share
-the one backend (`claude mcp add --transport http --scope user filmcraft-http http://127.0.0.1:9877/mcp`).
-Unlike this control channel, that endpoint speaks HTTP, so a web page can address it: it checks
-`Host` and `Origin` (a browser's request gets 403 unless its origin is listed with
-`--allow-origin`, which also turns on CORS for it), listens on loopback only unless a bearer token
-of 32+ characters is set (`FILMCRAFT_MCP_TOKEN` or `--token-file`; also needed behind a tunnel or
-proxy, for an `--allow-host` name that is not this machine and for `--allow-origin null`), and with
-a token refuses every
-request without it (401; 429 for wrong tokens for a while after 10 of them). It caps connections
+the one backend. Unlike this control channel, that endpoint requires a bearer token on every
+request, on loopback too (401 without it; 429 for wrong tokens for a while after 10 of them): it
+is `FILMCRAFT_MCP_TOKEN`, else the first line of `--token-file`, else a random 64-hex-digit token
+the server stores as `mcp-token` in the data directory on first use (`filmcraft-cli mcp-token`
+prints it, `--new` replaces it, `--path` says where it is). The server prints where it is, never
+the token, and the line to register it:
+`claude mcp add --transport http --scope user filmcraft-http http://127.0.0.1:9877/mcp --header "Authorization: Bearer $(cat '<path>/mcp-token')"`
+(on Windows, for PowerShell: `$(Get-Content -Raw '<path>\mcp-token')`). `--no-token` turns it off,
+on a loopback address only and not with `--allow-host` or `--allow-origin null`. A non-loopback
+address, an `--allow-host` name that is not this machine (a tunnel or proxy) and
+`--allow-origin null` need a token of 32+ characters, which the stored one is. Since it speaks
+HTTP, a web page can address it too: it checks `Host` and `Origin` (a browser's request gets 403
+unless its origin is listed with `--allow-origin`, which also turns on CORS for it). It caps connections
 per address and in all (closing ones that never sent a valid request to make room), times out slow
 clients, closes idle sessions and logs what it refuses. Those checks guard
 only the HTTP endpoint: in bridge mode this control channel stays as it is, without
