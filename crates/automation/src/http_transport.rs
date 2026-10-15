@@ -514,10 +514,16 @@ async fn accept(listeners: &[tokio::net::TcpListener], gate: &Arc<gate::Gate>, c
             _ = stop.cancelled() => return,
             accepted = next() => match accepted {
                 Ok(accepted) => accepted,
-                Err(_) => {
+                // a connection reset or aborted before it was accepted: on to the next one at once
+                Err(e) if !accept_error_backs_off(&e) => continue,
+                Err(e) => {
                     // out of file descriptors and the like: back off instead of spinning
-                    tokio::time::sleep(Duration::from_millis(100)).await;
-                    continue;
+                    let why = "cannot accept connections";
+                    gate.log.event(IpAddr::V4(Ipv4Addr::UNSPECIFIED), why, format_args!("{why}: {e}; trying again in {} ms", ACCEPT_BACKOFF.as_millis()));
+                    tokio::select! {
+                        _ = stop.cancelled() => return,
+                        _ = tokio::time::sleep(ACCEPT_BACKOFF) => continue,
+                    }
                 }
             },
         };
@@ -537,6 +543,29 @@ async fn accept(listeners: &[tokio::net::TcpListener], gate: &Arc<gate::Gate>, c
         }
     }
 }
+
+/// Whether an error from `accept` should pause the accept loop for [`ACCEPT_BACKOFF`]: the system is
+/// out of something (file descriptors, buffers, memory) or the listener is broken, and trying again
+/// at once would only spin. An error about one connection does not: it was reset or aborted before
+/// it was accepted (Windows reports `WSAECONNRESET`, BSD and macOS `ECONNABORTED`), or Linux passes
+/// on a network error that is pending on it. The next one is then accepted at once, so that
+/// clients resetting connections in a loop cannot slow the server down for everyone.
+fn accept_error_backs_off(e: &std::io::Error) -> bool {
+    use std::io::ErrorKind::{ConnectionAborted, ConnectionRefused, ConnectionReset, Interrupted, WouldBlock};
+    if matches!(e.kind(), ConnectionReset | ConnectionAborted | ConnectionRefused | Interrupted | WouldBlock) {
+        return false;
+    }
+    // accept(2): network errors pending on the new socket (EPROTO, ENOPROTOOPT, EHOSTDOWN, ENONET,
+    // EHOSTUNREACH, ENETUNREACH, ENETDOWN), and firewall rules refusing it (EPERM)
+    #[cfg(target_os = "linux")]
+    if matches!(e.raw_os_error(), Some(71 | 92 | 112 | 64 | 113 | 101 | 100 | 1)) {
+        return false;
+    }
+    true
+}
+
+/// How long the accept loop pauses after an error that [`accept_error_backs_off`].
+const ACCEPT_BACKOFF: Duration = Duration::from_millis(100);
 
 /// Serve one connection's requests through the gate until it closes, or the server stops (then it
 /// finishes the request in progress, for at most 5 s).

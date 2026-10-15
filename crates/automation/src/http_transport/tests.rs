@@ -1382,6 +1382,42 @@ fn listen_addresses_and_bind_rules() {
     assert!(!format!("{:?}", HttpOptions { token: Some("hunter2".into()), ..HttpOptions::default() }).contains("hunter2"));
 }
 
+/// A connection reset or aborted before it was accepted is skipped at once; only running out of
+/// resources (or a broken listener) pauses the accept loop. Clients that reset connections in a
+/// loop used to cost 100 ms each, about 10 accepted connections a second for everyone.
+#[test]
+fn accept_errors_back_off_only_when_out_of_resources() {
+    use std::io::{Error, ErrorKind};
+    for kind in [ErrorKind::ConnectionReset, ErrorKind::ConnectionAborted, ErrorKind::ConnectionRefused, ErrorKind::Interrupted, ErrorKind::WouldBlock] {
+        assert!(!accept_error_backs_off(&Error::from(kind)), "{kind:?}");
+    }
+    for kind in [ErrorKind::OutOfMemory, ErrorKind::InvalidInput, ErrorKind::Other] {
+        assert!(accept_error_backs_off(&Error::from(kind)), "{kind:?}");
+    }
+    #[cfg(target_os = "linux")]
+    {
+        // ECONNABORTED, ECONNRESET, EPROTO, ENETDOWN, EPERM: one connection's
+        for code in [103, 104, 71, 100, 1] {
+            assert!(!accept_error_backs_off(&Error::from_raw_os_error(code)), "errno {code}");
+        }
+        // EMFILE, ENFILE, ENOBUFS, ENOMEM, EBADF, EINVAL
+        for code in [24, 23, 105, 12, 9, 22] {
+            assert!(accept_error_backs_off(&Error::from_raw_os_error(code)), "errno {code}");
+        }
+    }
+    #[cfg(windows)]
+    {
+        // WSAECONNRESET (a connection reset before accept), WSAECONNABORTED, WSAEINTR
+        for code in [10054, 10053, 10004] {
+            assert!(!accept_error_backs_off(&Error::from_raw_os_error(code)), "WSA error {code}");
+        }
+        // WSAEMFILE, WSAENOBUFS, WSAENOTSOCK
+        for code in [10024, 10055, 10038] {
+            assert!(accept_error_backs_off(&Error::from_raw_os_error(code)), "WSA error {code}");
+        }
+    }
+}
+
 #[test]
 fn bearer_header_matching() {
     let h = |s: &str| HeaderValue::from_str(s).unwrap();
