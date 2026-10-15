@@ -197,16 +197,17 @@ impl Spawned {
         Self::with_env(args, &[])
     }
     fn with_env(args: &[&str], env: &[(&str, &str)]) -> Self {
+        let mut cmd = Command::new(env!("CARGO_BIN_EXE_filmcraft-cli"));
+        cmd.args(args).envs(env.iter().copied());
+        Self::spawn(cmd)
+    }
+    /// `cmd` (filmcraft-cli, or a program that runs it) without `FILMCRAFT_MCP_TOKEN` unless set.
+    fn spawn(mut cmd: Command) -> Self {
         use std::io::BufRead;
-        let mut child = Command::new(env!("CARGO_BIN_EXE_filmcraft-cli"))
-            .args(args)
-            .env_remove("FILMCRAFT_MCP_TOKEN")
-            .envs(env.iter().copied())
-            .stdin(Stdio::piped())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .spawn()
-            .expect("spawn filmcraft-cli");
+        if !cmd.get_envs().any(|(k, _)| k == "FILMCRAFT_MCP_TOKEN") {
+            cmd.env_remove("FILMCRAFT_MCP_TOKEN");
+        }
+        let mut child = cmd.stdin(Stdio::piped()).stdout(Stdio::piped()).stderr(Stdio::piped()).spawn().expect("spawn filmcraft-cli");
         let lines = |r: Box<dyn std::io::Read + Send>| {
             let (tx, rx) = std::sync::mpsc::channel();
             std::thread::spawn(move || {
@@ -320,6 +321,30 @@ fn mcp_stops_cleanly_on_sigterm_and_sighup() {
         let said = if signal == "INT" { "stopping (Ctrl+C)".to_string() } else { format!("stopping (SIG{signal})") };
         assert!(err.contains(&said), "{err}");
     }
+}
+
+/// Under `nohup` (SIGHUP ignored) the server keeps running when the terminal hangs up, as it
+/// did before it watched SIGHUP; SIGTERM still stops it cleanly.
+#[cfg(target_os = "linux")]
+#[test]
+fn mcp_under_nohup_ignores_sighup() {
+    let mut cmd = Command::new("nohup");
+    cmd.args([env!("CARGO_BIN_EXE_filmcraft-cli"), "mcp", "--demo", "--http", "127.0.0.1:0"]);
+    let mut p = Spawned::spawn(cmd);
+    let mut banner = Spawned::line(&p.err);
+    while !banner.contains("http://127.0.0.1:") {
+        banner = Spawned::line(&p.err); // nohup's own note about its input
+    }
+    let addr = url_addr(&banner);
+    let pid = p.child.id().to_string(); // nohup execs the program: the same process
+    assert!(Command::new("kill").args(["-HUP", &pid]).status().expect("run kill").success());
+    std::thread::sleep(std::time::Duration::from_millis(300));
+    assert!(p.child.try_wait().unwrap().is_none(), "still running");
+    assert!(http_initialize(&addr, None).starts_with("HTTP/1.1 200"));
+    assert!(Command::new("kill").args(["-TERM", &pid]).status().expect("run kill").success());
+    let (status, err) = p.wait();
+    assert_eq!(status.code(), Some(0), "{err}");
+    assert!(err.contains("stopping (SIGTERM)") && !err.contains("SIGHUP"), "{err}");
 }
 
 #[test]

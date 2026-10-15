@@ -100,7 +100,14 @@ off and shutting down. The server says which one it got. The port closes at once
 are cancelled and sessions closed, and exports get time to delete their partial files: 15 s, or
 3 s when Windows is closing the console, logging off or shutting down (it ends the process about
 5 s after telling it). The output of an export still running at the end is deleted. A second
-signal quits at once. Stdio mode (`mcp` without `--http`) stops on the same signals.
+signal quits at once. Stdio mode (`mcp` without `--http`) stops on the same signals. Signals are
+watched from before the first line is printed, so one sent right after it still stops the server
+cleanly. On Linux a server started with `nohup` (SIGHUP ignored) keeps running when its terminal
+closes; macOS gives no way to tell, so there it stops: keep it running after logout with `tmux`,
+`screen` or a launchd job instead. Windows does not always tell a console program that loads
+graphics libraries (filmcraft-cli does) that the user is logging off or the system is shutting
+down; then the process ends without warning and a running export may leave its partial file, so
+stop the server before logging off.
 
 **Every client shares one backend.** All clients drive the same engine session (headless) or the
 same app (bridge): one project, one undo history. An edit made by one client is what the next

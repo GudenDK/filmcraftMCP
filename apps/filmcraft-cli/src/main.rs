@@ -507,9 +507,11 @@ async fn cli() {
                     Backend::Bridge(_) => usage("mcp: use --bridge ADDR to drive a running app"),
                 },
             };
+            // from here on (before the server starts and says so), a stop signal stops it cleanly
+            let signals = StopSignals::watch();
             let result = match http {
-                Some((addr, opts)) => serve_mcp_http(&a, server, addr, opts).await,
-                None => server.serve_stdio_until(stop_signal()).await,
+                Some((addr, opts)) => serve_mcp_http(&a, server, addr, opts, signals).await,
+                None => server.serve_stdio_until(stop_signal(signals)).await,
             };
             if let Err(e) = result {
                 fail(format!("mcp: {e}"));
@@ -578,6 +580,7 @@ async fn serve_mcp_http(
     server: filmcraft_automation::FilmcraftMcp,
     addr: std::net::SocketAddr,
     opts: filmcraft_automation::HttpOptions,
+    signals: StopSignals,
 ) -> Result<(), filmcraft_automation::AutomationError> {
     let listener = match tokio::net::TcpListener::bind(addr).await {
         Ok(l) => l,
@@ -664,7 +667,7 @@ async fn serve_mcp_http(
     // the line to paste, never with the token itself
     let header = if opts.token.is_some() { " --header \"Authorization: Bearer <token>\"" } else { "" };
     diag(format_args!("filmcraft-cli: connect Claude Code with: claude mcp add --transport http --scope user filmcraft-http http://{url_addr}/mcp{header}"));
-    server.serve_http_listeners(listeners, opts, stop_signal()).await?;
+    server.serve_http_listeners(listeners, opts, stop_signal(signals)).await?;
     diag(format_args!("filmcraft-cli: MCP server stopped"));
     Ok(())
 }
@@ -683,59 +686,127 @@ fn lan_address(v6: bool) -> Option<std::net::IpAddr> {
 /// stop, a closed terminal), or on Windows Ctrl+Break, or the console closing, the user logging off
 /// or the system shutting down. Windows ends the process about 5 s after those last three, so the
 /// server hurries. A second signal quits at once.
-async fn stop_signal() -> Stop {
-    let (how, what) = first_signal().await;
+async fn stop_signal(mut signals: StopSignals) -> Stop {
+    let (how, what) = signals.first().await;
     let grace = how.grace().as_secs();
     diag(format_args!("filmcraft-cli: MCP server stopping ({what}): cancelling calls, up to {grace} s for exports to clean up; Ctrl+C again quits at once"));
-    tokio::spawn(async {
-        first_signal().await;
+    tokio::spawn(async move {
+        signals.first().await;
         std::process::exit(130);
     });
     how
 }
 
-/// A future that never resolves when its signal cannot be watched.
-async fn or_never<T>(watching: std::io::Result<T>, recv: impl AsyncFnOnce(T) -> Option<()>) {
-    let Ok(w) = watching else { return std::future::pending().await };
-    if recv(w).await.is_none() {
-        std::future::pending::<()>().await;
-    }
+/// The next signal on `watching`, or never when it could not be watched.
+macro_rules! next_signal {
+    ($watching:expr) => {
+        async {
+            if let Some(s) = $watching.as_mut()
+                && s.recv().await.is_some()
+            {
+                return;
+            }
+            std::future::pending::<()>().await
+        }
+    };
+}
+
+/// The stop signals, watched from the moment [`StopSignals::watch`] is called: before the server
+/// starts and says so, so that a signal sent as soon as it has (by a supervisor, a test) stops it
+/// cleanly instead of killing it.
+#[cfg(unix)]
+struct StopSignals {
+    int: Option<tokio::signal::unix::Signal>,
+    term: Option<tokio::signal::unix::Signal>,
+    hup: Option<tokio::signal::unix::Signal>,
 }
 
 #[cfg(unix)]
-async fn first_signal() -> (Stop, &'static str) {
-    use tokio::signal::unix::{SignalKind, signal};
-    let ctrl_c = or_never(Ok(()), async |()| tokio::signal::ctrl_c().await.ok());
-    let term = or_never(signal(SignalKind::terminate()), async |mut s| s.recv().await);
-    let hup = or_never(signal(SignalKind::hangup()), async |mut s| s.recv().await);
-    tokio::select! {
-        _ = ctrl_c => (Stop::Graceful, "Ctrl+C"),
-        _ = term => (Stop::Graceful, "SIGTERM"),
-        _ = hup => (Stop::Graceful, "SIGHUP"),
+impl StopSignals {
+    fn watch() -> Self {
+        use tokio::signal::unix::{SignalKind, signal};
+        Self {
+            int: signal(SignalKind::interrupt()).ok(),
+            term: signal(SignalKind::terminate()).ok(),
+            // under `nohup` (or a supervisor that ignores SIGHUP) the server keeps running after
+            // the terminal closes, as before: watching SIGHUP would undo that
+            hup: if hangup_ignored() { None } else { signal(SignalKind::hangup()).ok() },
+        }
+    }
+
+    async fn first(&mut self) -> (Stop, &'static str) {
+        let Self { int, term, hup } = self;
+        tokio::select! {
+            _ = next_signal!(int) => (Stop::Graceful, "Ctrl+C"),
+            _ = next_signal!(term) => (Stop::Graceful, "SIGTERM"),
+            _ = next_signal!(hup) => (Stop::Graceful, "SIGHUP"),
+        }
     }
 }
 
+/// Whether this process started with SIGHUP ignored (`nohup`): Linux shows it in
+/// `/proc/self/status` (`SigIgn`, a hex mask, SIGHUP being bit 0). Elsewhere it cannot be told
+/// without `unsafe`, so SIGHUP is watched (docs/agents.md says what to use instead of `nohup`).
+#[cfg(unix)]
+fn hangup_ignored() -> bool {
+    std::fs::read_to_string("/proc/self/status").ok().is_some_and(|status| sighup_in_mask(&status))
+}
+
+/// SIGHUP's bit in the `SigIgn:` line of a `/proc/<pid>/status`.
+#[cfg(unix)]
+fn sighup_in_mask(status: &str) -> bool {
+    status.lines().find_map(|l| l.strip_prefix("SigIgn:")).and_then(|mask| u64::from_str_radix(mask.trim(), 16).ok()).is_some_and(|mask| mask & 1 == 1)
+}
+
 #[cfg(windows)]
-async fn first_signal() -> (Stop, &'static str) {
-    use tokio::signal::windows;
-    let ctrl_c = or_never(windows::ctrl_c(), async |mut s| s.recv().await);
-    let ctrl_break = or_never(windows::ctrl_break(), async |mut s| s.recv().await);
-    let close = or_never(windows::ctrl_close(), async |mut s| s.recv().await);
-    let logoff = or_never(windows::ctrl_logoff(), async |mut s| s.recv().await);
-    let shutdown = or_never(windows::ctrl_shutdown(), async |mut s| s.recv().await);
-    tokio::select! {
-        _ = ctrl_c => (Stop::Graceful, "Ctrl+C"),
-        _ = ctrl_break => (Stop::Graceful, "Ctrl+Break"),
-        _ = close => (Stop::Hurried, "the console is closing"),
-        _ = logoff => (Stop::Hurried, "the user is logging off"),
-        _ = shutdown => (Stop::Hurried, "the system is shutting down"),
+struct StopSignals {
+    ctrl_c: Option<tokio::signal::windows::CtrlC>,
+    ctrl_break: Option<tokio::signal::windows::CtrlBreak>,
+    close: Option<tokio::signal::windows::CtrlClose>,
+    logoff: Option<tokio::signal::windows::CtrlLogoff>,
+    shutdown: Option<tokio::signal::windows::CtrlShutdown>,
+}
+
+#[cfg(windows)]
+impl StopSignals {
+    fn watch() -> Self {
+        use tokio::signal::windows;
+        Self {
+            ctrl_c: windows::ctrl_c().ok(),
+            ctrl_break: windows::ctrl_break().ok(),
+            close: windows::ctrl_close().ok(),
+            logoff: windows::ctrl_logoff().ok(),
+            shutdown: windows::ctrl_shutdown().ok(),
+        }
+    }
+
+    async fn first(&mut self) -> (Stop, &'static str) {
+        let Self { ctrl_c, ctrl_break, close, logoff, shutdown } = self;
+        tokio::select! {
+            _ = next_signal!(ctrl_c) => (Stop::Graceful, "Ctrl+C"),
+            _ = next_signal!(ctrl_break) => (Stop::Graceful, "Ctrl+Break"),
+            _ = next_signal!(close) => (Stop::Hurried, "the console is closing"),
+            _ = next_signal!(logoff) => (Stop::Hurried, "the user is logging off"),
+            _ = next_signal!(shutdown) => (Stop::Hurried, "the system is shutting down"),
+        }
     }
 }
 
 #[cfg(not(any(unix, windows)))]
-async fn first_signal() -> (Stop, &'static str) {
-    or_never(Ok(()), async |()| tokio::signal::ctrl_c().await.ok()).await;
-    (Stop::Graceful, "Ctrl+C")
+struct StopSignals;
+
+#[cfg(not(any(unix, windows)))]
+impl StopSignals {
+    fn watch() -> Self {
+        Self
+    }
+
+    async fn first(&mut self) -> (Stop, &'static str) {
+        if tokio::signal::ctrl_c().await.is_err() {
+            std::future::pending::<()>().await;
+        }
+        (Stop::Graceful, "Ctrl+C")
+    }
 }
 
 /// The files an export wrote, from its result: `path` of a direct export, or each queued item's
@@ -815,6 +886,17 @@ fn set_custom_bounds(p: &mut Value, start: Option<&str>, end: Option<&str>) {
 
 #[cfg(test)]
 mod format_tests {
+    /// `nohup` starts the server with SIGHUP ignored; Linux shows that in `SigIgn` (bit 0).
+    #[cfg(unix)]
+    #[test]
+    fn sighup_is_read_from_the_ignored_mask() {
+        assert!(super::sighup_in_mask("Name:\tfilmcraft-cli\nSigIgn:\t0000000000000001\nSigCgt:\t0000000000004002\n"));
+        assert!(super::sighup_in_mask("SigIgn:\t0000000000381001\n"));
+        assert!(!super::sighup_in_mask("SigIgn:\t0000000000001000\n"));
+        assert!(!super::sighup_in_mask("SigIgn:\tnot hex\n"));
+        assert!(!super::sighup_in_mask(""));
+    }
+
     #[test]
     fn render_reports_the_real_reason() {
         let mut s = filmcraft_engine::Session::default();
