@@ -1038,8 +1038,7 @@ mod tests {
     /// it, deletes the partial file and sends no response.
     #[tokio::test(flavor = "multi_thread")]
     async fn export_progress_and_cancel() {
-        let dir = std::env::temp_dir().join(format!("filmcraft-mcp-progress-{}", std::process::id()));
-        std::fs::create_dir_all(&dir).unwrap();
+        let dir = crate::TestDir::new("progress");
         let mut c = Client::start(demo());
         c.init().await;
         let export = |id: u64, name: &str, token: Option<Value>, seconds: f64| {
@@ -1132,7 +1131,6 @@ mod tests {
         };
         assert_eq!(last["result"]["error"], "cancelled", "{jobs}");
         assert!(!dir.join("b.mp4").exists());
-        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// stdio stops when asked (a signal: SIGTERM, a closing console) or when the client closes its
@@ -1141,8 +1139,7 @@ mod tests {
     #[tokio::test(flavor = "multi_thread")]
     async fn stdio_stops_mid_export_without_leaving_a_partial_file() {
         use tokio::io::{AsyncBufReadExt, AsyncWriteExt};
-        let dir = std::env::temp_dir().join(format!("filmcraft-mcp-stdio-stop-{}", std::process::id()));
-        std::fs::create_dir_all(&dir).unwrap();
+        let dir = crate::TestDir::new("stdio-stop");
         for (name, by_signal) in [("signal.mp4", true), ("eof.mp4", false)] {
             let out = dir.join(name);
             let (mut tx, server_in) = tokio::io::duplex(1 << 22);
@@ -1174,7 +1171,6 @@ mod tests {
             assert!(r.is_ok(), "{r:?}");
             assert!(!out.exists(), "{name}: the partial export is deleted");
         }
-        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// A hurried stop (Windows kills the process about 5 s after its console closes) keeps to its
@@ -1186,8 +1182,7 @@ mod tests {
     #[tokio::test(flavor = "multi_thread")]
     async fn a_hurried_stdio_stop_keeps_to_its_grace() {
         use tokio::io::{AsyncBufReadExt, AsyncWriteExt};
-        let dir = std::env::temp_dir().join(format!("filmcraft-mcp-hurried-stdio-{}", std::process::id()));
-        std::fs::create_dir_all(&dir).unwrap();
+        let dir = crate::TestDir::new("hurried-stdio");
         let mcp = FilmcraftMcp::headless(demo());
         // the engine stays busy for longer than the grace: an export's call cannot even start it
         let Backend::Headless(session) = &*mcp.backend else { panic!("headless") };
@@ -1233,7 +1228,6 @@ mod tests {
         let jobs = session.lock().unwrap_or_else(PoisonError::into_inner).execute("jobs.list", json!({})).unwrap();
         assert_eq!(jobs, json!([]), "no export started: {jobs}");
         assert!(!out.exists());
-        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// Bridge screenshots: the app is told to write into the server's private directory (not a

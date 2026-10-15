@@ -405,9 +405,7 @@ mod tests {
 
     #[test]
     fn only_the_exports_own_files_are_removed() {
-        let dir = std::env::temp_dir().join(format!("fc-remove-partial-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
-        std::fs::create_dir_all(&dir).unwrap();
+        let dir = crate::TestDir::new("remove-partial");
         let started = SystemTime::now();
         let ours = ["trailer.png", "trailer000.png", "trailer123.png", "trailer.srt", "trailer.vtt"];
         // same stem, written during the export, but not the export's
@@ -422,14 +420,11 @@ mod tests {
         for f in theirs {
             assert!(dir.join(f).exists(), "{f} must not be removed");
         }
-        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
     fn numbered_files_beside_a_movie_are_kept() {
-        let dir = std::env::temp_dir().join(format!("fc-remove-partial-movie-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
-        std::fs::create_dir_all(&dir).unwrap();
+        let dir = crate::TestDir::new("remove-partial-movie");
         let started = SystemTime::now();
         // a movie export writes one file: `clip1.mp4` and `clip002.mp4` are other exports
         let ours = ["clip.mp4", "clip.srt"];
@@ -444,14 +439,11 @@ mod tests {
         for f in theirs {
             assert!(dir.join(f).exists(), "{f} must not be removed");
         }
-        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
     fn sequence_frames_have_at_least_three_digits() {
-        let dir = std::env::temp_dir().join(format!("fc-remove-partial-digits-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
-        std::fs::create_dir_all(&dir).unwrap();
+        let dir = crate::TestDir::new("remove-partial-digits");
         let started = SystemTime::now();
         // frames are numbered with at least three digits (`shot000.tiff`); `shot2.tiff` is not one
         let ours = ["shot.tiff", "shot000.tiff", "shot1234.tiff"];
@@ -466,16 +458,13 @@ mod tests {
         for f in theirs {
             assert!(dir.join(f).exists(), "{f} must not be removed");
         }
-        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// Shutdown deletes what an export still running at its deadline wrote (the process exits
     /// before the export's own cancellation could), and each server counts only its own calls.
     #[tokio::test]
     async fn drain_deletes_the_output_of_calls_still_running() {
-        let dir = std::env::temp_dir().join(format!("fc-long-calls-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
-        std::fs::create_dir_all(&dir).unwrap();
+        let dir = crate::TestDir::new("long-calls");
         let (a, b) = (Arc::new(LongCalls::default()), Arc::new(LongCalls::default()));
         let started = SystemTime::now();
         let call = a.enter(None);
@@ -493,7 +482,6 @@ mod tests {
         assert!(dir.join("other.mp4").exists());
         drop(call);
         assert_eq!(a.count(), 0);
-        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// Stopping the server cancels the long calls running then, and those that begin until the
@@ -516,9 +504,7 @@ mod tests {
     /// its output deleted; one that begins while the server stops is cancelled at once.
     #[tokio::test]
     async fn exports_started_without_wait_are_stopped_and_cleaned_up() {
-        let dir = std::env::temp_dir().join(format!("fc-long-background-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
-        std::fs::create_dir_all(&dir).unwrap();
+        let dir = crate::TestDir::new("long-background");
         let job = |id| filmcraft_engine::Job { id, label: "export".into(), progress: Default::default(), result: Default::default() };
         let calls = Arc::new(LongCalls::default());
         let (running, late) = (job(1), job(2));
@@ -541,7 +527,6 @@ mod tests {
         assert!(t0.elapsed() >= Duration::from_millis(150), "waited for the export to stop writing");
         assert!(!out.exists(), "its partial output is deleted");
         assert!(calls.lock().background.is_empty());
-        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// Closing an HTTP session (its client's `DELETE`) cancels that session's long calls, and no
@@ -560,12 +545,9 @@ mod tests {
 
     #[test]
     fn files_older_than_the_export_are_kept() {
-        let dir = std::env::temp_dir().join(format!("fc-remove-partial-old-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
-        std::fs::create_dir_all(&dir).unwrap();
+        let dir = crate::TestDir::new("remove-partial-old");
         std::fs::write(dir.join("clip.mp4"), b"x").unwrap();
         remove_partial(&dir.join("clip.mp4").to_string_lossy(), SystemTime::now() + Duration::from_secs(60));
         assert!(dir.join("clip.mp4").exists());
-        let _ = std::fs::remove_dir_all(&dir);
     }
 }

@@ -1010,8 +1010,7 @@ async fn idle_sessions_are_closed_but_busy_ones_kept() {
 #[tokio::test(flavor = "multi_thread")]
 async fn a_long_quiet_call_outlives_the_idle_timeout() {
     within(async {
-        let dir = std::env::temp_dir().join(format!("filmcraft-mcp-http-quiet-{}", std::process::id()));
-        std::fs::create_dir_all(&dir).unwrap();
+        let dir = crate::TestDir::new("http-quiet");
         let out = dir.join("quiet.mp4");
         let idle = Duration::from_millis(200);
         let opts = HttpOptions { session_idle: Some(idle), ..HttpOptions::default() };
@@ -1031,7 +1030,6 @@ async fn a_long_quiet_call_outlives_the_idle_timeout() {
         assert!(t0.elapsed() > idle * 3, "the export ran for several idle periods: {:?}", t0.elapsed());
         assert!(out.exists());
         assert_eq!(post(srv.addr, Some(&sid), &[], &ping(7)).await.reply().await["id"], 7, "the id is free again");
-        let _ = std::fs::remove_dir_all(&dir);
     })
     .await;
 }
@@ -1330,8 +1328,7 @@ async fn deletes_reset_by_the_client_leave_no_untracked_session() {
 #[tokio::test(flavor = "multi_thread")]
 async fn a_call_whose_client_disconnected_keeps_its_session() {
     within(async {
-        let dir = std::env::temp_dir().join(format!("filmcraft-mcp-http-dropped-{}", std::process::id()));
-        std::fs::create_dir_all(&dir).unwrap();
+        let dir = crate::TestDir::new("http-dropped");
         let out = dir.join("dropped.mp4");
         let (log, lines) = log_capture();
         let opts = HttpOptions { session_idle: Some(Duration::from_millis(300)), log, ..HttpOptions::default() };
@@ -1371,7 +1368,6 @@ async fn a_call_whose_client_disconnected_keeps_its_session() {
             }
             assert!(t0.elapsed() < Duration::from_secs(30), "closed once idle");
         }
-        let _ = std::fs::remove_dir_all(&dir);
     })
     .await;
 }
@@ -1552,8 +1548,7 @@ async fn shutdown_returns() {
 #[tokio::test(flavor = "multi_thread")]
 async fn shutdown_deletes_partial_exports_and_closes_the_port_at_once() {
     within(async {
-        let dir = std::env::temp_dir().join(format!("filmcraft-mcp-http-shutdown-{}", std::process::id()));
-        std::fs::create_dir_all(&dir).unwrap();
+        let dir = crate::TestDir::new("http-shutdown");
         let out = dir.join("partial.mp4");
         let mut srv = Server::start(demo(), HttpOptions::default()).await;
         let (sid, _) = init(srv.addr, &[]).await;
@@ -1579,7 +1574,6 @@ async fn shutdown_deletes_partial_exports_and_closes_the_port_at_once() {
         assert!(r.is_ok(), "{r:?}");
         assert!(!out.exists(), "the partial export is deleted");
         assert_eq!(srv.mcp.long_calls.count(), 0);
-        let _ = std::fs::remove_dir_all(&dir);
     })
     .await;
 }
@@ -1592,8 +1586,7 @@ async fn shutdown_deletes_partial_exports_and_closes_the_port_at_once() {
 #[tokio::test(flavor = "multi_thread")]
 async fn a_hurried_stop_deletes_partial_exports_within_its_grace() {
     within(async {
-        let dir = std::env::temp_dir().join(format!("filmcraft-mcp-http-hurried-{}", std::process::id()));
-        std::fs::create_dir_all(&dir).unwrap();
+        let dir = crate::TestDir::new("http-hurried");
         let out = dir.join("partial.mp4");
         let limits = Limits { hurried_grace: Duration::from_millis(1500), ..Limits::default() };
         let mut srv = Server::start_limited(demo(), HttpOptions::default(), limits).await;
@@ -1628,7 +1621,6 @@ async fn a_hurried_stop_deletes_partial_exports_within_its_grace() {
             assert!(t0.elapsed() < Duration::from_millis(2000), "the export was cancelled at once: {jobs}");
             tokio::time::sleep(Duration::from_millis(50)).await;
         }
-        let _ = std::fs::remove_dir_all(&dir);
     })
     .await;
 }
@@ -1651,8 +1643,7 @@ async fn first_progress(r: &mut Reply, id: u64) {
 #[tokio::test(flavor = "multi_thread")]
 async fn a_stop_cancels_an_export_waiting_for_the_busy_engine() {
     within(async {
-        let dir = std::env::temp_dir().join(format!("filmcraft-mcp-http-busy-{}", std::process::id()));
-        std::fs::create_dir_all(&dir).unwrap();
+        let dir = crate::TestDir::new("http-busy");
         let out = dir.join("busy.mp4");
         let mut srv = Server::start(demo(), HttpOptions::default()).await;
         let (sid, _) = init(srv.addr, &[]).await;
@@ -1681,7 +1672,6 @@ async fn a_stop_cancels_an_export_waiting_for_the_busy_engine() {
         assert_eq!((&last["finished"], &last["result"]["error"]), (&json!(true), &json!("cancelled")), "{jobs}");
         assert!(took < Duration::from_secs(2), "the export was cancelled at once, not after rmcp's 5 s drain: {took:?}");
         drop(r);
-        let _ = std::fs::remove_dir_all(&dir);
     })
     .await;
 }
@@ -1692,8 +1682,7 @@ async fn a_stop_cancels_an_export_waiting_for_the_busy_engine() {
 #[tokio::test(flavor = "multi_thread")]
 async fn ending_a_session_cancels_its_export() {
     within(async {
-        let dir = std::env::temp_dir().join(format!("filmcraft-mcp-http-delete-{}", std::process::id()));
-        std::fs::create_dir_all(&dir).unwrap();
+        let dir = crate::TestDir::new("http-delete");
         let out = dir.join("deleted.mp4");
         let srv = Server::start(demo(), HttpOptions::default()).await;
         let (sid, _) = init(srv.addr, &[]).await;
@@ -1721,7 +1710,6 @@ async fn ending_a_session_cancels_its_export() {
         assert_eq!(c.status, 202);
         wait_gone(&kept).await;
         drop((r, k));
-        let _ = std::fs::remove_dir_all(&dir);
     })
     .await;
 }
@@ -1734,8 +1722,7 @@ async fn ending_a_session_cancels_its_export() {
 #[tokio::test(flavor = "multi_thread")]
 async fn a_stop_cancels_exports_started_without_wait() {
     within(async {
-        let dir = std::env::temp_dir().join(format!("filmcraft-mcp-http-nowait-{}", std::process::id()));
-        std::fs::create_dir_all(&dir).unwrap();
+        let dir = crate::TestDir::new("http-nowait");
         let mut srv = Server::start(demo(), HttpOptions::default()).await;
         let (sid, _) = init(srv.addr, &[]).await;
         let params = |path: &std::path::Path, seconds: f64| {
@@ -1770,7 +1757,6 @@ async fn a_stop_cancels_exports_started_without_wait() {
         let jobs = srv.mcp.run("jobs.list", json!({})).await.unwrap();
         let errors: Vec<Value> = jobs.as_array().unwrap().iter().map(|j| j["result"]["error"].clone()).collect();
         assert_eq!(errors, [Value::Null, json!("cancelled"), json!("cancelled")], "{jobs}");
-        let _ = std::fs::remove_dir_all(&dir);
     })
     .await;
 }
@@ -1815,8 +1801,7 @@ async fn wait_gone(path: &std::path::Path) {
 #[tokio::test(flavor = "multi_thread")]
 async fn export_progress_and_cancel_over_http() {
     within(async {
-        let dir = std::env::temp_dir().join(format!("filmcraft-mcp-http-{}", std::process::id()));
-        std::fs::create_dir_all(&dir).unwrap();
+        let dir = crate::TestDir::new("http");
         let srv = Server::start(demo(), HttpOptions::default()).await;
         let (sid, _) = init(srv.addr, &[]).await;
         let path = |n: &str| dir.join(n).to_string_lossy().to_string();
@@ -1887,7 +1872,6 @@ async fn export_progress_and_cancel_over_http() {
         wait_gone(std::path::Path::new(&c)).await;
         let jobs = last_job_once_finished(srv.addr, &sid, 31).await;
         assert_eq!(jobs.as_array().and_then(|a| a.last()).map(|j| j["result"]["error"].clone()), Some(json!("cancelled")), "{jobs}");
-        let _ = std::fs::remove_dir_all(&dir);
     })
     .await;
 }
