@@ -165,9 +165,13 @@ or `--bridge 127.0.0.1:9876` to drive the running app. With `--http 127.0.0.1:98
 over Streamable HTTP at `http://127.0.0.1:9877/mcp` instead, for any number of clients that share
 the one backend (`claude mcp add --transport http filmcraft-http http://127.0.0.1:9877/mcp`).
 Unlike this control channel, that endpoint speaks HTTP, so a web page can address it: it checks
-`Host` and `Origin` (a browser's request gets 403), listens on loopback only unless a bearer token
-is set (`FILMCRAFT_MCP_TOKEN` or `--token-file`), and with a token refuses every request without it
-(401). In bridge mode it puts the app behind those checks, so keep `--control` on loopback.
+`Host` and `Origin` (a browser's request gets 403 unless its origin is listed with
+`--allow-origin`, which also turns on CORS for it), listens on loopback only unless a bearer token
+of 32+ characters is set (`FILMCRAFT_MCP_TOKEN` or `--token-file`), and with a token refuses every
+request without it (401; 429 for a while after 10 failures). It caps connections per address and
+in all, times out slow clients, closes idle sessions and logs what it refuses. Those checks guard
+only the HTTP endpoint: in bridge mode this control channel stays as it is, without
+authentication, so any local process can still drive the app through `--control` directly.
 Details: [agents.md § HTTP transport](agents.md#http-transport). Tools: `command_list`, `command_run`,
 `command_batch`, `doc_inspect`, `render_preview`, `project_inspect`, `sequence_inspect`, `media_import`,
 `render_frame`, `ui_inspect`, `ui_elements`, `ui_click`, `ui_drag`, `ui_key`, `ui_type`, `ui_screenshot`,
