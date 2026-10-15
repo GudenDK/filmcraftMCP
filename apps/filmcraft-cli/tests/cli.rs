@@ -27,12 +27,20 @@ fn help_and_usage_errors() {
     assert_eq!(cli(&["mcp", "--bridge", "0.0.0.0:9876"]).status.code(), Some(2));
 }
 
+/// `filmcraft-cli args` (without `FILMCRAFT_MCP_TOKEN` unless `env` sets it), once it has exited:
+/// a usage error that started a server instead fails the test after 30 s rather than hanging it.
+fn cli_exit(args: &[&str], env: &[(&str, &str)]) -> Output {
+    let mut p = Spawned::with_env(args, env);
+    let (status, stderr) = p.wait();
+    let stdout: Vec<String> = p.out.iter().collect();
+    Output { status, stdout: stdout.join("\n").into_bytes(), stderr: stderr.into_bytes() }
+}
+
 /// `mcp --http`: bad, missing or non-loopback addresses (without a token) and HTTP options without
 /// `--http` are usage errors; the help lists the options.
 #[test]
 fn mcp_http_usage_errors() {
-    let cli_no_token =
-        |args: &[&str]| Command::new(env!("CARGO_BIN_EXE_filmcraft-cli")).args(args).env_remove("FILMCRAFT_MCP_TOKEN").output().expect("spawn filmcraft-cli");
+    let cli_no_token = |args: &[&str]| cli_exit(args, &[]);
     for args in [
         &["mcp", "--http", "0.0.0.0:9000"][..],
         &["mcp", "--http", "192.168.1.5:9000"],
@@ -49,25 +57,23 @@ fn mcp_http_usage_errors() {
         &["mcp", "--http", "127.0.0.1:0", "--allow-origin", "localhost:6274"],
         &["mcp", "--http", "127.0.0.1:0", "--allow-host", "a b"],
         &["mcp", "--http", "127.0.0.1:0", "--allow-host", "lan.example:http"],
+        // a tunnel or proxy's name: clients from the network, so a token is needed
+        &["mcp", "--http", "127.0.0.1:0", "--allow-host", "my-tunnel.trycloudflare.com"],
     ] {
         let o = cli_no_token(args);
         assert_eq!(o.status.code(), Some(2), "{args:?}: {}", String::from_utf8_lossy(&o.stderr));
     }
-    let o = Command::new(env!("CARGO_BIN_EXE_filmcraft-cli"))
-        .args(["mcp", "--http", "127.0.0.1:0"])
-        .env("FILMCRAFT_MCP_TOKEN", "has space")
-        .output()
-        .expect("spawn filmcraft-cli");
+    let o = cli_exit(&["mcp", "--http", "127.0.0.1:0"], &[("FILMCRAFT_MCP_TOKEN", "has space")]);
     assert_eq!(o.status.code(), Some(2), "{}", String::from_utf8_lossy(&o.stderr));
-    // reachable from the network: a token too short to resist guessing is refused
-    let o = Command::new(env!("CARGO_BIN_EXE_filmcraft-cli"))
-        .args(["mcp", "--http", "0.0.0.0:0"])
-        .env("FILMCRAFT_MCP_TOKEN", "x".repeat(31))
-        .output()
-        .expect("spawn filmcraft-cli");
-    let err = String::from_utf8_lossy(&o.stderr);
-    assert_eq!(o.status.code(), Some(2), "{err}");
-    assert!(err.contains("at least 32 characters") && !err.contains(&"x".repeat(31)), "{err}");
+    // reachable from the network (directly, or through a tunnel): a token too short to resist
+    // guessing is refused
+    let short = "x".repeat(31);
+    for args in [&["mcp", "--http", "0.0.0.0:0"][..], &["mcp", "--http", "127.0.0.1:0", "--allow-host", "proxy.example:443"]] {
+        let o = cli_exit(args, &[("FILMCRAFT_MCP_TOKEN", &short)]);
+        let err = String::from_utf8_lossy(&o.stderr);
+        assert_eq!(o.status.code(), Some(2), "{args:?}: {err}");
+        assert!(err.contains("at least 32 characters") && !err.contains(&short), "{err}");
+    }
     let help = String::from_utf8_lossy(&cli(&["help"]).stdout).into_owned();
     for want in ["mcp --http <ADDR>", "--token-file", "--allow-origin", "--allow-host", "FILMCRAFT_MCP_TOKEN"] {
         assert!(help.contains(want), "help lacks {want}");
@@ -121,7 +127,7 @@ fn mcp_http_on_localhost_listens_on_both_loopback_addresses() {
     assert!(addr.starts_with("127.0.0.1:"), "{banner}");
     let port = addr.trim_start_matches("127.0.0.1:");
     let paste = Spawned::line(&p.err);
-    assert!(paste.ends_with(&format!("claude mcp add --transport http filmcraft-http http://{addr}/mcp")), "{paste}");
+    assert!(paste.ends_with(&format!("claude mcp add --transport http --scope user filmcraft-http http://{addr}/mcp")), "{paste}");
     assert!(http_initialize(&addr, None).starts_with("HTTP/1.1 200"));
     let ipv6 = std::net::TcpListener::bind("[::1]:0").is_ok();
     assert_eq!(banner.contains(&format!("(and [::1]:{port})")), ipv6, "{banner}");
@@ -155,7 +161,10 @@ fn mcp_http_token_file_in_utf16_with_a_permission_warning() {
     assert!(line.contains("bearer token required") && !line.contains(token), "{line}");
     let addr = url_addr(&line);
     let paste = Spawned::line(&p.err);
-    assert!(paste.contains(&format!("claude mcp add --transport http filmcraft-http http://{addr}/mcp --header \"Authorization: Bearer <token>\"")), "{paste}");
+    assert!(
+        paste.contains(&format!("claude mcp add --transport http --scope user filmcraft-http http://{addr}/mcp --header \"Authorization: Bearer <token>\"")),
+        "{paste}"
+    );
     assert!(!paste.contains(token), "{paste}");
     assert!(http_initialize(&addr, None).starts_with("HTTP/1.1 401"));
     let reply = http_initialize(&addr, Some(token));
@@ -164,7 +173,7 @@ fn mcp_http_token_file_in_utf16_with_a_permission_warning() {
     // a file with no token in it is a usage error that says how to write one
     for bytes in [&b""[..], b"\r\n", &[0x41, 0, 0x42, 0]] {
         std::fs::write(&file, bytes).unwrap();
-        let o = cli(&["mcp", "--http", "127.0.0.1:0", "--token-file", file.to_str().unwrap()]);
+        let o = cli_exit(&["mcp", "--http", "127.0.0.1:0", "--token-file", file.to_str().unwrap()], &[]);
         let err = String::from_utf8_lossy(&o.stderr);
         assert_eq!(o.status.code(), Some(2), "{err}");
         assert!(err.contains("Set-Content -Encoding ascii"), "{err}");
@@ -176,6 +185,8 @@ fn mcp_http_token_file_in_utf16_with_a_permission_warning() {
 /// and stderr lines arriving on channels so a test never blocks on a silent child.
 struct Spawned {
     child: std::process::Child,
+    // only the unix-only signal test writes to it
+    #[cfg_attr(not(unix), allow(dead_code))]
     stdin: Option<std::process::ChildStdin>,
     out: std::sync::mpsc::Receiver<String>,
     err: std::sync::mpsc::Receiver<String>,
@@ -251,6 +262,32 @@ fn mcp_http_on_every_interface_prints_usable_addresses() {
     // the printed URL works
     let reply = http_initialize(&addr, Some(token));
     assert!(reply.starts_with("HTTP/1.1 200"), "{reply}");
+}
+
+/// This machine's LAN address, if it has one (as the server finds it).
+fn lan_ip() -> Option<std::net::IpAddr> {
+    let socket = std::net::UdpSocket::bind("0.0.0.0:0").ok()?;
+    socket.connect("192.0.2.1:9").ok()?;
+    let ip = socket.local_addr().ok()?.ip();
+    (!ip.is_unspecified() && !ip.is_loopback()).then_some(ip)
+}
+
+/// The banner knows an `--allow-host` without a port matches every port (LAN clients then get
+/// in), and says that requests for a tunnel's or proxy's name come through it, from its address.
+#[test]
+fn mcp_http_banner_for_lan_and_relayed_hosts() {
+    let token = "banner-test-token-0123456789-abcdefgh";
+    if let Some(ip) = lan_ip() {
+        let ip = ip.to_string();
+        let p = Spawned::with_env(&["mcp", "--demo", "--http", "0.0.0.0:0", "--allow-host", &ip], &[("FILMCRAFT_MCP_TOKEN", token)]);
+        let lines: Vec<String> = (0..3).map(|_| Spawned::line(&p.err)).collect();
+        assert!(lines.iter().any(|l| l.contains(&format!("LAN clients: http://{ip}:"))), "{lines:?}");
+    }
+    let p = Spawned::with_env(&["mcp", "--demo", "--http", "127.0.0.1:0", "--allow-host", "proxy.example:443"], &[("FILMCRAFT_MCP_TOKEN", token)]);
+    let banner = Spawned::line(&p.err);
+    assert!(banner.contains("bearer token required"), "{banner}");
+    let relayed = Spawned::line(&p.err);
+    assert!(relayed.contains("requests for proxy.example:443 arrive through a tunnel or proxy"), "{relayed}");
 }
 
 /// `mcp` stops cleanly on SIGTERM and SIGHUP (kill, systemd, docker stop, a closed terminal) as

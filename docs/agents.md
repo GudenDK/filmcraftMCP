@@ -78,7 +78,7 @@ filmcraft-cli mcp --bridge 127.0.0.1:9876 --http 127.0.0.1:9877   # ... over HTT
 
 ```text
 filmcraft-cli: MCP (Streamable HTTP) on http://127.0.0.1:9877/mcp, driving a headless engine with the demo project; no token: any local process can connect. Ctrl+C stops it.
-filmcraft-cli: connect Claude Code with: claude mcp add --transport http filmcraft-http http://127.0.0.1:9877/mcp
+filmcraft-cli: connect Claude Code with: claude mcp add --transport http --scope user filmcraft-http http://127.0.0.1:9877/mcp
 ```
 
 `--http` is newer than the 0.8.0 release, whose `filmcraft-cli` stops with "unknown mcp option"
@@ -164,6 +164,7 @@ Security).
 - A client in a Docker Desktop container (Windows, macOS) reaches the host as
   `host.docker.internal`, which Docker Desktop forwards to the host's loopback, so the server can
   stay on `127.0.0.1`. Add `--allow-host host.docker.internal:9877` so its `Host` is accepted.
+  Every container on the machine can then connect: without a token the server warns about it.
   Docker Engine on Linux has no such name by default. There, run the client with `--network host`
   and use `127.0.0.1`. Otherwise, listen on the bridge address (e.g. `--http 172.17.0.1:9877`,
   which needs a token) and start the client with `--add-host=host.docker.internal:host-gateway`.
@@ -179,12 +180,12 @@ it.
 #### Windows quick start
 
 For the desktop app driven over HTTP from PowerShell. The 0.8.0 release has no `--http`, so build
-the CLI and the app from a branch that has it, e.g. `mcp-http-prototype` of
+the CLI and the app from a branch that has it, e.g. `mcp-http` of
 `https://github.com/GudenDK/filmcraftMCP`. You need Git, Rust from <https://rustup.rs> and the
 MSVC build tools (Visual Studio Build Tools, "Desktop development with C++"):
 
 ```powershell
-git clone --branch mcp-http-prototype https://github.com/GudenDK/filmcraftMCP.git filmcraft
+git clone --branch mcp-http https://github.com/GudenDK/filmcraftMCP.git filmcraft
 cd filmcraft
 cargo build --release -p filmcraft-cli -p filmcraft     # the first build takes a while
 & .\target\release\filmcraft-cli.exe help              # lists `mcp --http <ADDR>`
@@ -247,7 +248,12 @@ wherever the user can, so the endpoint is locked down by default:
 - `Host` must name the server: `127.0.0.1:<port>`, `localhost:<port>`, `[::1]:<port>` or the address
   it listens on. A web page that rebinds its DNS name to 127.0.0.1 gets 403.
   `--allow-host NAME[:PORT]` (repeatable) adds names: a LAN name or IP, `host.docker.internal:<port>`,
-  a tunnel. A name without a port matches every port. A malformed entry exits 2.
+  a tunnel. A name without a port matches every port. A malformed entry exits 2. A name that is
+  not this machine (anything but `localhost`, 127.0.0.0/8, `[::1]` and `host.docker.internal`)
+  means requests relayed from the network by a tunnel or reverse proxy, so it needs a token of at
+  least 32 characters (else exit 2), as a non-loopback address does. Behind a proxy every request
+  comes from the proxy's address (on this machine: 127.0.0.1, like local clients), so the
+  per-address limits (connections, wrong tokens) count them all together; the first lines say so.
 - A request with an `Origin` header comes from a browser and gets 403, unless the origin is listed
   with `--allow-origin` (repeatable). MCP clients send no `Origin`. An entry is `scheme://host:port`
   with the port written out, exactly as the browser sends it: `http://localhost:6274` and

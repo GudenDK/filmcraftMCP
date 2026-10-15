@@ -10,7 +10,9 @@
 //!   `allowed_origins` (which then also get CORS headers); MCP clients send none;
 //! * with a token, every request needs `Authorization: Bearer <token>` (constant-time compare),
 //!   checked next, else 401; a peer that sends 10 wrong tokens in a minute gets 429 for its
-//!   wrong ones for a minute (and for the right one too if it is shorter than 32 characters).
+//!   wrong ones for a minute (and for the right one too if it is shorter than 32 characters);
+//! * an `allowed_hosts` name that is not this machine (a LAN name, a tunnel, a proxy) means clients
+//!   from the network, so it needs a token of 32+ characters too ([`check_host_exposure`]).
 //!
 //! The gate (`gate.rs`) runs these checks before reading a body, maps a non-JSON body to a
 //! JSON-RPC parse error (`-32700`, as `serve_io` does on stdio), and keeps rmcp's per-tool-name
@@ -204,6 +206,34 @@ pub fn check_bind(addr: SocketAddr, token: Option<&str>) -> Result<(), Automatio
     }
 }
 
+/// An `allowed_hosts` entry that names something other than this machine's loopback (a LAN name,
+/// a tunnel, a reverse proxy) means requests from the network, relayed to a loopback address, so
+/// it needs a token of at least [`MIN_REMOTE_TOKEN_LEN`] characters, as a non-loopback address
+/// does. `host.docker.internal` is the exception: Docker Desktop forwards it to the loopback, so
+/// only containers on this machine reach the server through it (the caller should warn).
+pub fn check_host_exposure(allowed_hosts: &[String], token: Option<&str>) -> Result<(), AutomationError> {
+    let Some(remote) = allowed_hosts.iter().map(|h| h.trim()).find(|h| !is_local_host(h)) else { return Ok(()) };
+    match token.map_or(0, str::len) {
+        0 => Err(AutomationError::BadRequest(format!(
+            "allowed host `{remote}` is not this machine, so clients from the network reach the server through it (a tunnel or proxy): that needs a bearer token of {MIN_REMOTE_TOKEN_LEN}+ characters (set {TOKEN_ENV})"
+        ))),
+        n if n < MIN_REMOTE_TOKEN_LEN => Err(AutomationError::BadRequest(format!(
+            "allowed host `{remote}` is not this machine, so clients from the network reach the server through it: that needs a token of at least {MIN_REMOTE_TOKEN_LEN} characters, this one has {n}: make one with `openssl rand -hex 32`"
+        ))),
+        _ => Ok(()),
+    }
+}
+
+/// Whether an `allowed_hosts` entry names this machine: `localhost` (or a name under it),
+/// 127.0.0.0/8, `[::1]`, or `host.docker.internal` (see [`check_host_exposure`]).
+pub fn is_local_host(entry: &str) -> bool {
+    let Some((host, _)) = gate::parse_allowed_host(entry) else { return true };
+    host == "localhost"
+        || host.ends_with(".localhost")
+        || host == "host.docker.internal"
+        || host.parse::<IpAddr>().is_ok_and(|ip| ip.to_canonical().is_loopback())
+}
+
 /// A usable bearer token: visible ASCII without spaces, as `Authorization: Bearer` carries it.
 pub fn check_token(token: &str) -> Result<(), AutomationError> {
     if token.is_empty() || !token.bytes().all(|b| b.is_ascii_graphic()) {
@@ -272,6 +302,13 @@ pub fn check_allowed_host(host: &str) -> Result<String, AutomationError> {
     };
     let port_ok = port.is_none_or(|p| p.bytes().all(|b| b.is_ascii_digit()) && p.parse::<u16>().is_ok());
     if name_ok && port_ok { Ok(h.to_string()) } else { bad() }
+}
+
+/// Whether one of the `allowed_hosts` entries (`name` for any port, or `name:port`) accepts the
+/// `Host` of a client that connects to `addr`.
+pub fn allows_host(allowed_hosts: &[String], addr: SocketAddr) -> bool {
+    let ip = addr.ip().to_string().to_ascii_lowercase();
+    allowed_hosts.iter().filter_map(|h| gate::parse_allowed_host(h)).any(|(host, port)| host == ip && port.is_none_or(|p| p == addr.port()))
 }
 
 /// The `Host` values this server answers to on `bound`, plus `extra`: its loopback names on its
@@ -364,9 +401,10 @@ impl FilmcraftMcp {
         for addr in &bound {
             check_bind(*addr, token.as_deref())?;
         }
+        let extra_hosts = opts.allowed_hosts.iter().map(|h| check_allowed_host(h)).collect::<Result<Vec<_>, _>>()?;
+        check_host_exposure(&extra_hosts, token.as_deref())?;
         let token = token.map(|t| t.into_bytes().into_boxed_slice());
         let origins = opts.allowed_origins.iter().map(|o| check_allowed_origin(o)).collect::<Result<Vec<_>, _>>()?;
-        let extra_hosts = opts.allowed_hosts.iter().map(|h| check_allowed_host(h)).collect::<Result<Vec<_>, _>>()?;
         let mut hosts: Vec<String> = bound.iter().flat_map(|addr| accepted_hosts(*addr, &extra_hosts)).collect();
         let mut seen = std::collections::HashSet::new();
         hosts.retain(|h| seen.insert(h.to_ascii_lowercase()));

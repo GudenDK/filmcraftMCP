@@ -1169,6 +1169,28 @@ fn listen_addresses_and_bind_rules() {
         assert!(check_bind(addr(remote), Some("tok")).is_err(), "{remote}");
         assert!(check_bind(addr(remote), Some(&long)).is_ok(), "{remote}");
     }
+    // a name that is not this machine: clients from the network, through a tunnel or proxy
+    let hosts = |h: &[&str]| h.iter().map(|s| s.to_string()).collect::<Vec<_>>();
+    for local in [
+        "localhost",
+        "localhost:9000",
+        "app.localhost",
+        "127.0.0.1:9000",
+        "127.0.0.2",
+        "[::1]:9000",
+        "[::1]",
+        "host.docker.internal:9000",
+        "HOST.docker.internal",
+    ] {
+        assert!(check_host_exposure(&hosts(&[local]), None).is_ok(), "{local}");
+    }
+    for remote in ["my-tunnel.trycloudflare.com", "192.168.1.5:9000", "lan.example:9000", "[2001:db8::1]:9000", "localhost.evil.example"] {
+        let e = check_host_exposure(&hosts(&["localhost", remote]), None).unwrap_err().to_string();
+        assert!(e.contains(remote) && e.contains("32+ characters"), "{e}");
+        let e = check_host_exposure(&hosts(&[remote]), Some("abc")).unwrap_err().to_string();
+        assert!(e.contains("at least 32 characters") && e.contains("has 3"), "{e}");
+        assert!(check_host_exposure(&hosts(&[remote]), Some(&long)).is_ok(), "{remote}");
+    }
     assert!(check_token("abc-DEF_123.~+/=").is_ok());
     for bad in ["", "has space", "tab\t", "ünïcode", "new\nline"] {
         assert!(check_token(bad).is_err(), "{bad:?}");
@@ -1199,6 +1221,11 @@ async fn a_non_loopback_bind_needs_a_token() {
         assert!(matches!(r, Err(AutomationError::BadRequest(_))), "{r:?}");
         let m = FilmcraftMcp::headless(Session::default());
         let r = m.serve_http("127.0.0.1:0".parse().unwrap(), HttpOptions { token: Some("bad token".into()), ..HttpOptions::default() }, async {}).await;
+        assert!(matches!(r, Err(AutomationError::BadRequest(_))), "{r:?}");
+        // loopback, but a tunnel's name: clients from the network
+        let m = FilmcraftMcp::headless(Session::default());
+        let opts = HttpOptions { allowed_hosts: vec!["my-tunnel.trycloudflare.com".into()], token: Some("abc".into()), ..HttpOptions::default() };
+        let r = m.serve_http("127.0.0.1:0".parse().unwrap(), opts, async {}).await;
         assert!(matches!(r, Err(AutomationError::BadRequest(_))), "{r:?}");
     })
     .await;

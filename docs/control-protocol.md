@@ -163,11 +163,12 @@ Ctrl), `Ctrl` (macOS ⌃), `Alt`, `Shift`. The dialog (Edit ▸ Keyboard Shortcu
 `filmcraft-cli mcp` serves MCP on stdio: headless (in-process session; `--demo` / `--project p.fcproj`)
 or `--bridge 127.0.0.1:9876` to drive the running app. With `--http 127.0.0.1:9877` it serves MCP
 over Streamable HTTP at `http://127.0.0.1:9877/mcp` instead, for any number of clients that share
-the one backend (`claude mcp add --transport http filmcraft-http http://127.0.0.1:9877/mcp`).
+the one backend (`claude mcp add --transport http --scope user filmcraft-http http://127.0.0.1:9877/mcp`).
 Unlike this control channel, that endpoint speaks HTTP, so a web page can address it: it checks
 `Host` and `Origin` (a browser's request gets 403 unless its origin is listed with
 `--allow-origin`, which also turns on CORS for it), listens on loopback only unless a bearer token
-of 32+ characters is set (`FILMCRAFT_MCP_TOKEN` or `--token-file`), and with a token refuses every
+of 32+ characters is set (`FILMCRAFT_MCP_TOKEN` or `--token-file`; also needed for an
+`--allow-host` name a tunnel or proxy relays), and with a token refuses every
 request without it (401; 429 for wrong tokens for a while after 10 of them). It caps connections
 per address and in all (closing ones that never sent a valid request to make room), times out slow
 clients, closes idle sessions and logs what it refuses. Those checks guard

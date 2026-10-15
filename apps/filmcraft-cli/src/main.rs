@@ -122,7 +122,8 @@ OPTIONS
                                 scheme://host:port with the port spelled out (repeatable; any
                                 other request with an Origin header is refused)
   --allow-host <host[:port]>    mcp --http: also answer to this Host (repeatable; a LAN name,
-                                host.docker.internal:PORT, a tunnel)
+                                host.docker.internal:PORT, a tunnel). A name that is not this
+                                machine (a tunnel, a proxy) needs a token of 32+ characters
   --keep-going                  `run`: report failing lines and continue
   --compact                     one-line JSON output
 
@@ -525,7 +526,9 @@ async fn cli() {
 /// `mcp --http` settings: the listen address and the server options (usage error on bad ones), or
 /// `None` for stdio.
 fn mcp_http_options(a: &Args) -> Option<(std::net::SocketAddr, filmcraft_automation::HttpOptions)> {
-    use filmcraft_automation::http_transport::{TOKEN_ENV, check_allowed_host, check_allowed_origin, check_bind, check_token, parse_listen_addr};
+    use filmcraft_automation::http_transport::{
+        TOKEN_ENV, check_allowed_host, check_allowed_origin, check_bind, check_host_exposure, check_token, parse_listen_addr,
+    };
     if !a.flag("--http") {
         if let Some(o) = ["--token-file", "--allow-origin", "--allow-host"].into_iter().find(|o| a.flag(o)) {
             usage(format!("mcp: {o} needs --http"));
@@ -559,8 +562,9 @@ fn mcp_http_options(a: &Args) -> Option<(std::net::SocketAddr, filmcraft_automat
             "filmcraft-cli: warning: --allow-origin null lets any web page call (a sandboxed frame or a file: page sends `Origin: null`); use it only with a token"
         ));
     }
-    let allowed_hosts =
+    let allowed_hosts: Vec<String> =
         a.opt_all("--allow-host").into_iter().map(|h| check_allowed_host(h).unwrap_or_else(|e| usage(format!("mcp --allow-host: {e}")))).collect();
+    check_host_exposure(&allowed_hosts, token.as_deref()).unwrap_or_else(|e| usage(format!("mcp --allow-host: {e}")));
     let opts = filmcraft_automation::HttpOptions { token, allowed_origins, allowed_hosts, ..Default::default() };
     Some((addr, opts))
 }
@@ -611,7 +615,10 @@ async fn serve_mcp_http(
         (None, None) if a.flag("--demo") => "a headless engine with the demo project".to_string(),
         (None, None) => "a headless engine".to_string(),
     };
+    use filmcraft_automation::http_transport::is_local_host;
+    let docker = opts.allowed_hosts.iter().any(|h| h.split(':').next().is_some_and(|n| n.eq_ignore_ascii_case("host.docker.internal")));
     let auth = match (&opts.token, a.opt("--token-file")) {
+        (None, _) if docker => "no token: any local process, and any container on this machine (host.docker.internal), can connect".to_string(),
         (None, _) => "no token: any local process can connect".to_string(),
         (Some(_), Some(f)) => format!("bearer token required (from {f})"),
         (Some(_), None) => format!("bearer token required (from {})", filmcraft_automation::http_transport::TOKEN_ENV),
@@ -626,13 +633,25 @@ async fn serve_mcp_http(
     if bound.ip().is_unspecified() {
         let hosts = filmcraft_automation::http_transport::accepted_hosts(bound, &opts.allowed_hosts).join(", ");
         diag(format_args!("filmcraft-cli: listening on every interface ({bound}); a request's Host must be one of: {hosts}"));
-        match lan_address(bound.is_ipv6()).map(|ip| std::net::SocketAddr::new(ip, bound.port()).to_string()) {
-            Some(lan) if opts.allowed_hosts.iter().any(|h| h.eq_ignore_ascii_case(&lan)) => {
+        match lan_address(bound.is_ipv6()).map(|ip| std::net::SocketAddr::new(ip, bound.port())) {
+            Some(lan) if filmcraft_automation::http_transport::allows_host(&opts.allowed_hosts, lan) => {
                 diag(format_args!("filmcraft-cli: LAN clients: http://{lan}/mcp"));
             }
             Some(lan) => diag(format_args!("filmcraft-cli: LAN clients get 403 until you add --allow-host {lan} (then they use http://{lan}/mcp)")),
             None => diag(format_args!("filmcraft-cli: LAN clients get 403 until you add --allow-host <this machine's IP>:{}", bound.port())),
         }
+    }
+    let relayed: Vec<&str> = opts.allowed_hosts.iter().map(String::as_str).filter(|h| !is_local_host(h)).collect();
+    if bound.ip().is_loopback() && !relayed.is_empty() {
+        diag(format_args!(
+            "filmcraft-cli: requests for {} arrive through a tunnel or proxy on this machine: they all come from its address, so the per-address limits (connections, wrong tokens) count them together with local clients",
+            relayed.join(", ")
+        ));
+    }
+    if docker && opts.token.is_none() {
+        diag(format_args!(
+            "filmcraft-cli: warning: --allow-host host.docker.internal lets every container on this machine drive FilmCraft; set a token if you run containers you do not trust"
+        ));
     }
     if let Some(n) = opts.token.as_ref().map(String::len).filter(|n| *n < filmcraft_automation::http_transport::MIN_REMOTE_TOKEN_LEN) {
         diag(format_args!("filmcraft-cli: warning: the MCP token is short ({n} characters); use 32+ random characters"));
@@ -644,7 +663,7 @@ async fn serve_mcp_http(
     }
     // the line to paste, never with the token itself
     let header = if opts.token.is_some() { " --header \"Authorization: Bearer <token>\"" } else { "" };
-    diag(format_args!("filmcraft-cli: connect Claude Code with: claude mcp add --transport http filmcraft-http http://{url_addr}/mcp{header}"));
+    diag(format_args!("filmcraft-cli: connect Claude Code with: claude mcp add --transport http --scope user filmcraft-http http://{url_addr}/mcp{header}"));
     server.serve_http_listeners(listeners, opts, stop_signal()).await?;
     diag(format_args!("filmcraft-cli: MCP server stopped"));
     Ok(())
