@@ -243,8 +243,9 @@ pub fn check_token(token: &str) -> Result<(), AutomationError> {
 }
 
 /// An `allowed_origins` entry: `scheme://host:port` with an `http` or `https` scheme and the port
-/// spelled out (`http://localhost:6274`), or `null`. Returns it normalized. Wildcards (`*`, `:*`),
-/// a missing port (which rmcp would match against every port) and anything else are refused.
+/// spelled out (`http://localhost:6274`), or `null`. Returns it normalized. A `*` anywhere, a
+/// missing port (which rmcp would match against every port), a port out of range, a fragment, a
+/// trailing dot and anything else are refused.
 /// `null` is accepted, but every web page can send it (from a sandboxed frame or a `file:` page),
 /// so the caller should warn about it.
 pub fn check_allowed_origin(origin: &str) -> Result<String, AutomationError> {
@@ -253,8 +254,11 @@ pub fn check_allowed_origin(origin: &str) -> Result<String, AutomationError> {
     if o.eq_ignore_ascii_case("null") {
         return Ok("null".into());
     }
-    if o == "*" || o.ends_with(":*") {
-        return bad("wildcards would let any web page (or any port) call; list each origin as scheme://host:port".into());
+    if o.contains('*') {
+        return bad("wildcards would let any web page (or any port) call, and browsers never send one; list each origin as scheme://host:port".into());
+    }
+    if o.contains('#') {
+        return bad("an origin has no fragment (#...)".into());
     }
     let Ok(uri) = o.parse::<http::Uri>() else { return bad("not an origin; write it as scheme://host:port, e.g. http://localhost:6274".into()) };
     let scheme = match uri.scheme_str() {
@@ -265,9 +269,20 @@ pub fn check_allowed_origin(origin: &str) -> Result<String, AutomationError> {
     if authority.as_str().contains('@') {
         return bad("an origin has no user name".into());
     }
-    if authority.port_u16().is_none() {
-        let port = if scheme == "https" { 443 } else { 80 };
-        return bad(format!("add the port (every other port would match too), e.g. {scheme}://{}:{port}", authority.host()));
+    let host = authority.host();
+    if !host.starts_with('[') && host.split('.').any(str::is_empty) {
+        return bad("the host has an empty label (a trailing dot?): browsers send the name without one".into());
+    }
+    // what follows the host: nothing, or `:port`
+    let after_host = authority.as_str().get(host.len()..).unwrap_or_default();
+    match authority.port_u16() {
+        Some(0) => return bad("the port must be 1-65535".into()),
+        Some(_) => {}
+        None if !after_host.is_empty() => return bad("the port must be 1-65535".into()),
+        None => {
+            let port = if scheme == "https" { 443 } else { 80 };
+            return bad(format!("add the port (every other port would match too), e.g. {scheme}://{host}:{port}"));
+        }
     }
     if !matches!(uri.path(), "" | "/") || uri.query().is_some() {
         return bad("an origin has no path or query".into());

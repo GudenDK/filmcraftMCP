@@ -580,11 +580,20 @@ fn allowed_origins_and_hosts_are_checked() {
         "http://localhost:6274/app",
         "http://localhost:6274/?x=1",
         "not an origin",
+        // looks like a wildcard, but would be a literal name no browser sends
+        "http://*.example:80",
+        "https://*:443",
+        "http://localhost:6274#f",
+        "http://localhost.:6274",
+        "http://app..example:80",
+        "http://localhost:0",
     ] {
         assert!(check_allowed_origin(bad).is_err(), "{bad:?}");
     }
     let e = check_allowed_origin("http://localhost").unwrap_err().to_string();
     assert!(e.contains("http://localhost:80"), "names the port to add: {e}");
+    let e = check_allowed_origin("http://localhost:99999").unwrap_err().to_string();
+    assert!(e.contains("1-65535") && !e.contains("add the port"), "{e}");
     for ok in ["example.com", "example.com:9000", "[::1]:9000", "host.docker.internal:9877", "192.168.1.5:9877"] {
         assert_eq!(check_allowed_host(ok).map_err(|e| e.to_string()), Ok(ok.to_string()));
     }

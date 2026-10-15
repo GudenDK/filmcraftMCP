@@ -264,8 +264,8 @@ wherever the user can, so the endpoint is locked down by default:
 - A request with an `Origin` header comes from a browser and gets 403, unless the origin is listed
   with `--allow-origin` (repeatable). MCP clients send no `Origin`. An entry is `scheme://host:port`
   with the port written out, exactly as the browser sends it: `http://localhost:6274` and
-  `http://127.0.0.1:6274` are different origins. Wildcards (`*`, `:*`), an entry without a port
-  (it would match every port), paths and user names exit 2. `null` is accepted with a warning:
+  `http://127.0.0.1:6274` are different origins. Wildcards (a `*` anywhere), an entry without a
+  port (it would match every port), paths, fragments, user names and a trailing dot exit 2. `null` is accepted with a warning:
   every sandboxed frame and `file:` page sends it, so use it only with a token.
 - A listed origin gets CORS headers, so a page there can call the server: its preflight
   (`OPTIONS` with `Access-Control-Request-Method`) gets 204 with `Access-Control-Allow-Origin`,
