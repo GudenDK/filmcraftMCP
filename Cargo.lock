@@ -1843,6 +1843,7 @@ dependencies = [
  "filmcraft-render",
  "filmcraft-testkit",
  "filmcraft-time",
+ "getrandom 0.4.3",
  "serde_json",
  "tokio",
 ]

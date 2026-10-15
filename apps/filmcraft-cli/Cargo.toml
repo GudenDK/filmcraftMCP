@@ -32,6 +32,8 @@ filmcraft-mpegts = { workspace = true }
 filmcraft-ogg = { workspace = true }
 filmcraft-automation = { workspace = true }
 serde_json = { workspace = true }
+# the MCP token (`mcp --http`, `mcp-token`): already in the tree through rmcp
+getrandom = "0.4"
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "signal"] }
 
 [dev-dependencies]

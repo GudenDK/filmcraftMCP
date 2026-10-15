@@ -100,11 +100,18 @@ SUBCOMMANDS
   mcp --http <ADDR>             MCP server over Streamable HTTP at http://ADDR/mcp instead: a
                                 long-running server any number of clients connect to by URL;
                                 they all share one project (or the one live app with --bridge).
-                                ADDR is PORT, 127.0.0.1:PORT, [::1]:PORT or localhost:PORT
+                                Every request needs `Authorization: Bearer <token>`: the token
+                                is FILMCRAFT_MCP_TOKEN, else --token-file's, else the one stored
+                                in the data directory (made on first use; `mcp-token` prints
+                                it). ADDR is PORT, 127.0.0.1:PORT, [::1]:PORT or localhost:PORT
                                 (loopback; localhost listens on 127.0.0.1 and, with IPv6, on
                                 [::1]); a non-loopback address needs a token of 32+
                                 characters. Ctrl+C or SIGTERM stops it (on Windows also
                                 Ctrl+Break and closing the console)
+  mcp-token [--new | --path]    print the stored MCP token, making it if there is none, for
+                                --header \"Authorization: Bearer $(filmcraft-cli mcp-token)\";
+                                --new replaces it with a new random one and prints that (restart
+                                the server, register clients again); --path prints where it is
   help                          this text
   --version                     print the version
 
@@ -114,10 +121,13 @@ OPTIONS
   --save                        save the project back to --project when done
   --save-as <p.fcproj>          save the project to this path when done
   --bridge <127.0.0.1:PORT>     send commands to the running app (`filmcraft --control PORT`)
-  --data-dir <dir>              FilmCraft data directory for user export presets (headless;
-                                default: the app's data directory)
-  --token-file <path>           mcp --http: require `Authorization: Bearer <token>`, the token
-                                being this file's first line (or set FILMCRAFT_MCP_TOKEN)
+  --data-dir <dir>              FilmCraft data directory: user export presets (headless) and
+                                the stored MCP token (default: the app's data directory)
+  --token-file <path>           mcp --http: the token is this file's first line instead of the
+                                stored one (FILMCRAFT_MCP_TOKEN, when set, comes first)
+  --no-token                    mcp --http: no token, so any program on this machine can drive
+                                FilmCraft. Loopback addresses only, and not with --allow-host,
+                                --allow-origin null, --token-file or FILMCRAFT_MCP_TOKEN
   --allow-origin <origin>       mcp --http: let this browser origin call, with CORS headers:
                                 scheme://host:port with the port spelled out (repeatable; any
                                 other request with an Origin header is refused). `null` (any
@@ -293,6 +303,11 @@ async fn cli() {
     // `--version` anywhere and `-V` as the subcommand, also after global options (`--demo --version`, #710).
     if a.wants_version() {
         outln!("filmcraft-cli {}", env!("CARGO_PKG_VERSION"));
+        return;
+    }
+    // before the decoders and renderers start: scripts call it inside `$(...)`
+    if a.pos(0) == Some("mcp-token") {
+        mcp_token(&a);
         return;
     }
     register_hardware_decoders();
@@ -497,7 +512,9 @@ async fn cli() {
             diag(format_args!("rendered {}x{} in {:.1} ms → {out}", img.w, img.h, dt.as_secs_f64() * 1000.0));
         }
         "mcp" => {
-            if let Some(opt) = a.unknown_opt(&["--bridge", "--project", "--demo", "--data-dir", "--http", "--token-file", "--allow-origin", "--allow-host"]) {
+            if let Some(opt) =
+                a.unknown_opt(&["--bridge", "--project", "--demo", "--data-dir", "--http", "--token-file", "--no-token", "--allow-origin", "--allow-host"])
+            {
                 usage(format!("unknown mcp option `{opt}`"));
             }
             let http = mcp_http_options(&a);
@@ -511,7 +528,7 @@ async fn cli() {
             // from here on (before the server starts and says so), a stop signal stops it cleanly
             let signals = StopSignals::watch();
             let result = match http {
-                Some((addr, opts)) => serve_mcp_http(&a, server, addr, opts, signals).await,
+                Some((addr, opts, source)) => serve_mcp_http(&a, server, addr, opts, source, signals).await,
                 None => server.serve_stdio_until(stop_signal(signals)).await,
             };
             if let Err(e) = result {
@@ -526,46 +543,115 @@ async fn cli() {
     }
 }
 
-/// `mcp --http` settings: the listen address and the server options (usage error on bad ones), or
-/// `None` for stdio.
-fn mcp_http_options(a: &Args) -> Option<(std::net::SocketAddr, filmcraft_automation::HttpOptions)> {
+/// `mcp --http` settings: the listen address, the server options and where its token came from
+/// (usage error on bad ones), or `None` for stdio. The token is on by default: see
+/// [`token::resolve`]. The stored one is only made once every option has been checked.
+fn mcp_http_options(a: &Args) -> Option<(std::net::SocketAddr, filmcraft_automation::HttpOptions, token::Source)> {
     use filmcraft_automation::http_transport::{
         TOKEN_ENV, check_allowed_host, check_allowed_origin, check_bind, check_host_exposure, check_origin_exposure, check_token, parse_listen_addr,
     };
     if !a.flag("--http") {
-        if let Some(o) = ["--token-file", "--allow-origin", "--allow-host"].into_iter().find(|o| a.flag(o)) {
+        if let Some(o) = ["--token-file", "--no-token", "--allow-origin", "--allow-host"].into_iter().find(|o| a.flag(o)) {
             usage(format!("mcp: {o} needs --http"));
         }
         return None;
     }
     let Some(addr) = a.opt("--http") else { usage("mcp: --http needs an address: PORT, 127.0.0.1:PORT, [::1]:PORT or localhost:PORT") };
     let addr = parse_listen_addr(addr).unwrap_or_else(|e| usage(format!("mcp --http: {e}")));
-    let token = match a.opt("--token-file") {
-        Some(p) => {
-            let (token, warning) = token::read_token_file(p).unwrap_or_else(|e| usage(format!("mcp --token-file {p}: {e}")));
-            if let Some(w) = warning {
-                diag(format_args!("filmcraft-cli: warning: the token file {w}"));
-            }
-            Some(token)
-        }
-        None => match std::env::var(TOKEN_ENV) {
-            Ok(t) => token::token_from_env(&t),
-            Err(std::env::VarError::NotPresent) => None,
-            Err(std::env::VarError::NotUnicode(_)) => usage(format!("mcp: {TOKEN_ENV} is not valid text")),
-        },
-    };
-    if let Some(t) = &token {
-        check_token(t).unwrap_or_else(|e| usage(format!("mcp: {e}")));
+    // a missing value must not fall back to the stored token or the default data directory
+    if let Some(o) = ["--token-file", "--data-dir"].into_iter().find(|o| a.flag(o) && a.opt(o).is_none()) {
+        usage(format!("mcp: {o} needs a value"));
     }
-    check_bind(addr, token.as_deref()).unwrap_or_else(|e| usage(format!("mcp --http: {e}")));
+    if a.opt("--no-token").is_some() {
+        usage("mcp: --no-token takes no value");
+    }
     let allowed_origins: Vec<String> =
         a.opt_all("--allow-origin").into_iter().map(|o| check_allowed_origin(o).unwrap_or_else(|e| usage(format!("mcp --allow-origin: {e}")))).collect();
-    check_origin_exposure(&allowed_origins, token.as_deref()).unwrap_or_else(|e| usage(format!("mcp --allow-origin: {e}")));
     let allowed_hosts: Vec<String> =
         a.opt_all("--allow-host").into_iter().map(|h| check_allowed_host(h).unwrap_or_else(|e| usage(format!("mcp --allow-host: {e}")))).collect();
+    let no_token = a.flag("--no-token");
+    if no_token {
+        token::check_no_token(addr, &allowed_hosts, &allowed_origins).unwrap_or_else(|e| usage(format!("mcp: {e}")));
+    }
+    let env = match std::env::var(TOKEN_ENV) {
+        Ok(t) => Some(t),
+        Err(std::env::VarError::NotPresent) => None,
+        Err(std::env::VarError::NotUnicode(_)) => usage(format!("mcp: {TOKEN_ENV} is not valid text")),
+    };
+    let resolved =
+        token::resolve(no_token, env.as_deref(), a.opt("--token-file"), || token::stored_token_path(a.opt("--data-dir"))).unwrap_or_else(|p| match p {
+            token::Problem::Usage(m) => usage(format!("mcp: {m}")),
+            token::Problem::Failure(m) => fail(format!("mcp: {m}")),
+        });
+    for w in &resolved.warnings {
+        diag(format_args!("filmcraft-cli: warning: {w}"));
+    }
+    let token = resolved.token;
+    if let Some(t) = &token {
+        check_token(t).unwrap_or_else(|e| match &resolved.source {
+            token::Source::Stored { path, .. } => {
+                fail(format!("mcp: the stored token in {} is unusable: {e}; replace it with `filmcraft-cli mcp-token --new`", path.display()))
+            }
+            _ => usage(format!("mcp: {e}")),
+        });
+    }
+    check_bind(addr, token.as_deref()).unwrap_or_else(|e| usage(format!("mcp --http: {e}")));
+    check_origin_exposure(&allowed_origins, token.as_deref()).unwrap_or_else(|e| usage(format!("mcp --allow-origin: {e}")));
     check_host_exposure(&allowed_hosts, token.as_deref()).unwrap_or_else(|e| usage(format!("mcp --allow-host: {e}")));
     let opts = filmcraft_automation::HttpOptions { token, allowed_origins, allowed_hosts, ..Default::default() };
-    Some((addr, opts))
+    Some((addr, opts, resolved.source))
+}
+
+/// `mcp-token [--new | --path]`: print the stored MCP token (made if there is none) for scripts
+/// (`--header "Authorization: Bearer $(filmcraft-cli mcp-token)"`), replace it with a new one, or
+/// print where it is. Notes go to stderr, so `$(...)` takes only the token.
+fn mcp_token(a: &Args) {
+    use filmcraft_automation::http_transport::{TOKEN_ENV, check_token};
+    if let Some(opt) = a.unknown_opt(&["--new", "--path", "--data-dir"]) {
+        usage(format!("unknown mcp-token option `{opt}`"));
+    }
+    if let Some(extra) = a.pos(1) {
+        usage(format!("mcp-token takes no arguments, got `{extra}`"));
+    }
+    if a.flag("--data-dir") && a.opt("--data-dir").is_none() {
+        usage("mcp-token: --data-dir needs a value");
+    }
+    if let Some(o) = ["--new", "--path"].into_iter().find(|o| a.opt(o).is_some()) {
+        usage(format!("mcp-token: {o} takes no value"));
+    }
+    if a.flag("--new") && a.flag("--path") {
+        usage("mcp-token: give --new or --path, not both");
+    }
+    let path = token::stored_token_path(a.opt("--data-dir"))
+        .unwrap_or_else(|e| fail(format!("mcp-token: cannot locate the stored MCP token: {e}; pass --data-dir DIR to keep it elsewhere")));
+    if a.flag("--path") {
+        outln!("{}", path.display());
+        return;
+    }
+    if std::env::var(TOKEN_ENV).ok().and_then(|v| token::token_from_env(&v)).is_some() {
+        diag(format_args!("filmcraft-cli: note: {TOKEN_ENV} is set, so `mcp --http` uses it instead of this stored token"));
+    }
+    let token = if a.flag("--new") {
+        let t = token::replace_stored(&path).unwrap_or_else(|e| fail(format!("mcp-token --new: {e}")));
+        diag(format_args!(
+            "filmcraft-cli: stored a new MCP token in {}. A running `mcp --http` server keeps the old one until it restarts, and clients need the new one (claude mcp remove, then add again)",
+            path.display()
+        ));
+        t
+    } else {
+        let stored = token::load_or_create(&path).unwrap_or_else(|e| fail(format!("mcp-token: {e}; `filmcraft-cli mcp-token --new` replaces it")));
+        if let Some(w) = stored.warning {
+            diag(format_args!("filmcraft-cli: warning: the stored token file {w}"));
+        }
+        if stored.created {
+            diag(format_args!("filmcraft-cli: made a new MCP token and stored it in {}", path.display()));
+        }
+        stored.token
+    };
+    if let Err(e) = check_token(&token) {
+        fail(format!("mcp-token: the token in {} is unusable: {e}; `filmcraft-cli mcp-token --new` replaces it", path.display()));
+    }
+    outln!("{token}");
 }
 
 /// Serve MCP over HTTP until Ctrl+C or another stop signal. The listener is bound here so the URL
@@ -577,6 +663,7 @@ async fn serve_mcp_http(
     server: filmcraft_automation::FilmcraftMcp,
     addr: std::net::SocketAddr,
     opts: filmcraft_automation::HttpOptions,
+    source: token::Source,
     signals: StopSignals,
 ) -> Result<(), filmcraft_automation::AutomationError> {
     let listener = match tokio::net::TcpListener::bind(addr).await {
@@ -615,13 +702,22 @@ async fn serve_mcp_http(
         (None, None) if a.flag("--demo") => "a headless engine with the demo project".to_string(),
         (None, None) => "a headless engine".to_string(),
     };
-    use filmcraft_automation::http_transport::is_local_host;
-    let docker = opts.allowed_hosts.iter().any(|h| h.split(':').next().is_some_and(|n| n.eq_ignore_ascii_case("host.docker.internal")));
-    let auth = match (&opts.token, a.opt("--token-file")) {
-        (None, _) if docker => "no token: any local process, and any container on this machine (host.docker.internal), can connect".to_string(),
-        (None, _) => "no token: any local process can connect".to_string(),
-        (Some(_), Some(f)) => format!("bearer token required (from {f})"),
-        (Some(_), None) => format!("bearer token required (from {})", filmcraft_automation::http_transport::TOKEN_ENV),
+    use filmcraft_automation::http_transport::{TOKEN_ENV, is_local_host};
+    // where the token is, never the token
+    let powershell = cfg!(windows);
+    let print_it = match (&source, a.opt("--data-dir")) {
+        (token::Source::Stored { path, .. }, Some(_)) => {
+            let dir = path.parent().unwrap_or(path).to_string_lossy();
+            let dir = if powershell { token::powershell_quote(&dir) } else { token::sh_quote(&dir) };
+            format!("filmcraft-cli mcp-token --data-dir {dir}")
+        }
+        _ => "filmcraft-cli mcp-token".to_string(),
+    };
+    let auth = match &source {
+        token::Source::Env => format!("bearer token required (from {TOKEN_ENV})"),
+        token::Source::File(p) => format!("bearer token required (from {})", p.display()),
+        token::Source::Stored { path, .. } => format!("bearer token required (the one stored in {}; `{print_it}` prints it)", path.display()),
+        token::Source::Off => "no token (--no-token): any local program can connect".to_string(),
     };
     // 0.0.0.0 / [::] is no address a client can use: show the loopback URL, and what LAN clients need
     let url_addr = match bound.ip() {
@@ -630,6 +726,16 @@ async fn serve_mcp_http(
         _ => bound,
     };
     diag(format_args!("filmcraft-cli: MCP (Streamable HTTP) on http://{url_addr}/mcp{also}, driving {backend}; {auth}. Ctrl+C stops it."));
+    match &source {
+        token::Source::Stored { path, created: true } => diag(format_args!(
+            "filmcraft-cli: made a new random MCP token and stored it in {}, readable only by you; `{print_it}` prints it, `{print_it} --new` replaces it",
+            path.display()
+        )),
+        token::Source::Off => diag(format_args!(
+            "filmcraft-cli: warning: --no-token: any program on this machine, run by any user, can drive FilmCraft through this port; leave --no-token off to require the stored token"
+        )),
+        _ => {}
+    }
     if bound.ip().is_unspecified() {
         let hosts = filmcraft_automation::http_transport::accepted_hosts(bound, &opts.allowed_hosts).join(", ");
         diag(format_args!("filmcraft-cli: listening on every interface ({bound}); a request's Host must be one of: {hosts}"));
@@ -648,11 +754,6 @@ async fn serve_mcp_http(
             relayed.join(", ")
         ));
     }
-    if docker && opts.token.is_none() {
-        diag(format_args!(
-            "filmcraft-cli: warning: --allow-host host.docker.internal lets every container on this machine drive FilmCraft; set a token if you run containers you do not trust"
-        ));
-    }
     if let Some(n) = opts.token.as_ref().map(String::len).filter(|n| *n < filmcraft_automation::http_transport::MIN_REMOTE_TOKEN_LEN) {
         diag(format_args!("filmcraft-cli: warning: the MCP token is short ({n} characters); use 32+ random characters"));
     }
@@ -661,9 +762,16 @@ async fn serve_mcp_http(
             "filmcraft-cli: warning: {bound} is reachable from the network and HTTP is not encrypted: the token and every request travel in clear text. Prefer 127.0.0.1 with `ssh -L` or a TLS reverse proxy (--allow-host)."
         ));
     }
-    // the line to paste, never with the token itself
-    let header = if opts.token.is_some() { " --header \"Authorization: Bearer <token>\"" } else { "" };
-    diag(format_args!("filmcraft-cli: connect Claude Code with: claude mcp add --transport http --scope user filmcraft-http http://{url_addr}/mcp{header}"));
+    // the line to paste: it reads the token where the server got it, and never shows it
+    let header = match token::header_arg(&source, powershell) {
+        Some(h) => format!(" {h}"),
+        None if opts.token.is_some() => " --header \"Authorization: Bearer <token>\"".to_string(),
+        None => String::new(),
+    };
+    let shell = if powershell { " (in PowerShell)" } else { "" };
+    diag(format_args!(
+        "filmcraft-cli: connect Claude Code{shell} with: claude mcp add --transport http --scope user filmcraft-http http://{url_addr}/mcp{header}"
+    ));
     server.serve_http_listeners(listeners, opts, stop_signal(signals)).await?;
     diag(format_args!("filmcraft-cli: MCP server stopped"));
     Ok(())

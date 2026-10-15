@@ -27,8 +27,9 @@ fn help_and_usage_errors() {
     assert_eq!(cli(&["mcp", "--bridge", "0.0.0.0:9876"]).status.code(), Some(2));
 }
 
-/// `filmcraft-cli args` (without `FILMCRAFT_MCP_TOKEN` unless `env` sets it), once it has exited:
-/// a usage error that started a server instead fails the test after 30 s rather than hanging it.
+/// `filmcraft-cli args` (without `FILMCRAFT_MCP_TOKEN` unless `env` sets it, with a data
+/// directory of its own), once it has exited: a usage error that started a server instead fails
+/// the test after 30 s rather than hanging it.
 fn cli_exit(args: &[&str], env: &[(&str, &str)]) -> Output {
     let mut p = Spawned::with_env(args, env);
     let (status, stderr) = p.wait();
@@ -36,20 +37,59 @@ fn cli_exit(args: &[&str], env: &[(&str, &str)]) -> Output {
     Output { status, stdout: stdout.join("\n").into_bytes(), stderr: stderr.into_bytes() }
 }
 
-/// `mcp --http`: bad, missing or non-loopback addresses (without a token) and HTTP options without
-/// `--http` are usage errors; the help lists the options.
+/// A test folder under the system's temporary folder, removed when the test ends (also when it
+/// fails).
+struct TempDir(std::path::PathBuf);
+
+impl TempDir {
+    fn new(tag: &str) -> Self {
+        static N: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+        let n = N.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let d = std::env::temp_dir().join(format!("fc-cli-{tag}-{}-{n}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&d);
+        std::fs::create_dir_all(&d).unwrap();
+        Self(d)
+    }
+    fn path(&self, rel: &str) -> std::path::PathBuf {
+        self.0.join(rel)
+    }
+}
+
+impl Drop for TempDir {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.0);
+    }
+}
+
+#[cfg(unix)]
+fn mode(p: &std::path::Path) -> u32 {
+    use std::os::unix::fs::PermissionsExt as _;
+    std::fs::metadata(p).unwrap().permissions().mode() & 0o777
+}
+
+fn is_generated_token(t: &str) -> bool {
+    t.len() == 64 && t.bytes().all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
+}
+
+/// `mcp --http`: bad, missing or non-loopback addresses with too short a token, `--no-token`
+/// anywhere but on loopback alone, and HTTP options without `--http` are usage errors (exit 2),
+/// and none of them stores a token; the help lists the options.
 #[test]
 fn mcp_http_usage_errors() {
-    let cli_no_token = |args: &[&str]| cli_exit(args, &[]);
+    let data = TempDir::new("usage");
+    let data_dir = data.0.to_str().unwrap().to_string();
+    let no_env = [("FILMCRAFT_DATA_DIR", data_dir.as_str())];
     for args in [
-        &["mcp", "--http", "0.0.0.0:9000"][..],
-        &["mcp", "--http", "192.168.1.5:9000"],
-        &["mcp", "--http", "nonsense"],
+        &["mcp", "--http", "nonsense"][..],
         &["mcp", "--http", "example.com:9000"],
         &["mcp", "--http"],
         &["mcp", "--token-file", "t.txt"],
+        &["mcp", "--no-token"],
         &["mcp", "--allow-origin", "http://localhost:6274"],
         &["mcp", "--http", "127.0.0.1:0", "--token-file", "/nonexistent/token"],
+        // a missing value never falls back to the stored token or the default data directory
+        &["mcp", "--http", "127.0.0.1:0", "--token-file"],
+        &["mcp", "--http", "127.0.0.1:0", "--data-dir"],
         // origins need scheme://host:port (no wildcard, no port-less entry matching every port)
         &["mcp", "--http", "127.0.0.1:0", "--allow-origin", "*"],
         &["mcp", "--http", "127.0.0.1:0", "--allow-origin", "http://localhost"],
@@ -57,16 +97,29 @@ fn mcp_http_usage_errors() {
         &["mcp", "--http", "127.0.0.1:0", "--allow-origin", "localhost:6274"],
         &["mcp", "--http", "127.0.0.1:0", "--allow-host", "a b"],
         &["mcp", "--http", "127.0.0.1:0", "--allow-host", "lan.example:http"],
-        // a tunnel or proxy's name: clients from the network, so a token is needed
-        &["mcp", "--http", "127.0.0.1:0", "--allow-host", "my-tunnel.trycloudflare.com"],
-        // any web page sends `Origin: null`: a token is needed too
-        &["mcp", "--http", "127.0.0.1:0", "--allow-origin", "null"],
         &["mcp", "--http", "127.0.0.1:0", "--allow-origin", "http://127.1:6274"],
+        // --no-token: loopback only, and not with what lets others in, nor with a token
+        &["mcp", "--http", "0.0.0.0:0", "--no-token"],
+        &["mcp", "--http", "[::]:0", "--no-token"],
+        &["mcp", "--http", "192.168.1.5:9000", "--no-token"],
+        &["mcp", "--http", "127.0.0.1:0", "--no-token", "--allow-host", "my-tunnel.trycloudflare.com"],
+        &["mcp", "--http", "127.0.0.1:0", "--no-token", "--allow-host", "host.docker.internal:9877"],
+        &["mcp", "--http", "127.0.0.1:0", "--no-token", "--allow-origin", "null"],
+        &["mcp", "--http", "127.0.0.1:0", "--no-token", "--token-file", "t.txt"],
+        &["mcp", "--http", "127.0.0.1:0", "--no-token=yes"],
     ] {
-        let o = cli_no_token(args);
-        assert_eq!(o.status.code(), Some(2), "{args:?}: {}", String::from_utf8_lossy(&o.stderr));
+        let o = cli_exit(args, &no_env);
+        let err = String::from_utf8_lossy(&o.stderr);
+        assert_eq!(o.status.code(), Some(2), "{args:?}: {err}");
+        if args.contains(&"--no-token") {
+            assert!(err.contains("--no-token"), "{args:?}: {err}");
+        }
     }
-    let o = cli_exit(&["mcp", "--http", "127.0.0.1:0"], &[("FILMCRAFT_MCP_TOKEN", "has space")]);
+    let o = cli_exit(&["mcp", "--http", "127.0.0.1:0", "--no-token"], &[no_env[0], ("FILMCRAFT_MCP_TOKEN", "some-token")]);
+    let err = String::from_utf8_lossy(&o.stderr);
+    assert_eq!(o.status.code(), Some(2), "{err}");
+    assert!(err.contains("contradicts FILMCRAFT_MCP_TOKEN") && !err.contains("some-token"), "{err}");
+    let o = cli_exit(&["mcp", "--http", "127.0.0.1:0"], &[no_env[0], ("FILMCRAFT_MCP_TOKEN", "has space")]);
     assert_eq!(o.status.code(), Some(2), "{}", String::from_utf8_lossy(&o.stderr));
     // reachable from the network (directly, or through a tunnel): a token too short to resist
     // guessing is refused
@@ -76,26 +129,226 @@ fn mcp_http_usage_errors() {
         &["mcp", "--http", "127.0.0.1:0", "--allow-host", "proxy.example:443"],
         &["mcp", "--http", "127.0.0.1:0", "--allow-origin", "null"],
     ] {
-        let o = cli_exit(args, &[("FILMCRAFT_MCP_TOKEN", &short)]);
+        let o = cli_exit(args, &[no_env[0], ("FILMCRAFT_MCP_TOKEN", &short)]);
         let err = String::from_utf8_lossy(&o.stderr);
         assert_eq!(o.status.code(), Some(2), "{args:?}: {err}");
         assert!(err.contains("at least 32 characters") && !err.contains(&short), "{err}");
     }
+    assert!(!data.path("mcp-token").exists(), "a usage error stored a token");
+    for args in
+        [&["mcp-token", "--bogus"][..], &["mcp-token", "extra"], &["mcp-token", "--new", "--path"], &["mcp-token", "--data-dir"], &["mcp-token", "--new=1"]]
+    {
+        let o = cli_exit(args, &no_env);
+        assert_eq!(o.status.code(), Some(2), "{args:?}: {}", String::from_utf8_lossy(&o.stderr));
+    }
+    assert!(!data.path("mcp-token").exists(), "a usage error stored a token");
     let help = String::from_utf8_lossy(&cli(&["help"]).stdout).into_owned();
-    for want in ["mcp --http <ADDR>", "--token-file", "--allow-origin", "--allow-host", "FILMCRAFT_MCP_TOKEN"] {
+    for want in ["mcp --http <ADDR>", "--token-file", "--no-token", "mcp-token [--new | --path]", "--allow-origin", "--allow-host", "FILMCRAFT_MCP_TOKEN"] {
         assert!(help.contains(want), "help lacks {want}");
     }
 }
 
-/// `mcp --demo --http 127.0.0.1:0` prints its URL on stderr and answers `initialize` there.
+/// The stderr lines a server prints before it serves: up to and including the `claude mcp add`
+/// line.
+fn banner(p: &Spawned) -> Vec<String> {
+    let mut lines = Vec::new();
+    loop {
+        let l = Spawned::line(&p.err);
+        let done = l.contains("connect Claude Code");
+        lines.push(l);
+        if done {
+            return lines;
+        }
+    }
+}
+
+/// The `host:port` of the first `http://host:port/mcp` URL in the banner.
+fn banner_addr(lines: &[String]) -> String {
+    url_addr(lines.iter().find(|l| l.contains("/mcp")).unwrap_or_else(|| panic!("no URL in {lines:?}")))
+}
+
+/// By default `mcp --http` stores a new random token in the data directory (private, no line
+/// break), answers 401 without it and 200 with it, and tells where the token is and how to hand it
+/// to Claude Code without ever printing it.
 #[test]
-fn mcp_http_serves_initialize() {
+fn mcp_http_requires_the_stored_token_by_default() {
     let p = Spawned::new(&["mcp", "--demo", "--http", "127.0.0.1:0"]);
-    let addr = url_addr(&Spawned::line(&p.err));
-    let reply = http_initialize(&addr, None);
+    let lines = banner(&p);
+    let addr = banner_addr(&lines);
+    let file = p.data_dir().join("mcp-token");
+    let token = std::fs::read_to_string(&file).unwrap();
+    assert!(is_generated_token(&token), "{token:?}");
+    #[cfg(unix)]
+    assert_eq!((mode(&file), mode(&p.data_dir())), (0o600, 0o700));
+    let shown = file.display().to_string();
+    assert!(lines[0].contains(&format!("bearer token required (the one stored in {shown}; `filmcraft-cli mcp-token` prints it)")), "{lines:?}");
+    assert!(lines.iter().any(|l| l.contains(&format!("made a new random MCP token and stored it in {shown}"))), "{lines:?}");
+    let paste = lines.last().unwrap();
+    let read = if cfg!(windows) { format!("$(Get-Content -Raw '{shown}')") } else { format!("$(cat '{shown}')") };
+    assert!(
+        paste.ends_with(&format!("claude mcp add --transport http --scope user filmcraft-http http://{addr}/mcp --header \"Authorization: Bearer {read}\"")),
+        "{paste}"
+    );
+    assert!(lines.iter().all(|l| !l.contains(&token)), "the banner shows the token: {lines:?}");
+    let refused = http_initialize(&addr, None);
+    assert!(refused.starts_with("HTTP/1.1 401"), "{refused}");
+    assert!(http_initialize(&addr, Some("0".repeat(64).as_str())).starts_with("HTTP/1.1 401"));
+    let reply = http_initialize(&addr, Some(&token));
     assert!(reply.starts_with("HTTP/1.1 200"), "{reply}");
     assert!(reply.to_ascii_lowercase().contains("mcp-session-id:"), "{reply}");
     assert!(reply.contains(r#""name":"filmcraft""#), "{reply}");
+    // nothing printed later shows it either (the refusal log)
+    while let Ok(l) = p.err.recv_timeout(std::time::Duration::from_millis(300)) {
+        assert!(!l.contains(&token), "{l}");
+    }
+}
+
+/// A restarted server, and `mcp-token`, use the token stored the first time; `mcp-token --new`
+/// replaces it (the next server takes the new one) and `--path` says where it is.
+#[test]
+fn the_stored_token_is_reused_printed_and_replaced() {
+    let data = TempDir::new("reuse");
+    let dir = data.0.to_str().unwrap().to_string();
+    let env = [("FILMCRAFT_DATA_DIR", dir.as_str())];
+    let file = data.path("mcp-token");
+    let printed = cli_exit(&["mcp-token"], &env);
+    assert!(printed.status.success(), "{}", String::from_utf8_lossy(&printed.stderr));
+    let token = String::from_utf8(printed.stdout).unwrap();
+    assert!(is_generated_token(&token), "{token:?}");
+    assert_eq!(std::fs::read_to_string(&file).unwrap(), token);
+    assert!(String::from_utf8_lossy(&printed.stderr).contains("made a new MCP token") && !String::from_utf8_lossy(&printed.stderr).contains(&token));
+    #[cfg(unix)]
+    assert_eq!(mode(&file), 0o600);
+    for _ in 0..2 {
+        let p = Spawned::with_env(&["mcp", "--demo", "--http", "127.0.0.1:0"], &env);
+        let lines = banner(&p);
+        assert!(!lines.iter().any(|l| l.contains("made a new")), "{lines:?}");
+        assert!(lines.iter().all(|l| !l.contains(&token)));
+        assert!(http_initialize(&banner_addr(&lines), Some(&token)).starts_with("HTTP/1.1 200"));
+    }
+    let again = cli_exit(&["mcp-token"], &env);
+    assert_eq!(String::from_utf8(again.stdout).unwrap(), token);
+    assert!(again.stderr.is_empty(), "{}", String::from_utf8_lossy(&again.stderr));
+    let path = cli_exit(&["mcp-token", "--path"], &env);
+    assert_eq!(String::from_utf8(path.stdout).unwrap(), file.display().to_string());
+    let rotated = cli_exit(&["mcp-token", "--new"], &env);
+    assert!(rotated.status.success());
+    let new = String::from_utf8(rotated.stdout).unwrap();
+    assert!(is_generated_token(&new) && new != token);
+    assert_eq!(std::fs::read_to_string(&file).unwrap(), new);
+    assert!(!String::from_utf8_lossy(&rotated.stderr).contains(&new));
+    #[cfg(unix)]
+    assert_eq!(mode(&file), 0o600);
+    let p = Spawned::with_env(&["mcp", "--demo", "--http", "127.0.0.1:0"], &env);
+    let addr = banner_addr(&banner(&p));
+    assert!(http_initialize(&addr, Some(&token)).starts_with("HTTP/1.1 401"));
+    assert!(http_initialize(&addr, Some(&new)).starts_with("HTTP/1.1 200"));
+    // --data-dir picks another one, for the server and for mcp-token
+    let other = data.path("other dir");
+    let other_s = other.to_str().unwrap();
+    let p = Spawned::with_env(&["mcp", "--demo", "--http", "127.0.0.1:0", "--data-dir", other_s], &env);
+    let lines = banner(&p);
+    let other_token = std::fs::read_to_string(other.join("mcp-token")).unwrap();
+    assert!(is_generated_token(&other_token) && other_token != new);
+    assert!(lines[0].contains("--data-dir") && lines[0].contains("other dir"), "{lines:?}");
+    assert!(http_initialize(&banner_addr(&lines), Some(&other_token)).starts_with("HTTP/1.1 200"));
+    assert_eq!(String::from_utf8(cli_exit(&["mcp-token", "--data-dir", other_s], &env).stdout).unwrap(), other_token);
+    // FILMCRAFT_MCP_TOKEN set: mcp-token still prints the stored one, and says the server uses the variable
+    let noted = cli_exit(&["mcp-token"], &[env[0], ("FILMCRAFT_MCP_TOKEN", "from-the-environment-0123456789-abc")]);
+    assert_eq!(String::from_utf8(noted.stdout).unwrap(), new);
+    assert!(String::from_utf8_lossy(&noted.stderr).contains("FILMCRAFT_MCP_TOKEN is set"));
+}
+
+/// Without `FILMCRAFT_DATA_DIR` or `--data-dir`, the token is stored in the app's per-user data
+/// directory (here under a test home); when there is no usable one, the server and `mcp-token`
+/// fail (exit 1) and say how to give a token instead.
+#[test]
+fn the_stored_token_lives_in_the_per_user_data_directory() {
+    let home = TempDir::new("home");
+    let env: Vec<(&str, String)> = vec![
+        ("FILMCRAFT_DATA_DIR", String::new()),
+        ("HOME", home.path("home").display().to_string()),
+        ("XDG_DATA_HOME", home.path("xdg").display().to_string()),
+        ("APPDATA", home.path("appdata").display().to_string()),
+    ];
+    let env: Vec<(&str, &str)> = env.iter().map(|(k, v)| (*k, v.as_str())).collect();
+    let want = if cfg!(target_os = "macos") {
+        home.path("home/Library/Application Support/FilmCraft/mcp-token")
+    } else if cfg!(windows) {
+        home.path("appdata/FilmCraft/mcp-token")
+    } else {
+        home.path("xdg/filmcraft/mcp-token")
+    };
+    let o = cli_exit(&["mcp-token", "--path"], &env);
+    assert_eq!(String::from_utf8(o.stdout).unwrap(), want.display().to_string());
+    assert!(!want.exists(), "--path stores nothing");
+    let p = Spawned::with_env(&["mcp", "--demo", "--http", "127.0.0.1:0"], &env);
+    let lines = banner(&p);
+    let token = std::fs::read_to_string(&want).unwrap();
+    assert!(is_generated_token(&token));
+    assert!(lines[0].contains(&want.display().to_string()), "{lines:?}");
+    drop(p);
+    // a data directory that cannot be made (a file is in the way)
+    let blocked = home.path("blocked");
+    std::fs::write(&blocked, b"not a folder").unwrap();
+    let blocked_s = blocked.to_str().unwrap();
+    for args in [&["mcp", "--http", "127.0.0.1:0"][..], &["mcp-token"]] {
+        let o = cli_exit(args, &[("FILMCRAFT_DATA_DIR", blocked_s)]);
+        let err = String::from_utf8_lossy(&o.stderr);
+        assert_eq!(o.status.code(), Some(1), "{args:?}: {err}");
+        assert!(err.contains("mcp-token") && !err.contains("panicked"), "{err}");
+    }
+    let o = cli_exit(&["mcp", "--http", "127.0.0.1:0"], &[("FILMCRAFT_DATA_DIR", blocked_s)]);
+    let err = String::from_utf8_lossy(&o.stderr);
+    assert!(err.contains("--token-file") && err.contains("FILMCRAFT_MCP_TOKEN"), "{err}");
+}
+
+/// `FILMCRAFT_MCP_TOKEN` comes first, then `--token-file`, then the stored token; the stored one
+/// is not made while another is used.
+#[test]
+fn mcp_http_token_precedence() {
+    let data = TempDir::new("precedence");
+    let dir = data.0.to_str().unwrap().to_string();
+    let env_token = "env-token-0123456789-0123456789-abcdef";
+    let file_token = "file-token-0123456789-0123456789-abcde";
+    let file = data.path("token.txt");
+    std::fs::write(&file, format!("{file_token}\n")).unwrap();
+    #[cfg(unix)]
+    std::fs::set_permissions(&file, std::os::unix::fs::PermissionsExt::from_mode(0o600)).unwrap();
+    let f = file.to_str().unwrap();
+    let p =
+        Spawned::with_env(&["mcp", "--demo", "--http", "127.0.0.1:0", "--token-file", f], &[("FILMCRAFT_DATA_DIR", &dir), ("FILMCRAFT_MCP_TOKEN", env_token)]);
+    let lines = banner(&p);
+    assert!(lines.iter().any(|l| l.contains("warning: FILMCRAFT_MCP_TOKEN is set") && l.contains("--token-file")), "{lines:?}");
+    assert!(lines.iter().any(|l| l.contains("bearer token required (from FILMCRAFT_MCP_TOKEN)")), "{lines:?}");
+    let paste = lines.last().unwrap();
+    let var = if cfg!(windows) { "$env:FILMCRAFT_MCP_TOKEN" } else { "$FILMCRAFT_MCP_TOKEN" };
+    assert!(paste.ends_with(&format!("--header \"Authorization: Bearer {var}\"")), "{paste}");
+    assert!(lines.iter().all(|l| !l.contains(env_token) && !l.contains(file_token)), "{lines:?}");
+    let addr = banner_addr(&lines);
+    assert!(http_initialize(&addr, Some(file_token)).starts_with("HTTP/1.1 401"));
+    assert!(http_initialize(&addr, Some(env_token)).starts_with("HTTP/1.1 200"));
+    drop(p);
+    let p = Spawned::with_env(&["mcp", "--demo", "--http", "127.0.0.1:0", "--token-file", f], &[("FILMCRAFT_DATA_DIR", &dir)]);
+    let lines = banner(&p);
+    let addr = banner_addr(&lines);
+    assert!(http_initialize(&addr, Some(file_token)).starts_with("HTTP/1.1 200"));
+    assert!(lines.iter().all(|l| !l.contains(file_token)), "{lines:?}");
+    assert!(!data.path("mcp-token").exists(), "the stored token is made only when used");
+}
+
+/// `--no-token` on loopback serves without a token, warns that any local program can drive
+/// FilmCraft, and prints the command without a header.
+#[test]
+fn mcp_http_no_token_on_loopback() {
+    let p = Spawned::new(&["mcp", "--demo", "--http", "127.0.0.1:0", "--no-token"]);
+    let lines = banner(&p);
+    assert!(lines[0].contains("no token (--no-token)"), "{lines:?}");
+    assert!(lines.iter().any(|l| l.contains("warning: --no-token: any program on this machine")), "{lines:?}");
+    let addr = banner_addr(&lines);
+    assert!(lines.last().unwrap().ends_with(&format!("claude mcp add --transport http --scope user filmcraft-http http://{addr}/mcp")), "{lines:?}");
+    assert!(http_initialize(&addr, None).starts_with("HTTP/1.1 200"));
+    assert!(!p.data_dir().join("mcp-token").exists(), "--no-token stores no token");
 }
 
 /// The `host:port` of the `http://host:port/mcp` URL in a banner line.
@@ -125,21 +378,23 @@ fn http_initialize(addr: &str, token: Option<&str>) -> String {
 
 /// `--http localhost:PORT` listens on 127.0.0.1 and, where the system has IPv6, on [::1] at the
 /// same port (clients may resolve `localhost` to either); without IPv6 it still starts. The
-/// banner gives the 127.0.0.1 URL, and the next line the `claude mcp add` command for it.
+/// banner gives the 127.0.0.1 URL, and the last line the `claude mcp add` command for it.
 #[test]
 fn mcp_http_on_localhost_listens_on_both_loopback_addresses() {
     let p = Spawned::new(&["mcp", "--demo", "--http", "localhost:0"]);
-    let banner = Spawned::line(&p.err);
-    let addr = url_addr(&banner);
-    assert!(addr.starts_with("127.0.0.1:"), "{banner}");
+    let lines = banner(&p);
+    let addr = banner_addr(&lines);
+    assert!(addr.starts_with("127.0.0.1:"), "{lines:?}");
     let port = addr.trim_start_matches("127.0.0.1:");
-    let paste = Spawned::line(&p.err);
-    assert!(paste.ends_with(&format!("claude mcp add --transport http --scope user filmcraft-http http://{addr}/mcp")), "{paste}");
-    assert!(http_initialize(&addr, None).starts_with("HTTP/1.1 200"));
+    assert!(lines.last().unwrap().contains(&format!("claude mcp add --transport http --scope user filmcraft-http http://{addr}/mcp --header")), "{lines:?}");
+    let token = p.stored_token();
+    assert!(http_initialize(&addr, Some(&token)).starts_with("HTTP/1.1 200"));
     let ipv6 = std::net::TcpListener::bind("[::1]:0").is_ok();
-    assert_eq!(banner.contains(&format!("(and [::1]:{port})")), ipv6, "{banner}");
+    assert_eq!(lines[0].contains(&format!("(and [::1]:{port})")), ipv6, "{lines:?}");
     if ipv6 {
-        let reply = http_initialize(&format!("[::1]:{port}"), None);
+        let v6 = format!("[::1]:{port}");
+        assert!(http_initialize(&v6, None).starts_with("HTTP/1.1 401"));
+        let reply = http_initialize(&v6, Some(&token));
         assert!(reply.starts_with("HTTP/1.1 200"), "{reply}");
     }
 }
@@ -150,9 +405,8 @@ fn mcp_http_on_localhost_listens_on_both_loopback_addresses() {
 #[test]
 fn mcp_http_token_file_in_utf16_with_a_permission_warning() {
     let token = "token-file-test-0123456789-abcdefghij";
-    let dir = std::env::temp_dir().join(format!("fc-cli-token-{}", std::process::id()));
-    std::fs::create_dir_all(&dir).unwrap();
-    let file = dir.join("token.txt");
+    let dir = TempDir::new("token-file");
+    let file = dir.path("token.txt");
     let mut utf16 = vec![0xFF, 0xFE];
     utf16.extend(format!("{token}\r\n").encode_utf16().flat_map(u16::to_le_bytes));
     std::fs::write(&file, utf16).unwrap();
@@ -168,14 +422,17 @@ fn mcp_http_token_file_in_utf16_with_a_permission_warning() {
     assert!(line.contains("bearer token required") && !line.contains(token), "{line}");
     let addr = url_addr(&line);
     let paste = Spawned::line(&p.err);
+    let shown = file.display();
+    let read = if cfg!(windows) { format!("$((Get-Content -TotalCount 1 '{shown}').Trim())") } else { format!("$(head -n 1 '{shown}')") };
     assert!(
-        paste.contains(&format!("claude mcp add --transport http --scope user filmcraft-http http://{addr}/mcp --header \"Authorization: Bearer <token>\"")),
+        paste.contains(&format!("claude mcp add --transport http --scope user filmcraft-http http://{addr}/mcp --header \"Authorization: Bearer {read}\"")),
         "{paste}"
     );
     assert!(!paste.contains(token), "{paste}");
     assert!(http_initialize(&addr, None).starts_with("HTTP/1.1 401"));
     let reply = http_initialize(&addr, Some(token));
     assert!(reply.starts_with("HTTP/1.1 200"), "{reply}");
+    assert!(!p.data_dir().join("mcp-token").exists());
     drop(p);
     // a file with no token in it is a usage error that says how to write one
     for bytes in [&b""[..], b"\r\n", &[0x41, 0, 0x42, 0]] {
@@ -185,11 +442,11 @@ fn mcp_http_token_file_in_utf16_with_a_permission_warning() {
         assert_eq!(o.status.code(), Some(2), "{err}");
         assert!(err.contains("Set-Content -Encoding ascii"), "{err}");
     }
-    let _ = std::fs::remove_dir_all(&dir);
 }
 
 /// A spawned `filmcraft-cli`, killed when the test ends (also when it fails), with its stdout
-/// and stderr lines arriving on channels so a test never blocks on a silent child.
+/// and stderr lines arriving on channels so a test never blocks on a silent child. It runs with
+/// a data directory and home of its own (unless the test sets them), never the user's.
 struct Spawned {
     child: std::process::Child,
     // only the unix-only signal test writes to it
@@ -197,6 +454,8 @@ struct Spawned {
     stdin: Option<std::process::ChildStdin>,
     out: std::sync::mpsc::Receiver<String>,
     err: std::sync::mpsc::Receiver<String>,
+    /// Its own folder, with its default data directory (`data`) and home.
+    root: TempDir,
 }
 
 impl Spawned {
@@ -208,11 +467,21 @@ impl Spawned {
         cmd.args(args).envs(env.iter().copied());
         Self::spawn(cmd)
     }
-    /// `cmd` (filmcraft-cli, or a program that runs it) without `FILMCRAFT_MCP_TOKEN` unless set.
+    /// `cmd` (filmcraft-cli, or a program that runs it) without `FILMCRAFT_MCP_TOKEN` unless set,
+    /// and in a folder of its own for the data directory and home unless set.
     fn spawn(mut cmd: Command) -> Self {
         use std::io::BufRead;
-        if !cmd.get_envs().any(|(k, _)| k == "FILMCRAFT_MCP_TOKEN") {
+        let root = TempDir::new("spawned");
+        let set = |k: &str| cmd.get_envs().any(|(n, _)| n == k);
+        let (token_set, own) = (set("FILMCRAFT_MCP_TOKEN"), ["FILMCRAFT_DATA_DIR", "HOME", "XDG_DATA_HOME", "APPDATA", "LOCALAPPDATA"].map(|k| (k, !set(k))));
+        if !token_set {
             cmd.env_remove("FILMCRAFT_MCP_TOKEN");
+        }
+        for (k, unset) in own {
+            if unset {
+                let dir = if k == "FILMCRAFT_DATA_DIR" { "data".to_string() } else { k.to_ascii_lowercase() };
+                cmd.env(k, root.path(&dir));
+            }
         }
         let mut child = cmd.stdin(Stdio::piped()).stdout(Stdio::piped()).stderr(Stdio::piped()).spawn().expect("spawn filmcraft-cli");
         let lines = |r: Box<dyn std::io::Read + Send>| {
@@ -226,7 +495,15 @@ impl Spawned {
         };
         let out = lines(Box::new(child.stdout.take().unwrap()));
         let err = lines(Box::new(child.stderr.take().unwrap()));
-        Self { stdin: child.stdin.take(), child, out, err }
+        Self { stdin: child.stdin.take(), child, out, err, root }
+    }
+    /// Its default data directory (when the test did not set `FILMCRAFT_DATA_DIR`).
+    fn data_dir(&self) -> std::path::PathBuf {
+        self.root.path("data")
+    }
+    /// The token it stored in its default data directory.
+    fn stored_token(&self) -> String {
+        std::fs::read_to_string(self.data_dir().join("mcp-token")).unwrap()
     }
     fn line(rx: &std::sync::mpsc::Receiver<String>) -> String {
         rx.recv_timeout(std::time::Duration::from_secs(60)).expect("a line in time")
@@ -270,6 +547,20 @@ fn mcp_http_on_every_interface_prints_usable_addresses() {
     // the printed URL works
     let reply = http_initialize(&addr, Some(token));
     assert!(reply.starts_with("HTTP/1.1 200"), "{reply}");
+}
+
+/// The stored token is long enough for an address the network reaches, so `0.0.0.0` works with
+/// nothing else given; it is the same token as on loopback.
+#[test]
+fn mcp_http_on_every_interface_with_the_stored_token() {
+    let p = Spawned::new(&["mcp", "--demo", "--http", "0.0.0.0:0"]);
+    let lines = banner(&p);
+    let addr = banner_addr(&lines);
+    assert!(lines.iter().any(|l| l.contains("reachable from the network and HTTP is not encrypted")), "{lines:?}");
+    let token = p.stored_token();
+    assert!(lines.iter().all(|l| !l.contains(&token)));
+    assert!(http_initialize(&addr, None).starts_with("HTTP/1.1 401"));
+    assert!(http_initialize(&addr, Some(&token)).starts_with("HTTP/1.1 200"));
 }
 
 /// This machine's LAN address, if it has one (as the server finds it).
@@ -320,6 +611,7 @@ fn mcp_stops_cleanly_on_sigterm_and_sighup() {
             writeln!(p.stdin.as_mut().unwrap(), "{initialize}").unwrap();
             let reply = Spawned::line(&p.out);
             assert!(reply.contains(r#""id":0"#), "{reply}");
+            assert!(!p.data_dir().join("mcp-token").exists(), "stdio needs no token");
         }
         let kill = Command::new("kill").args([format!("-{signal}"), p.child.id().to_string()]).status().expect("run kill");
         assert!(kill.success());
@@ -347,7 +639,7 @@ fn mcp_under_nohup_ignores_sighup() {
     assert!(Command::new("kill").args(["-HUP", &pid]).status().expect("run kill").success());
     std::thread::sleep(std::time::Duration::from_millis(300));
     assert!(p.child.try_wait().unwrap().is_none(), "still running");
-    assert!(http_initialize(&addr, None).starts_with("HTTP/1.1 200"));
+    assert!(http_initialize(&addr, Some(&p.stored_token())).starts_with("HTTP/1.1 200"));
     assert!(Command::new("kill").args(["-TERM", &pid]).status().expect("run kill").success());
     let (status, err) = p.wait();
     assert_eq!(status.code(), Some(0), "{err}");

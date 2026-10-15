@@ -124,7 +124,8 @@ impl Default for Limits {
 #[derive(Clone)]
 pub struct HttpOptions {
     /// Require `Authorization: Bearer <token>` on every request. Mandatory for a non-loopback
-    /// address. Never logged.
+    /// address. Never logged. `filmcraft-cli mcp --http` always sets one (by default a random
+    /// one it stores in the data directory) unless given `--no-token`.
     pub token: Option<String>,
     /// More `Host` values to accept besides this server's own, as `name` (any port) or
     /// `name:port`: a LAN name, `host.docker.internal:<port>`, a tunnel or reverse proxy. See
