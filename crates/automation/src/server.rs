@@ -308,17 +308,24 @@ impl FilmcraftMcp {
             r = &mut waiting => Err(r),
             s = &mut stop => Ok(s),
         };
-        let (r, how) = match stopped {
-            Err(r) => (r, Stop::Graceful),
+        // One deadline for everything that follows, from the moment the stop came (or the input
+        // ended): a hurried stop must be over before the process is killed, however long rmcp
+        // waits for handlers that do not finish.
+        let (r, deadline) = match stopped {
+            Err(r) => (Some(r), crate::http_transport::deadline_after(Stop::Graceful.grace())),
             Ok(how) => {
+                let deadline = crate::http_transport::deadline_after(how.grace());
                 quit.cancel();
-                (waiting.await, how)
+                (tokio::time::timeout_at(deadline, &mut waiting).await.ok(), deadline)
             }
         };
         reader.abort();
-        let _ = tokio::time::timeout(how.grace(), writer).await;
-        long_calls.drain(crate::http_transport::deadline_after(how.grace())).await;
-        r.map(|_| ()).map_err(|e| AutomationError::Other(e.to_string()))
+        let _ = tokio::time::timeout_at(deadline, writer).await;
+        long_calls.drain(deadline).await;
+        match r {
+            Some(r) => r.map(|_| ()).map_err(|e| AutomationError::Other(e.to_string())),
+            None => Ok(()), // the service did not end in time: the process is stopping anyway
+        }
     }
 
     /// Run an engine command on whichever backend.
@@ -1098,6 +1105,48 @@ mod tests {
             assert!(!out.exists(), "{name}: the partial export is deleted");
         }
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A hurried stop (Windows kills the process about 5 s after its console closes) keeps to its
+    /// grace in all: rmcp's wait for a handler that does not finish, the writer and the exports
+    /// share one deadline instead of each getting the grace again.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_hurried_stdio_stop_keeps_to_its_grace() {
+        use tokio::io::{AsyncBufReadExt, AsyncWriteExt};
+        let mcp = FilmcraftMcp::headless(demo());
+        // the engine stays busy for longer than the grace: an export's call cannot even start it
+        let Backend::Headless(session) = &*mcp.backend else { panic!("headless") };
+        let session = session.clone();
+        let (locked, is_locked) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let _busy = session.lock().unwrap_or_else(PoisonError::into_inner);
+            let _ = locked.send(());
+            std::thread::sleep(std::time::Duration::from_secs(5));
+        });
+        is_locked.recv().unwrap();
+        let (mut tx, server_in) = tokio::io::duplex(1 << 20);
+        let (server_out, rx) = tokio::io::duplex(1 << 20);
+        let (stop, stop_rx) = tokio::sync::oneshot::channel::<Stop>();
+        let long_calls = mcp.long_calls.clone();
+        let done = tokio::spawn(mcp.serve_io_until(server_in, server_out, async move { stop_rx.await.unwrap_or(Stop::Graceful) }));
+        let mut rx = tokio::io::BufReader::new(rx).lines();
+        let init = json!({"jsonrpc":"2.0","id":0,"method":"initialize","params":{"protocolVersion":"2025-06-18","capabilities":{},"clientInfo":{"name":"t","version":"1"}}});
+        tx.write_all(format!("{init}\n{}\n", json!({"jsonrpc":"2.0","method":"notifications/initialized"})).as_bytes()).await.unwrap();
+        assert!(rx.next_line().await.unwrap().unwrap().contains(r#""id":0"#));
+        let out = std::env::temp_dir().join(format!("filmcraft-mcp-hurried-{}.mp4", std::process::id()));
+        let params = json!({"path": out.to_string_lossy(), "format": "h264", "width": 640, "height": 360, "audio": false, "wait": true});
+        let call = json!({"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"command_run","arguments":{"id":"file.exportMedia","params":params}}});
+        tx.write_all(format!("{call}\n").as_bytes()).await.unwrap();
+        while long_calls.count() == 0 {
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+        let t0 = std::time::Instant::now();
+        let _ = stop.send(Stop::Hurried);
+        let r = tokio::time::timeout(std::time::Duration::from_secs(30), done).await.expect("stopped").unwrap();
+        assert!(r.is_ok(), "{r:?}");
+        let took = t0.elapsed();
+        assert!(took < Stop::Hurried.grace() + std::time::Duration::from_millis(700), "within the hurried grace: {took:?}");
+        let _ = std::fs::remove_file(&out);
     }
 
     /// Bridge screenshots: the app is told to write into the server's private directory (not a
