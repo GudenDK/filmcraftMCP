@@ -3,18 +3,21 @@
 //! number of clients, and they all drive the same backend (one engine session, or one app).
 //!
 //! Secure by default (MCP spec, transports § Security Warning):
-//! * loopback addresses only, unless a bearer token is set;
+//! * loopback addresses only, unless a bearer token of 32+ characters is set;
 //! * with a token, every request needs `Authorization: Bearer <token>` (constant-time compare),
-//!   checked before anything else but a listed origin's CORS preflight, else 401;
+//!   checked before anything else but a listed origin's CORS preflight, else 401; a peer that
+//!   fails 10 times in a minute is refused (429) for a minute;
 //! * `Host` must name this server (`127.0.0.1:<port>`, `localhost:<port>`, `[::1]:<port>`, the
 //!   bound address, plus any `allowed_hosts`): a DNS-rebinding page gets 403;
 //! * a request with an `Origin` header (a browser) gets 403 unless that origin is listed in
 //!   `allowed_origins` (which then also get CORS headers); MCP clients send none.
 //!
-//! [`gate`] runs these checks before reading a body, maps a non-JSON body to a JSON-RPC parse error
-//! (`-32700`, as `serve_io` does on stdio), caps sessions, and keeps rmcp's per-tool-name schema
-//! cache bounded by answering unknown tool names itself. Refused requests are logged (stderr, or
-//! [`HttpOptions::log`]), rate limited per peer.
+//! The gate (`gate.rs`) runs these checks before reading a body, maps a non-JSON body to a
+//! JSON-RPC parse error (`-32700`, as `serve_io` does on stdio), and keeps rmcp's per-tool-name
+//! schema cache bounded by answering unknown tool names itself. Resources are bounded per peer and
+//! in all (`limits.rs`: connections, slow or idle clients, bodies) and sessions are tracked
+//! (`sessions.rs`: closed when idle, never with a call in flight). Refused requests are logged
+//! (stderr, or [`HttpOptions::log`]), rate limited per peer.
 
 mod gate;
 mod limits;
@@ -389,89 +392,101 @@ impl FilmcraftMcp {
         if let Some(idle) = opts.session_idle {
             tokio::spawn(reap_idle_sessions(gate.clone(), idle, limits.reap_every, ct.clone()));
         }
-        let refusing = Arc::new(tokio::sync::Semaphore::new(MAX_REFUSING));
-
-        loop {
-            let (stream, peer) = tokio::select! {
-                _ = ct.cancelled() => break,
-                accepted = listener.accept() => match accepted {
-                    Ok(accepted) => accepted,
-                    Err(_) => {
-                        // out of file descriptors and the like: back off instead of spinning
-                        tokio::time::sleep(Duration::from_millis(100)).await;
-                        continue;
-                    }
-                },
-            };
-            let slot = match conns.open(peer.ip()) {
-                Ok(slot) => slot,
-                Err(why) => {
-                    gate.log.event(peer.ip(), why, format_args!("refused a connection from {peer} with 503: {why}"));
-                    if let Ok(permit) = refusing.clone().try_acquire_owned() {
-                        tokio::spawn(async move {
-                            let _permit = permit;
-                            limits::refuse_connection(stream).await;
-                        });
-                    }
-                    continue;
-                }
-            };
-            let (gate, ct, header_timeout) = (gate.clone(), ct.clone(), limits.header_timeout);
-            tokio::spawn(async move {
-                let _slot = slot;
-                let reporter = gate.clone();
-                // a panic in a request is answered with 500 (Gate::serve)
-                let svc = service_fn(move |req: Request<Incoming>| {
-                    let gate = gate.clone();
-                    async move { Ok::<_, Infallible>(gate.serve(peer, req).await) }
-                });
-                // hyper panics on a timeout configured without a timer (hyper common/time.rs). Its
-                // header timer also runs while a keep-alive connection waits for its next request.
-                let conn = http1::Builder::new().timer(TokioTimer::new()).header_read_timeout(header_timeout).serve_connection(TokioIo::new(stream), svc);
-                let served = AssertUnwindSafe(async {
-                    tokio::pin!(conn);
-                    tokio::select! {
-                        _ = conn.as_mut() => {}
-                        _ = ct.cancelled() => {
-                            conn.as_mut().graceful_shutdown();
-                            let _ = tokio::time::timeout(Duration::from_secs(5), conn).await;
-                        }
-                    }
-                })
-                .catch_unwind()
-                .await;
-                // a panic while streaming a response: the connection is closed, the server goes on
-                if served.is_err() {
-                    reporter.log.event(
-                        peer.ip(),
-                        "panic",
-                        format_args!("internal error (a panic) while streaming a response to {peer}; closed the connection"),
-                    );
-                }
-            });
-        }
-
+        accept(&listener, &gate, &conns, limits.header_timeout, &ct).await;
         // Refuse new connections now rather than leave them hanging until the process exits.
         drop(listener);
         let grace = match *how.lock().unwrap_or_else(std::sync::PoisonError::into_inner) {
             Stop::Graceful => limits.grace,
             Stop::Hurried => limits.hurried_grace,
         };
-        let deadline = deadline_after(grace);
-        // The token ended every SSE stream and cancelled the stateless calls, but session workers
-        // outlive it: close them, so their calls see `context.ct` cancelled (after rmcp's response
-        // drain) and an export stops and deletes its partial output before the process exits.
-        let ids = gate.sessions.ids();
-        let rmcp_sessions = &sessions;
-        let close_all = futures_util::future::join_all(ids.iter().map(|id| async move {
-            let _ = rmcp_sessions.close_session(&id.as_str().into()).await;
-        }));
-        let _ = tokio::time::timeout_at(deadline, close_all).await;
-        // Exports first: whatever still runs at the deadline has its partial output deleted.
-        long_calls.drain(deadline).await;
-        let _ = tokio::time::timeout_at(deadline, conns.all_closed()).await;
+        wind_down(&gate, &long_calls, &conns, deadline_after(grace)).await;
         Ok(())
     }
+}
+
+/// Accept connections until `stop`. One within the limits is served by its own task; one past
+/// them gets a 503.
+async fn accept(listener: &tokio::net::TcpListener, gate: &Arc<gate::Gate>, conns: &Arc<limits::Conns>, header_timeout: Duration, stop: &CancellationToken) {
+    let refusing = Arc::new(tokio::sync::Semaphore::new(MAX_REFUSING));
+    loop {
+        let (stream, peer) = tokio::select! {
+            _ = stop.cancelled() => return,
+            accepted = listener.accept() => match accepted {
+                Ok(accepted) => accepted,
+                Err(_) => {
+                    // out of file descriptors and the like: back off instead of spinning
+                    tokio::time::sleep(Duration::from_millis(100)).await;
+                    continue;
+                }
+            },
+        };
+        match conns.open(peer.ip()) {
+            Ok(slot) => {
+                tokio::spawn(serve_connection(gate.clone(), stream, peer, slot, header_timeout, stop.clone()));
+            }
+            Err(why) => {
+                gate.log.event(peer.ip(), why, format_args!("refused a connection from {peer} with 503: {why}"));
+                if let Ok(permit) = refusing.clone().try_acquire_owned() {
+                    tokio::spawn(async move {
+                        let _permit = permit;
+                        limits::refuse_connection(stream).await;
+                    });
+                }
+            }
+        }
+    }
+}
+
+/// Serve one connection's requests through the gate until it closes, or the server stops (then it
+/// finishes the request in progress, for at most 5 s).
+async fn serve_connection(
+    gate: Arc<gate::Gate>,
+    stream: tokio::net::TcpStream,
+    peer: SocketAddr,
+    _slot: limits::ConnSlot,
+    header_timeout: Duration,
+    stop: CancellationToken,
+) {
+    let reporter = gate.clone();
+    // a panic in a request is answered with 500 (Gate::serve)
+    let svc = service_fn(move |req: Request<Incoming>| {
+        let gate = gate.clone();
+        async move { Ok::<_, Infallible>(gate.serve(peer, req).await) }
+    });
+    // hyper panics on a timeout configured without a timer (hyper common/time.rs). Its header
+    // timer also runs while a keep-alive connection waits for its next request.
+    let conn = http1::Builder::new().timer(TokioTimer::new()).header_read_timeout(header_timeout).serve_connection(TokioIo::new(stream), svc);
+    let served = AssertUnwindSafe(async {
+        tokio::pin!(conn);
+        tokio::select! {
+            _ = conn.as_mut() => {}
+            _ = stop.cancelled() => {
+                conn.as_mut().graceful_shutdown();
+                let _ = tokio::time::timeout(Duration::from_secs(5), conn).await;
+            }
+        }
+    })
+    .catch_unwind()
+    .await;
+    // a panic while streaming a response: the connection is closed, the server goes on
+    if served.is_err() {
+        reporter.log.event(peer.ip(), "panic", format_args!("internal error (a panic) while streaming a response to {peer}; closed the connection"));
+    }
+}
+
+/// After the accept loop, with the stop token cancelled: that ended every SSE stream and cancelled
+/// the stateless calls, but session workers outlive it, so close them; their calls then see
+/// `context.ct` cancelled (after rmcp's response drain), and an export stops and deletes its
+/// partial output. Exports get until `deadline` (what one still running then wrote is deleted),
+/// then the connections.
+async fn wind_down(gate: &gate::Gate, long_calls: &crate::long_job::LongCalls, conns: &limits::Conns, deadline: tokio::time::Instant) {
+    let ids = gate.sessions.ids();
+    let close_all = futures_util::future::join_all(ids.iter().map(|id| async move {
+        let _ = gate.rmcp_sessions.close_session(&id.as_str().into()).await;
+    }));
+    let _ = tokio::time::timeout_at(deadline, close_all).await;
+    long_calls.drain(deadline).await;
+    let _ = tokio::time::timeout_at(deadline, conns.all_closed()).await;
 }
 
 /// rmcp's session store with its idle timeout off: it counts session events only, so it would cut
