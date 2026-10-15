@@ -598,6 +598,11 @@ fn accept_error_backs_off(e: &std::io::Error) -> bool {
     if matches!(e.raw_os_error(), Some(71 | 92 | 112 | 64 | 113 | 101 | 100 | 1)) {
         return false;
     }
+    // WSAEINTR, Windows' EINTR, which std reports as uncategorized rather than `Interrupted`
+    #[cfg(windows)]
+    if e.raw_os_error() == Some(10004) {
+        return false;
+    }
     true
 }
 

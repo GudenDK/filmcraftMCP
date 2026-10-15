@@ -1484,7 +1484,8 @@ fn accept_errors_back_off_only_when_out_of_resources() {
     }
     #[cfg(windows)]
     {
-        // WSAECONNRESET (a connection reset before accept), WSAECONNABORTED, WSAEINTR
+        // WSAECONNRESET (a connection reset before accept) and WSAECONNABORTED, which std maps to
+        // ConnectionReset and ConnectionAborted, and WSAEINTR, which it does not map at all
         for code in [10054, 10053, 10004] {
             assert!(!accept_error_backs_off(&Error::from_raw_os_error(code)), "WSA error {code}");
         }
