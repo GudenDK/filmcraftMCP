@@ -105,6 +105,7 @@ fn mcp_http_usage_errors() {
         &["mcp", "--http", "127.0.0.1:0", "--no-token", "--allow-host", "my-tunnel.trycloudflare.com"],
         &["mcp", "--http", "127.0.0.1:0", "--no-token", "--allow-host", "host.docker.internal:9877"],
         &["mcp", "--http", "127.0.0.1:0", "--no-token", "--allow-origin", "null"],
+        &["mcp", "--http", "127.0.0.1:0", "--no-token", "--allow-origin", "https://example.com:443"],
         &["mcp", "--http", "127.0.0.1:0", "--no-token", "--token-file", "t.txt"],
         &["mcp", "--http", "127.0.0.1:0", "--no-token=yes"],
     ] {
@@ -181,10 +182,16 @@ fn mcp_http_requires_the_stored_token_by_default() {
     #[cfg(unix)]
     assert_eq!((mode(&file), mode(&p.data_dir())), (0o600, 0o700));
     let shown = file.display().to_string();
-    assert!(lines[0].contains(&format!("bearer token required (the one stored in {shown}; `filmcraft-cli mcp-token` prints it)")), "{lines:?}");
-    assert!(lines.iter().any(|l| l.contains(&format!("made a new random MCP token and stored it in {shown}"))), "{lines:?}");
+    // FILMCRAFT_DATA_DIR is set for this server only: the command names the folder
+    let print = format!("filmcraft-cli mcp-token --data-dir '{}'", p.data_dir().display());
+    assert!(lines[0].contains(&format!("bearer token required (the one stored in {shown}; `{print}` prints it)")), "{lines:?}");
+    let made = lines.iter().find(|l| l.contains("made a new random MCP token")).unwrap_or_else(|| panic!("{lines:?}"));
+    assert!(made.contains(&format!("stored it in {shown}")) && made.ends_with(&format!("; `{print}` prints it, `{print} --new` replaces it")), "{made}");
+    // (on Windows only when the folder is in the user's profile, as the temporary folder usually is)
+    #[cfg(unix)]
+    assert!(made.contains(&format!("stored it in {shown}, readable only by you;")), "{made}");
     let paste = lines.last().unwrap();
-    let read = if cfg!(windows) { format!("$(Get-Content -Raw '{shown}')") } else { format!("$(cat '{shown}')") };
+    let read = if cfg!(windows) { format!("$((Get-Content -LiteralPath '{shown}' -TotalCount 1).Trim())") } else { format!("$(cat '{shown}')") };
     assert!(
         paste.ends_with(&format!("claude mcp add --transport http --scope user filmcraft-http http://{addr}/mcp --header \"Authorization: Bearer {read}\"")),
         "{paste}"
@@ -286,8 +293,22 @@ fn the_stored_token_lives_in_the_per_user_data_directory() {
     let lines = banner(&p);
     let token = std::fs::read_to_string(&want).unwrap();
     assert!(is_generated_token(&token));
-    assert!(lines[0].contains(&want.display().to_string()), "{lines:?}");
+    // where `mcp-token` looks from any shell: no --data-dir needed
+    assert!(lines[0].contains(&format!("the one stored in {}; `filmcraft-cli mcp-token` prints it", want.display())), "{lines:?}");
     drop(p);
+    // a relative XDG_DATA_HOME or HOME would put the token in the current folder: refused
+    let cwd = home.path("cwd");
+    std::fs::create_dir_all(&cwd).unwrap();
+    let relative = [("FILMCRAFT_DATA_DIR", ""), ("HOME", "rel-home"), ("XDG_DATA_HOME", "rel-xdg"), ("APPDATA", "rel-appdata")];
+    for args in [&["mcp", "--http", "127.0.0.1:0"][..], &["mcp-token"], &["mcp-token", "--path"]] {
+        let mut cmd = Command::new(env!("CARGO_BIN_EXE_filmcraft-cli"));
+        cmd.args(args).envs(relative).current_dir(&cwd);
+        let mut p = Spawned::spawn(cmd);
+        let (status, err) = p.wait();
+        assert_eq!(status.code(), Some(1), "{args:?}: {err}");
+        assert!(err.contains("not an absolute path") && err.contains("--data-dir"), "{args:?}: {err}");
+    }
+    assert_eq!(std::fs::read_dir(&cwd).unwrap().count(), 0, "nothing stored in the current folder");
     // a data directory that cannot be made (a file is in the way)
     let blocked = home.path("blocked");
     std::fs::write(&blocked, b"not a folder").unwrap();
@@ -301,6 +322,18 @@ fn the_stored_token_lives_in_the_per_user_data_directory() {
     let o = cli_exit(&["mcp", "--http", "127.0.0.1:0"], &[("FILMCRAFT_DATA_DIR", blocked_s)]);
     let err = String::from_utf8_lossy(&o.stderr);
     assert!(err.contains("--token-file") && err.contains("FILMCRAFT_MCP_TOKEN"), "{err}");
+    // an unusable stored token: the command that replaces it names its data directory, here given
+    // with --data-dir (`mcp-token --new` alone would replace the default one)
+    let bad = home.path("bad");
+    std::fs::create_dir_all(&bad).unwrap();
+    std::fs::write(bad.join("mcp-token"), "\r\n").unwrap();
+    let again = format!("mcp-token --data-dir '{}' --new", bad.display());
+    for args in [&["mcp", "--http", "127.0.0.1:0", "--data-dir", bad.to_str().unwrap()][..], &["mcp-token", "--data-dir", bad.to_str().unwrap()]] {
+        let o = cli_exit(args, &env);
+        let err = String::from_utf8_lossy(&o.stderr);
+        assert_eq!(o.status.code(), Some(1), "{args:?}: {err}");
+        assert!(err.contains("unusable") && err.contains(&again), "{args:?}: {err}");
+    }
 }
 
 /// `FILMCRAFT_MCP_TOKEN` comes first, then `--token-file`, then the stored token; the stored one
@@ -423,7 +456,11 @@ fn mcp_http_token_file_in_utf16_with_a_permission_warning() {
     let addr = url_addr(&line);
     let paste = Spawned::line(&p.err);
     let shown = file.display();
-    let read = if cfg!(windows) { format!("$((Get-Content -TotalCount 1 '{shown}').Trim())") } else { format!("$(head -n 1 '{shown}')") };
+    let read = if cfg!(windows) {
+        format!("$((Get-Content -LiteralPath '{shown}' -TotalCount 1).Trim())")
+    } else {
+        format!(r"$(LC_ALL=C tr -d ' \t\r\000\357\273\277\376\377' < '{shown}' | head -n 1)")
+    };
     assert!(
         paste.contains(&format!("claude mcp add --transport http --scope user filmcraft-http http://{addr}/mcp --header \"Authorization: Bearer {read}\"")),
         "{paste}"

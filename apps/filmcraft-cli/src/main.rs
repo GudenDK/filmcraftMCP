@@ -127,7 +127,8 @@ OPTIONS
                                 stored one (FILMCRAFT_MCP_TOKEN, when set, comes first)
   --no-token                    mcp --http: no token, so any program on this machine can drive
                                 FilmCraft. Loopback addresses only, and not with --allow-host,
-                                --allow-origin null, --token-file or FILMCRAFT_MCP_TOKEN
+                                an --allow-origin other than this machine's (localhost, a
+                                loopback address), --token-file or FILMCRAFT_MCP_TOKEN
   --allow-origin <origin>       mcp --http: let this browser origin call, with CORS headers:
                                 scheme://host:port with the port spelled out (repeatable; any
                                 other request with an Origin header is refused). `null` (any
@@ -589,9 +590,11 @@ fn mcp_http_options(a: &Args) -> Option<(std::net::SocketAddr, filmcraft_automat
     let token = resolved.token;
     if let Some(t) = &token {
         check_token(t).unwrap_or_else(|e| match &resolved.source {
-            token::Source::Stored { path, .. } => {
-                fail(format!("mcp: the stored token in {} is unusable: {e}; replace it with `filmcraft-cli mcp-token --new`", path.display()))
-            }
+            token::Source::Stored { path, .. } => fail(format!(
+                "mcp: the stored token in {} is unusable: {e}; replace it with `{} --new`",
+                path.display(),
+                token::mcp_token_command(path, cfg!(windows))
+            )),
             _ => usage(format!("mcp: {e}")),
         });
     }
@@ -624,6 +627,8 @@ fn mcp_token(a: &Args) {
     }
     let path = token::stored_token_path(a.opt("--data-dir"))
         .unwrap_or_else(|e| fail(format!("mcp-token: cannot locate the stored MCP token: {e}; pass --data-dir DIR to keep it elsewhere")));
+    // this command again, with the same data directory
+    let again = token::mcp_token_command(&path, cfg!(windows));
     if a.flag("--path") {
         outln!("{}", path.display());
         return;
@@ -640,11 +645,11 @@ fn mcp_token(a: &Args) {
         t
     } else {
         let stored = token::load_or_create(&path).unwrap_or_else(|e| {
-            let what = if e.unusable { "`filmcraft-cli mcp-token --new` replaces it" } else { "pass --data-dir DIR to keep it elsewhere" };
+            let what = if e.unusable { format!("`{again} --new` replaces it") } else { "pass --data-dir DIR to keep it elsewhere".into() };
             fail(format!("mcp-token: {}; {what}", e.message))
         });
-        if let Some(w) = stored.warning {
-            diag(format_args!("filmcraft-cli: warning: the stored token file {w}"));
+        for w in &stored.warnings {
+            diag(format_args!("filmcraft-cli: warning: {w}"));
         }
         if stored.created {
             diag(format_args!("filmcraft-cli: made a new MCP token and stored it in {}", path.display()));
@@ -652,7 +657,7 @@ fn mcp_token(a: &Args) {
         stored.token
     };
     if let Err(e) = check_token(&token) {
-        fail(format!("mcp-token: the token in {} is unusable: {e}; `filmcraft-cli mcp-token --new` replaces it", path.display()));
+        fail(format!("mcp-token: the token in {} is unusable: {e}; `{again} --new` replaces it", path.display()));
     }
     outln!("{token}");
 }
@@ -708,12 +713,9 @@ async fn serve_mcp_http(
     use filmcraft_automation::http_transport::{TOKEN_ENV, is_local_host};
     // where the token is, never the token
     let powershell = cfg!(windows);
-    let print_it = match (&source, a.opt("--data-dir")) {
-        (token::Source::Stored { path, .. }, Some(_)) => {
-            let dir = path.parent().unwrap_or(path).to_string_lossy();
-            let dir = if powershell { token::powershell_quote(&dir) } else { token::sh_quote(&dir) };
-            format!("filmcraft-cli mcp-token --data-dir {dir}")
-        }
+    // with --data-dir unless the token is where `mcp-token` looks from any shell
+    let print_it = match &source {
+        token::Source::Stored { path, .. } => token::mcp_token_command(path, powershell),
         _ => "filmcraft-cli mcp-token".to_string(),
     };
     let auth = match &source {
@@ -731,8 +733,10 @@ async fn serve_mcp_http(
     diag(format_args!("filmcraft-cli: MCP (Streamable HTTP) on http://{url_addr}/mcp{also}, driving {backend}; {auth}. Ctrl+C stops it."));
     match &source {
         token::Source::Stored { path, created: true } => diag(format_args!(
-            "filmcraft-cli: made a new random MCP token and stored it in {}, readable only by you; `{print_it}` prints it, `{print_it} --new` replaces it",
-            path.display()
+            "filmcraft-cli: made a new random MCP token and stored it in {}{}; `{print_it}` prints it, `{print_it} --new` replaces it",
+            path.display(),
+            // on Windows only the folder's permissions protect it (warned about above when they may not)
+            if token::stored_location_warning(path).is_none() { ", readable only by you" } else { "" }
         )),
         token::Source::Off => diag(format_args!(
             "filmcraft-cli: warning: --no-token: any program on this machine, run by any user, can drive FilmCraft through this port; leave --no-token off to require the stored token"

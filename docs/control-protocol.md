@@ -170,10 +170,12 @@ the server stores as `mcp-token` in the data directory on first use (`filmcraft-
 prints it, `--new` replaces it, `--path` says where it is). The server prints where it is, never
 the token, and the line to register it:
 `claude mcp add --transport http --scope user filmcraft-http http://127.0.0.1:9877/mcp --header "Authorization: Bearer $(cat '<path>/mcp-token')"`
-(on Windows, for PowerShell: `$(Get-Content -Raw '<path>\mcp-token')`). `--no-token` turns it off,
-on a loopback address only and not with `--allow-host` or `--allow-origin null`. A non-loopback
-address, an `--allow-host` name that is not this machine (a tunnel or proxy) and
-`--allow-origin null` need a token of 32+ characters, which the stored one is. Since it speaks
+(on Windows, for PowerShell: `$((Get-Content -LiteralPath '<path>\mcp-token' -TotalCount 1).Trim())`).
+`--no-token` turns it off, on a loopback address only and not with `--allow-host` or with an
+`--allow-origin` that is `null` or another machine's. A non-loopback address, an `--allow-host`
+name that is not this machine (a tunnel or proxy), `--allow-origin null` and requests relayed by a
+proxy or tunnel (they carry forwarding headers such as `X-Forwarded-For` or `Via`; 403 otherwise)
+need a token of 32+ characters, which the stored one is. Since it speaks
 HTTP, a web page can address it too: it checks `Host` and `Origin` (a browser's request gets 403
 unless its origin is listed with `--allow-origin`, which also turns on CORS for it). It caps connections
 per address and in all (closing ones that never sent a valid request to make room), times out slow

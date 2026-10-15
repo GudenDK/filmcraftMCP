@@ -30,9 +30,14 @@ const HOW: &str =
 /// The token in the file at `path` (its first line, trimmed), and a warning if other users can get
 /// at the file.
 pub fn read_token_file(path: &Path) -> Result<(String, Option<String>), String> {
+    let file = std::fs::File::open(path).map_err(|e| e.to_string())?;
+    read_open_token_file(file, path)
+}
+
+/// [`read_token_file`] on the file opened from `path`.
+fn read_open_token_file(file: std::fs::File, path: &Path) -> Result<(String, Option<String>), String> {
     use std::io::Read as _;
     let mut bytes = Vec::new();
-    let file = std::fs::File::open(path).map_err(|e| e.to_string())?;
     let warning = file.metadata().ok().and_then(|m| exposure(&m)).map(|why| format!("{} {why}", path.display()));
     file.take(MAX_FILE + 1).read_to_end(&mut bytes).map_err(|e| e.to_string())?;
     if bytes.len() as u64 > MAX_FILE {
@@ -85,8 +90,8 @@ fn utf16(bytes: &[u8], unit: fn([u8; 2]) -> u16) -> Result<String, String> {
 }
 
 /// Why other users can get at a token file (read it, or put in their own token), if they can:
-/// group or other permission bits on a regular file. Only checked on unix; a Windows profile
-/// folder is private by default.
+/// group or other permission bits on a regular file. Only checked on unix: on Windows a file has
+/// its folder's permissions (see [`windows_exposure`] for the stored token).
 #[cfg(unix)]
 fn exposure(meta: &std::fs::Metadata) -> Option<String> {
     use std::os::unix::fs::PermissionsExt as _;
@@ -124,11 +129,21 @@ pub enum Source {
 }
 
 /// The token `mcp --http` requires, where it came from, and warnings to show (never the token).
-#[derive(Debug)]
 pub struct Resolved {
     pub token: Option<String>,
     pub source: Source,
     pub warnings: Vec<String>,
+}
+
+/// Debug output never shows the token.
+impl std::fmt::Debug for Resolved {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Resolved")
+            .field("token", &self.token.as_ref().map(|_| "<set>"))
+            .field("source", &self.source)
+            .field("warnings", &self.warnings)
+            .finish()
+    }
 }
 
 /// Why no token could be had: a usage error (exit 2) or a failure (exit 1).
@@ -170,16 +185,17 @@ pub fn resolve(no_token: bool, env: Option<&str>, token_file: Option<&str>, stor
     let instead = format!("pass --data-dir DIR or --token-file FILE, or set {TOKEN_ENV}");
     let path = stored().map_err(|e| Problem::Failure(format!("cannot locate the stored MCP token: {e}; {instead}")))?;
     let stored = load_or_create(&path).map_err(|e| {
-        let replace = if e.unusable { "replace it with `filmcraft-cli mcp-token --new`, or " } else { "" };
+        let replace = if e.unusable { format!("replace it with `{} --new`, or ", mcp_token_command(&path, cfg!(windows))) } else { String::new() };
         Problem::Failure(format!("{}; {replace}{instead}", e.message))
     })?;
-    warnings.extend(stored.warning.map(|w| format!("the stored token file {w}")));
+    warnings.extend(stored.warnings);
     Ok(Resolved { token: Some(stored.token), source: Source::Stored { path, created: stored.created }, warnings })
 }
 
 /// `--no-token` is for loopback only: not with an address the network reaches, nor with an
 /// `--allow-host` (the names other machines, containers, tunnels and proxies reach the server
-/// by), nor with `--allow-origin null` (any web page).
+/// by), nor with an `--allow-origin` other than a page on this machine (`null` is any web page,
+/// and a site's pages, or scripts injected into them, would drive FilmCraft from the browser).
 pub fn check_no_token(addr: SocketAddr, allowed_hosts: &[String], allowed_origins: &[String]) -> Result<(), String> {
     if !addr.ip().is_loopback() {
         return Err(format!(
@@ -191,10 +207,27 @@ pub fn check_no_token(addr: SocketAddr, allowed_hosts: &[String], allowed_origin
             "--no-token can't be used with --allow-host {h}: the names it adds are how containers, tunnels, proxies or other machines reach the server, so it needs the token"
         ));
     }
-    if allowed_origins.iter().any(|o| o.eq_ignore_ascii_case("null")) {
+    if allowed_origins.iter().any(|o| o.trim().eq_ignore_ascii_case("null")) {
         return Err("--no-token can't be used with --allow-origin null: every web page can send that origin, so it needs the token".into());
     }
+    if let Some(o) = allowed_origins.iter().find(|o| !is_local_origin(o)) {
+        return Err(format!("--no-token can't be used with --allow-origin {o}: pages from that site could drive FilmCraft, so it needs the token"));
+    }
     Ok(())
+}
+
+/// Whether an `--allow-origin` entry (`scheme://host:port`, as `check_allowed_origin` returns it)
+/// is a page served by this machine: `localhost`, a name under it, or a loopback address.
+fn is_local_origin(origin: &str) -> bool {
+    let Some((_, authority)) = origin.trim().split_once("://") else { return false };
+    let authority = authority.trim_end_matches('/');
+    let host = match authority.rsplit_once(':') {
+        Some((h, port)) if port.bytes().all(|b| b.is_ascii_digit()) => h,
+        _ => authority,
+    };
+    let host = host.to_ascii_lowercase();
+    let ip = host.strip_prefix('[').and_then(|h| h.strip_suffix(']')).unwrap_or(&host);
+    host == "localhost" || host.ends_with(".localhost") || ip.parse::<std::net::IpAddr>().is_ok_and(|ip| ip.to_canonical().is_loopback())
 }
 
 /// Where the stored token lives: `mcp-token` in `data_dir` (`--data-dir`), else in FilmCraft's
@@ -203,22 +236,62 @@ pub fn check_no_token(addr: SocketAddr, allowed_hosts: &[String], allowed_origin
 /// `$XDG_DATA_HOME/filmcraft` or `~/.local/share/filmcraft`). Absolute, so the command the server
 /// prints to read it works from any folder.
 pub fn stored_token_path(data_dir: Option<&str>) -> Result<PathBuf, String> {
+    stored_token_path_in(data_dir, filmcraft_engine::autosave::default_data_dir)
+}
+
+/// [`stored_token_path`], with `default` the data directory. One from the environment must be
+/// absolute: a relative `XDG_DATA_HOME` or `HOME` (which the XDG spec says to ignore) would put
+/// the token in whatever folder the command runs in, maybe a repository where `git add -A` takes
+/// it. A relative `--data-dir` is the user's choice, and taken from the current folder.
+fn stored_token_path_in(data_dir: Option<&str>, default: impl FnOnce() -> Option<PathBuf>) -> Result<PathBuf, String> {
     let dir = match data_dir {
         Some(d) => PathBuf::from(d),
-        None => filmcraft_engine::autosave::default_data_dir().ok_or("FilmCraft found no per-user data directory (HOME, or APPDATA on Windows, is not set)")?,
+        None => {
+            let d = default().ok_or("FilmCraft found no per-user data directory (HOME, or APPDATA on Windows, is not set)")?;
+            if !d.is_absolute() {
+                return Err(format!("the data directory `{}` (from FILMCRAFT_DATA_DIR, XDG_DATA_HOME, HOME or APPDATA) is not an absolute path", d.display()));
+            }
+            d
+        }
     };
     let dir = std::path::absolute(&dir).map_err(|e| format!("data directory `{}`: {e}", dir.display()))?;
     Ok(dir.join(STORED_FILE))
 }
 
+/// The `filmcraft-cli mcp-token` command for the token stored at `path`, quoted for PowerShell
+/// (`powershell`) or a POSIX shell: with `--data-dir` unless `path` is in the per-user data
+/// directory, the one `mcp-token` finds from any shell (`FILMCRAFT_DATA_DIR` may be set for the
+/// server only, and a portable install's folder is only found by its own `filmcraft-cli`).
+pub fn mcp_token_command(path: &Path, powershell: bool) -> String {
+    let per_user = filmcraft_engine::autosave::per_user_data_dir().filter(|d| d.is_absolute());
+    mcp_token_command_for(path, per_user.as_deref(), powershell)
+}
+
+fn mcp_token_command_for(path: &Path, per_user: Option<&Path>, powershell: bool) -> String {
+    let dir = path.parent().unwrap_or(path);
+    if per_user.is_some_and(|d| d == dir) {
+        return "filmcraft-cli mcp-token".into();
+    }
+    let dir = dir.to_string_lossy();
+    let dir = if powershell { powershell_quote(&dir) } else { sh_quote(&dir) };
+    format!("filmcraft-cli mcp-token --data-dir {dir}")
+}
+
 /// The stored token at a path.
-#[derive(Debug)]
 pub struct Stored {
     pub token: String,
     /// Made just now: there was none.
     pub created: bool,
-    /// Other users can get at the file (unix).
-    pub warning: Option<String>,
+    /// How other users could get at the file, if they could: its permissions or its folder's
+    /// (unix), or its folder outside the user's profile (Windows).
+    pub warnings: Vec<String>,
+}
+
+/// Debug output never shows the token.
+impl std::fmt::Debug for Stored {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Stored").field("token", &"<set>").field("created", &self.created).field("warnings", &self.warnings).finish()
+    }
 }
 
 /// Why the stored token could not be had.
@@ -230,31 +303,109 @@ pub struct StoreError {
     pub unusable: bool,
 }
 
-/// The token stored at `path`, read as a `--token-file` is. When nothing is there, a new random
-/// one ([`generate_token`]) is stored first, without ever replacing or following what is at
-/// `path`: a file another process (another server, `mcp-token`) stored meanwhile is read instead,
-/// and a dangling link is an error. On unix the file is private (0600), and so is a folder made
-/// for it (0700).
+/// The token stored at `path`, read as a `--token-file` is, but only from a regular file: never
+/// through a link (another user who can write to the folder could point it at any file of yours
+/// with a predictable first line), nor from a pipe or device (which would block, or feed it
+/// anything). When nothing is there, a new random one ([`generate_token`]) is stored first,
+/// without ever replacing or following what is at `path`: a file another process (another server,
+/// `mcp-token`) stored meanwhile is read instead. On unix the file is private (0600), and so is a
+/// folder made for it (0700).
 pub fn load_or_create(path: &Path) -> Result<Stored, StoreError> {
     let shown = path.display();
-    let read = || {
-        read_token_file(path)
-            .map(|(token, warning)| Stored { token, created: false, warning })
-            .map_err(|e| StoreError { message: format!("the stored MCP token in {shown} is unusable: {e}"), unusable: true })
-    };
     let fault = |message: String| StoreError { message, unusable: false };
     match std::fs::symlink_metadata(path) {
-        Ok(_) => return read(),
+        Ok(m) => return read_stored(path, &m),
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
         Err(e) => return Err(fault(format!("cannot get at the stored MCP token in {shown}: {e}"))),
     }
     let token = generate_token().map_err(fault)?;
     match create_token_file(path, &token) {
-        Ok(()) => Ok(Stored { token, created: true, warning: None }),
+        Ok(()) => Ok(Stored { token, created: true, warnings: location_warnings(path) }),
         // another process stored one first: that is the token
-        Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => read(),
+        Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => match std::fs::symlink_metadata(path) {
+            Ok(m) => read_stored(path, &m),
+            Err(_) => Err(fault(format!("cannot store a new MCP token in {shown}: {e}"))),
+        },
         Err(e) => Err(fault(format!("cannot store a new MCP token in {shown}: {e}"))),
     }
+}
+
+/// Read the stored token at `path`, whose `symlink_metadata` is `meta`: a regular file only, and
+/// on unix the very file that was looked at.
+fn read_stored(path: &Path, meta: &std::fs::Metadata) -> Result<Stored, StoreError> {
+    let shown = path.display();
+    let unusable = |why: String| StoreError { message: format!("the stored MCP token in {shown} is unusable: {why}"), unusable: true };
+    let kind = meta.file_type();
+    if kind.is_dir() {
+        return Err(StoreError { message: format!("{shown} is a folder, not the stored MCP token: move it away"), unusable: false });
+    }
+    if !kind.is_file() {
+        let what = if kind.is_symlink() { "a link" } else { "no regular file (a pipe, socket or device)" };
+        return Err(unusable(format!("it is {what}, which is never read as the token")));
+    }
+    let file = std::fs::File::open(path).map_err(|e| unusable(e.to_string()))?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt as _;
+        let opened = file.metadata().map_err(|e| unusable(e.to_string()))?;
+        if !opened.is_file() || (opened.dev(), opened.ino()) != (meta.dev(), meta.ino()) {
+            return Err(unusable("it was replaced while it was being read".into()));
+        }
+    }
+    let (token, warning) = read_open_token_file(file, path).map_err(unusable)?;
+    let mut warnings: Vec<String> = warning.map(|w| format!("the stored token file {w}")).into_iter().collect();
+    warnings.extend(location_warnings(path));
+    Ok(Stored { token, created: false, warnings })
+}
+
+/// How other users could get at the stored token at `path` through its folder: on unix a folder
+/// they can write to (without the sticky bit) lets them replace the file with one holding a token
+/// they know; on Windows a folder outside the user's profile ([`windows_exposure`]).
+fn location_warnings(path: &Path) -> Vec<String> {
+    let warnings = stored_location_warning(path).into_iter();
+    #[cfg(unix)]
+    let warnings = warnings.chain(path.parent().and_then(folder_exposure));
+    warnings.collect()
+}
+
+/// Why other users could replace a file in `dir`: they may write to it, and it has no sticky bit.
+#[cfg(unix)]
+fn folder_exposure(dir: &Path) -> Option<String> {
+    use std::os::unix::fs::PermissionsExt as _;
+    let mode = std::fs::metadata(dir).ok()?.permissions().mode();
+    (mode & 0o022 != 0 && mode & 0o1000 == 0).then(|| {
+        format!(
+            "the folder {} can be changed by other users (mode {:03o}), so they could replace the stored token with one they know; make it private with `chmod 700`",
+            dir.display(),
+            mode & 0o777
+        )
+    })
+}
+
+/// On Windows, a warning when the stored token at `path` is outside the user's profile
+/// (`%USERPROFILE%`, `%APPDATA%`, `%LOCALAPPDATA%`); `None` elsewhere.
+pub fn stored_location_warning(path: &Path) -> Option<String> {
+    if !cfg!(windows) {
+        return None;
+    }
+    let profile: Vec<String> =
+        ["USERPROFILE", "APPDATA", "LOCALAPPDATA"].iter().filter_map(|k| std::env::var(k).ok()).filter(|v| !v.trim().is_empty()).collect();
+    windows_exposure(&path.to_string_lossy(), &profile)
+}
+
+/// Nothing restricts a token file on Windows but its folder's permissions. Those of the user's
+/// profile folders (`profile`) are private, but a folder elsewhere, such as a portable install's
+/// `data` folder under `C:\`, usually lets every user of the PC read and change what is in it. A
+/// warning when `path` is outside `profile` (Windows paths: no case, either slash).
+fn windows_exposure(path: &str, profile: &[String]) -> Option<String> {
+    let norm = |s: &str| s.replace('/', "\\").trim_end_matches('\\').to_lowercase();
+    let p = norm(path);
+    let inside = profile.iter().map(|d| norm(d)).filter(|d| !d.is_empty()).any(|d| p.strip_prefix(&d).is_some_and(|rest| rest.starts_with('\\')));
+    (!inside).then(|| {
+        format!(
+            "the stored token {path} is outside your user profile, so its folder's permissions decide who can read it: other users of this PC may be able to read or replace it. Keep it in your profile with --data-dir \"$env:APPDATA\\FilmCraft\", or set {TOKEN_ENV}"
+        )
+    })
 }
 
 /// Replace the token stored at `path` with a new random one, in one step: a reader sees the old
@@ -298,7 +449,9 @@ fn hex(bytes: &[u8]) -> String {
 /// is written in place, still never over another file.
 fn create_token_file(path: &Path, token: &str) -> std::io::Result<()> {
     let dir = folder(path)?;
-    create_private_dir(dir)?;
+    // never `AlreadyExists` for the folder (something that is no folder is in its place, such as a
+    // dangling link): that would be taken for another process having stored the token first
+    create_private_dir(dir).map_err(|e| std::io::Error::other(format!("cannot make the folder {}: {e}", dir.display())))?;
     let tmp = write_temp(dir, token)?;
     let linked = match std::fs::hard_link(&tmp, path) {
         Err(e) if e.kind() != std::io::ErrorKind::AlreadyExists => write_private(path, token),
@@ -385,12 +538,18 @@ pub fn header_arg(source: &Source, powershell: bool) -> Option<String> {
         (Source::Off, _) => return None,
         (Source::Env, true) => format!("$env:{TOKEN_ENV}"),
         (Source::Env, false) => format!("${TOKEN_ENV}"),
-        // the stored file has no line break; Get-Content -Raw takes the file as it is
-        (Source::Stored { path, .. }, true) => format!("$(Get-Content -Raw {})", powershell_quote(path.to_str()?)),
+        // -LiteralPath: -Path (the default) would take `[` `]` in a folder name for wildcards and
+        // read nothing. Get-Content decodes UTF-16 and byte-order marks; the first line, trimmed, is
+        // the token, as the server reads it.
+        (Source::Stored { path, .. } | Source::File(path), true) => {
+            format!("$((Get-Content -LiteralPath {} -TotalCount 1).Trim())", powershell_quote(path.to_str()?))
+        }
+        // the stored file is written without a line break
         (Source::Stored { path, .. }, false) => format!("$(cat {})", sh_quote(path.to_str()?)),
-        // a token file may hold more than its first line, and a line break: read it as the server does
-        (Source::File(path), true) => format!("$((Get-Content -TotalCount 1 {}).Trim())", powershell_quote(path.to_str()?)),
-        (Source::File(path), false) => format!("$(head -n 1 {})", sh_quote(path.to_str()?)),
+        // a token file may hold CRLF line breaks, a byte-order mark, UTF-16 or spaces around the
+        // token, all of which the server reads past: tokens are visible ASCII, so drop those bytes
+        // (byte-wise: LC_ALL=C) and take the first line
+        (Source::File(path), false) => format!("$(LC_ALL=C tr -d ' \\t\\r\\000\\357\\273\\277\\376\\377' < {} | head -n 1)", sh_quote(path.to_str()?)),
     };
     Some(format!("--header \"Authorization: Bearer {read}\""))
 }
@@ -575,7 +734,7 @@ mod tests {
         let dir = tmp.0.join("data").join("filmcraft");
         let path = dir.join(STORED_FILE);
         let first = load_or_create(&path).unwrap();
-        assert!(first.created && first.warning.is_none() && is_token(&first.token), "{first:?}");
+        assert!(first.created && first.warnings.is_empty() && is_token(&first.token), "{first:?}");
         assert_eq!(std::fs::read(&path).unwrap(), first.token.as_bytes(), "the file holds the token and no line break");
         assert_eq!(TempDir::names(&dir), [STORED_FILE]);
         #[cfg(unix)]
@@ -597,8 +756,23 @@ mod tests {
             std::fs::create_dir(&shared).unwrap();
             std::fs::set_permissions(&shared, std::fs::Permissions::from_mode(0o755)).unwrap();
             let p = shared.join(STORED_FILE);
-            assert!(load_or_create(&p).unwrap().created);
+            let made = load_or_create(&p).unwrap();
+            assert!(made.created && made.warnings.is_empty(), "{made:?}");
             assert_eq!((mode(&shared), mode(&p)), (0o755, 0o600));
+            // others may write to the folder: they could put their own token in its place
+            for (m, warned) in [(0o775, true), (0o777, true), (0o1777, false), (0o700, false)] {
+                std::fs::set_permissions(&shared, std::fs::Permissions::from_mode(m)).unwrap();
+                let s = load_or_create(&p).unwrap();
+                let w = s.warnings.iter().find(|w| w.contains("can be changed by other users"));
+                assert_eq!(w.is_some(), warned, "mode {m:o}: {:?}", s.warnings);
+                assert!(w.is_none_or(|w| w.contains("chmod 700") && w.contains(&format!("{:03o}", m & 0o777)) && !w.contains(&s.token)), "{w:?}");
+            }
+            std::fs::set_permissions(&shared, std::fs::Permissions::from_mode(0o755)).unwrap();
+            let fresh = shared.join("fresh").join(STORED_FILE);
+            std::fs::create_dir(shared.join("fresh")).unwrap();
+            std::fs::set_permissions(shared.join("fresh"), std::fs::Permissions::from_mode(0o777)).unwrap();
+            let s = load_or_create(&fresh).unwrap();
+            assert!(s.created && s.warnings.iter().any(|w| w.contains("can be changed by other users")), "{s:?}");
         }
     }
 
@@ -616,14 +790,15 @@ mod tests {
         assert_eq!((s.token.as_str(), s.created), (TOKEN, false));
         assert_eq!(std::fs::read_to_string(&path).unwrap(), format!("{TOKEN}\r\n"));
         #[cfg(unix)]
-        assert!(s.warning.is_some_and(|w| w.contains("can be read by other users") && !w.contains(TOKEN)));
+        assert!(s.warnings.iter().any(|w| w.contains("can be read by other users") && !w.contains(TOKEN)), "{s:?}");
         std::fs::write(&path, "\n").unwrap();
         let e = load_or_create(&path).unwrap_err();
         assert!(e.unusable && e.message.contains("first line of the file is empty"), "{e:?}");
         assert_eq!(std::fs::read(&path).unwrap(), b"\n");
         std::fs::remove_file(&path).unwrap();
         std::fs::create_dir(&path).unwrap();
-        assert!(load_or_create(&path).is_err());
+        let e = load_or_create(&path).unwrap_err();
+        assert!(!e.unusable && e.message.contains("is a folder"), "mcp-token --new cannot replace a folder: {e:?}");
         std::fs::remove_dir(&path).unwrap();
         #[cfg(unix)]
         {
@@ -632,11 +807,63 @@ mod tests {
             assert!(load_or_create(&path).unwrap_err().unusable, "mcp-token --new replaces a dangling link");
             assert!(!target.exists(), "nothing written through the link");
             assert!(std::fs::symlink_metadata(&path).unwrap().file_type().is_symlink());
-            // a link to a token file is read
+            // a link to a file is never read: another user who can write to the folder could
+            // point it at a file of yours with a predictable first line
             std::fs::write(&target, TOKEN).unwrap();
-            assert_eq!(load_or_create(&path).unwrap().token, TOKEN);
+            let e = load_or_create(&path).unwrap_err();
+            assert!(e.unusable && e.message.contains("a link") && !e.message.contains(TOKEN), "{e:?}");
+            std::fs::remove_file(&path).unwrap();
         }
         assert!(TempDir::names(&tmp.0).iter().all(|n| !n.ends_with(".tmp")));
+    }
+
+    /// A pipe in the stored token's place is refused at once: opening it would block the server
+    /// (and `mcp-token`) until another program writes to it, and feed it that program's token.
+    #[cfg(unix)]
+    #[test]
+    fn a_pipe_in_place_of_the_stored_token_is_refused() {
+        let tmp = TempDir::new("fifo");
+        let path = tmp.0.join(STORED_FILE);
+        let made = std::process::Command::new("mkfifo").arg(&path).status();
+        if !made.is_ok_and(|s| s.success()) {
+            return; // no mkfifo here
+        }
+        let (tx, rx) = std::sync::mpsc::channel();
+        let p = path.clone();
+        std::thread::spawn(move || {
+            let _ = tx.send(load_or_create(&p).map(|s| s.token));
+        });
+        let e = rx.recv_timeout(std::time::Duration::from_secs(10)).expect("refused at once, without opening the pipe").unwrap_err();
+        assert!(e.unusable && e.message.contains("no regular file"), "{e:?}");
+        // `mcp-token --new` puts a token file in its place
+        let t = replace_stored(&path).unwrap();
+        assert_eq!(load_or_create(&path).unwrap().token, t);
+    }
+
+    /// A data folder that cannot be made because something that is no folder is in its place
+    /// (here a dangling link) is a failure to store the token, not "another process stored one":
+    /// `mcp-token --new` would fail there too, so it is not suggested.
+    #[cfg(unix)]
+    #[test]
+    fn a_blocked_data_folder_is_no_race() {
+        let tmp = TempDir::new("blocked-dir");
+        let dir = tmp.0.join("data");
+        std::os::unix::fs::symlink(tmp.0.join("nowhere"), &dir).unwrap();
+        let e = load_or_create(&dir.join(STORED_FILE)).unwrap_err();
+        assert!(!e.unusable && e.message.contains("cannot store a new MCP token") && e.message.contains("cannot make the folder"), "{e:?}");
+        let p = resolve(false, None, None, || Ok(dir.join(STORED_FILE))).unwrap_err();
+        assert!(matches!(&p, Problem::Failure(m) if !m.contains("--new") && m.contains("--token-file")), "{p:?}");
+        assert!(!tmp.0.join("nowhere").exists());
+    }
+
+    /// Debug output never shows the token.
+    #[test]
+    fn debug_output_hides_the_token() {
+        let stored = Stored { token: TOKEN.into(), created: true, warnings: vec!["w".into()] };
+        let resolved = Resolved { token: Some(TOKEN.into()), source: Source::Env, warnings: Vec::new() };
+        for shown in [format!("{stored:?}"), format!("{resolved:?}"), format!("{:?}", Ok::<_, ()>(&resolved))] {
+            assert!(!shown.contains(TOKEN) && shown.contains("<set>"), "{shown}");
+        }
     }
 
     /// Servers and `mcp-token` starting at once on a fresh data directory all end up with the
@@ -740,13 +967,62 @@ mod tests {
         let blocked = tmp.0.join("blocked");
         std::fs::write(&blocked, "a file, not a folder").unwrap();
         let cannot = resolve(false, None, None, || Ok(blocked.join(STORED_FILE))).unwrap_err();
-        assert!(
-            matches!(&cannot, Problem::Failure(m) if m.contains("--data-dir") && m.contains("--token-file") && !m.contains("mcp-token --new")),
-            "{cannot:?}"
-        );
+        assert!(matches!(&cannot, Problem::Failure(m) if m.contains("--data-dir") && m.contains("--token-file") && !m.contains("--new")), "{cannot:?}");
         std::fs::write(&stored, [0xFF, 0xFE, 0x41]).unwrap();
         let bad = resolve(false, None, None, at).unwrap_err();
-        assert!(matches!(&bad, Problem::Failure(m) if m.contains("unusable") && m.contains("mcp-token --new") && m.contains("--token-file")), "{bad:?}");
+        // the command that replaces it names its data directory (not the default one)
+        let dir = stored.parent().unwrap().to_str().unwrap();
+        let again = if cfg!(windows) { format!("mcp-token --data-dir '{dir}' --new") } else { format!("mcp-token --data-dir {} --new", sh_quote(dir)) };
+        assert!(matches!(&bad, Problem::Failure(m) if m.contains("unusable") && m.contains(&again) && m.contains("--token-file")), "{bad:?}");
+    }
+
+    /// The token is never stored relative to the current folder because of a relative
+    /// `XDG_DATA_HOME` or `HOME`; a relative `--data-dir` is taken from the current folder.
+    #[test]
+    fn the_stored_token_path_is_absolute() {
+        let e = stored_token_path_in(None, || Some(PathBuf::from("rel/filmcraft"))).unwrap_err();
+        assert!(e.contains("rel/filmcraft") && e.contains("not an absolute path"), "{e}");
+        assert!(stored_token_path_in(None, || None).unwrap_err().contains("no per-user data directory"));
+        let abs = std::env::temp_dir().join("filmcraft");
+        assert_eq!(stored_token_path_in(None, || Some(abs.clone())).unwrap(), abs.join(STORED_FILE));
+        let given = stored_token_path_in(Some("given"), || panic!("not looked up")).unwrap();
+        assert_eq!(given, std::env::current_dir().unwrap().join("given").join(STORED_FILE));
+    }
+
+    /// The `mcp-token` command the server and the error messages print names the data directory
+    /// unless it is the per-user one, which `mcp-token` finds from any shell.
+    #[test]
+    fn the_mcp_token_command_names_the_data_directory_when_needed() {
+        let per_user = Path::new("/home/ann/.local/share/filmcraft");
+        assert_eq!(mcp_token_command_for(&per_user.join(STORED_FILE), Some(per_user), false), "filmcraft-cli mcp-token");
+        assert_eq!(mcp_token_command_for(Path::new("/srv/it's/mcp-token"), Some(per_user), false), r"filmcraft-cli mcp-token --data-dir '/srv/it'\''s'");
+        assert_eq!(mcp_token_command_for(Path::new("/srv/fc/mcp-token"), None, false), "filmcraft-cli mcp-token --data-dir '/srv/fc'");
+        // PowerShell quoting (a Windows path has folders only on Windows)
+        assert_eq!(mcp_token_command_for(Path::new("/srv/it's/mcp-token"), Some(per_user), true), "filmcraft-cli mcp-token --data-dir '/srv/it''s'");
+        #[cfg(windows)]
+        assert_eq!(
+            mcp_token_command_for(Path::new(r"C:\claude\FilmCraft\data\mcp-token"), Some(per_user), true),
+            r"filmcraft-cli mcp-token --data-dir 'C:\claude\FilmCraft\data'"
+        );
+    }
+
+    /// On Windows the stored token is only as private as its folder: inside the user's profile it
+    /// is, outside it (a portable install under C:\, a --data-dir on another drive) a warning says
+    /// so, without the token.
+    #[test]
+    fn a_stored_token_outside_the_windows_profile_is_warned_about() {
+        let profile = [r"C:\Users\Ann".to_string(), r"C:\Users\Ann\AppData\Roaming".to_string(), String::new()];
+        for inside in [r"C:\Users\Ann\AppData\Roaming\FilmCraft\mcp-token", r"c:/users/ann/filmcraft/mcp-token", r"C:\Users\Ann\mcp-token"] {
+            assert_eq!(windows_exposure(inside, &profile), None, "{inside}");
+        }
+        for outside in [r"C:\claude\FilmCraftMCP\filmcraft-0.8.0\data\mcp-token", r"C:\Users\Anne\mcp-token", r"D:\fc\mcp-token", r"C:\Users\mcp-token"] {
+            let w = windows_exposure(outside, &profile).unwrap_or_else(|| panic!("{outside}"));
+            assert!(w.contains("outside your user profile") && w.contains("--data-dir") && w.contains(TOKEN_ENV), "{w}");
+        }
+        assert!(windows_exposure(r"C:\x\mcp-token", &[]).is_some());
+        if !cfg!(windows) {
+            assert_eq!(stored_location_warning(Path::new("/anywhere/mcp-token")), None);
+        }
     }
 
     #[test]
@@ -763,6 +1039,16 @@ mod tests {
             assert!(check_no_token(lo, &[host.to_string()], &[]).unwrap_err().contains("--allow-host"), "{host}");
         }
         assert!(check_no_token(lo, &[], &["null".into()]).unwrap_err().contains("--allow-origin null"));
+        // a page served by this machine may call; any other site needs the token
+        for local in ["http://localhost:6274", "http://127.0.0.1:6274", "https://app.localhost:443", "http://[::1]:8080", "http://127.3.4.5:80"] {
+            assert!(check_no_token(lo, &[], &[local.to_string()]).is_ok(), "{local}");
+        }
+        for remote in
+            ["https://example.com:443", "http://192.168.1.5:6274", "http://host.docker.internal:80", "http://localhost.example.com:80", "http://[::2]:80"]
+        {
+            let e = check_no_token(lo, &[], &["http://localhost:6274".to_string(), remote.to_string()]).unwrap_err();
+            assert!(e.contains(&format!("--allow-origin {remote}")) && e.contains("needs the token"), "{remote}: {e}");
+        }
     }
 
     /// The printed `claude mcp add` header reads the token where the server got it, quoted for
@@ -778,15 +1064,19 @@ mod tests {
             header_arg(&stored("/home/me/.local/share/filmcraft/mcp-token"), false).unwrap(),
             r#"--header "Authorization: Bearer $(cat '/home/me/.local/share/filmcraft/mcp-token')""#
         );
+        // -LiteralPath: `[beta]` is no wildcard
         assert_eq!(
             header_arg(&stored(r"C:\Users\Ann Lee\AppData\Roaming\FilmCraft\mcp-token"), true).unwrap(),
-            r#"--header "Authorization: Bearer $(Get-Content -Raw 'C:\Users\Ann Lee\AppData\Roaming\FilmCraft\mcp-token')""#
+            r#"--header "Authorization: Bearer $((Get-Content -LiteralPath 'C:\Users\Ann Lee\AppData\Roaming\FilmCraft\mcp-token' -TotalCount 1).Trim())""#
         );
         assert_eq!(
-            header_arg(&Source::File(PathBuf::from(r"C:\tok\t.txt")), true).unwrap(),
-            r#"--header "Authorization: Bearer $((Get-Content -TotalCount 1 'C:\tok\t.txt').Trim())""#
+            header_arg(&Source::File(PathBuf::from(r"C:\Tools\FilmCraft [beta]\t.txt")), true).unwrap(),
+            r#"--header "Authorization: Bearer $((Get-Content -LiteralPath 'C:\Tools\FilmCraft [beta]\t.txt' -TotalCount 1).Trim())""#
         );
-        assert_eq!(header_arg(&Source::File(PathBuf::from("/a b/t.txt")), false).unwrap(), r#"--header "Authorization: Bearer $(head -n 1 '/a b/t.txt')""#);
+        assert_eq!(
+            header_arg(&Source::File(PathBuf::from("/a b/t.txt")), false).unwrap(),
+            r#"--header "Authorization: Bearer $(LC_ALL=C tr -d ' \t\r\000\357\273\277\376\377' < '/a b/t.txt' | head -n 1)""#
+        );
         // quotes in paths
         assert_eq!(sh_quote("/home/o'brien/x"), r"'/home/o'\''brien/x'");
         assert_eq!(powershell_quote(r"C:\Users\O'Brien"), r"'C:\Users\O''Brien'");
@@ -803,9 +1093,24 @@ mod tests {
         let dir = tmp.0.join("it's a $HOME `dir`");
         let path = dir.join(STORED_FILE);
         let token = load_or_create(&path).unwrap().token;
-        let file = dir.join("token.txt");
-        std::fs::write(&file, format!("{TOKEN}\nsecond line\n")).unwrap();
-        for (source, want) in [(Source::Stored { path, created: false }, token.as_str()), (Source::File(file), TOKEN), (Source::Env, "from-env")] {
+        // token files as the server reads them: a second line, Windows line breaks (CRLF), a UTF-8
+        // byte-order mark, UTF-16 (PowerShell 5.1 `>`), cmd.exe's space before the line break
+        let files: Vec<(&str, Vec<u8>)> = vec![
+            ("lf.txt", format!("{TOKEN}\nsecond line\n").into_bytes()),
+            ("crlf.txt", format!("{TOKEN}\r\nsecond\r\n").into_bytes()),
+            ("bom.txt", [&[0xEF, 0xBB, 0xBF][..], format!("{TOKEN}\r\n").as_bytes()].concat()),
+            ("utf16.txt", utf16le(&format!("{TOKEN}\r\n"), true)),
+            ("utf16be.txt", utf16be(&format!("{TOKEN}\r\n"))),
+            ("cmd.txt", format!(" {TOKEN} \r\n").into_bytes()),
+        ];
+        let mut sources = vec![(Source::Stored { path, created: false }, token.clone()), (Source::Env, "from-env".to_string())];
+        for (name, bytes) in files {
+            assert_eq!(token_from_bytes(&bytes).as_deref(), Ok(TOKEN), "the server reads {name}");
+            let file = dir.join(name);
+            std::fs::write(&file, bytes).unwrap();
+            sources.push((Source::File(file), TOKEN.to_string()));
+        }
+        for (source, want) in sources {
             let arg = header_arg(&source, false).unwrap();
             let out = std::process::Command::new("sh")
                 .arg("-c")

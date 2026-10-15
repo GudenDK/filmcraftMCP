@@ -15,8 +15,8 @@ FilmCraft from an agent. Part 2 covers developing FilmCraft as an agent.
 | Headless | `filmcraft-cli mcp --demo` or `--project p.fcproj` (neither = empty project) | an in-process engine session, no window |
 | Bridge | `filmcraft-cli mcp --bridge 127.0.0.1:9876` | the running desktop app started with `filmcraft --control 9876` |
 
-Headless mode also takes `--data-dir DIR` (user presets; over HTTP also where the token is
-stored). `--http`, `--token-file`, `--no-token`, `--allow-origin` and `--allow-host` set up the
+Both modes take `--data-dir DIR`, where the HTTP transport stores its token; headless mode also
+reads user presets from it. `--http`, `--token-file`, `--no-token`, `--allow-origin` and `--allow-host` set up the
 HTTP transport. Any other option is rejected (exit 2):
 there are no folder-confinement flags such as `--automation-read-root`, so the server can read
 and write wherever the user can.
@@ -142,19 +142,30 @@ can reach.) The token is, first match wins:
 | Linux, Flatpak | `~/.var/app/ai.storyteller.filmcraft/data/filmcraft/mcp-token` |
 
 `--data-dir DIR` (or `FILMCRAFT_DATA_DIR=DIR`) keeps it in `DIR/mcp-token` instead: give
-`mcp-token` the same option. It is the app's data directory (autosaves, presets; see
-[project files](project-files.md)), never the current folder. `filmcraft-cli mcp-token --path`
-prints where it is.
+`mcp-token` the same option (the server's messages include it whenever the token is not in the
+per-user folder). It is the app's data directory (autosaves, presets; see
+[project files](project-files.md)), never the current folder: a relative `XDG_DATA_HOME`, `HOME`,
+`APPDATA` or `FILMCRAFT_DATA_DIR` is refused (exit 1) rather than taken from the folder you are in.
+`filmcraft-cli mcp-token --path` prints where it is.
 
 - **Made on first use.** When the file is not there, the server (or `mcp-token`) stores 32 random
   bytes from the operating system's random number generator as 64 hex digits, without a line
-  break. On Linux and macOS the file is readable only by you (mode 600), and a folder made for it
-  too (700); on Windows your profile folder is private to you (and administrators). It is
-  written in one step and never over or through anything already at that path. A file there is
-  read the way a `--token-file` is (and gets the same warning if other users can read it).
-  When the folder cannot be made or the file cannot be read, the server exits 1 and says what
-  to do: `--data-dir`, `--token-file`, `FILMCRAFT_MCP_TOKEN`, or `mcp-token --new` to replace a
-  file that holds no usable token.
+  break. It is written in one step and never over or through anything already at that path. A
+  file there is read the way a `--token-file` is, but only a regular file: a link, a pipe or a
+  device in its place is refused (`mcp-token --new` replaces it). When the folder cannot be made
+  or the file cannot be read, the server exits 1 and says what to do: `--data-dir`,
+  `--token-file`, `FILMCRAFT_MCP_TOKEN`, or `mcp-token --new` (with the same `--data-dir`) to
+  replace a file that holds no usable token.
+- **Who can read it.** On Linux and macOS the file is readable only by you (mode 600), and a
+  folder made for it too (700). A warning says when other users can read or change the file, or
+  write to its folder (they could put a token they know in its place): `chmod 600` the file,
+  `chmod 700` the folder. On Windows nothing restricts the file but its folder's permissions. In
+  your profile (`%APPDATA%`, the default) only you and administrators can read it. A folder
+  outside the profile usually lets every user of the PC read and change what is in it: a portable
+  FilmCraft folder made directly under `C:\`, or a `--data-dir` there or on another drive. The
+  server then warns at every start; on a PC others use, keep the token in your profile with
+  `--data-dir "$env:APPDATA\FilmCraft"` (or move the portable folder into your profile), or use
+  `FILMCRAFT_MCP_TOKEN`.
 - **Print it.** `filmcraft-cli mcp-token` prints the stored token on stdout (making it if
   needed), for scripts: `--header "Authorization: Bearer $(filmcraft-cli mcp-token)"`. Notes go
   to stderr, so `$(...)` takes only the token. With `FILMCRAFT_MCP_TOKEN` set it still prints the
@@ -175,16 +186,20 @@ prints where it is.
 - **`--no-token`** turns the token off: then any program on the machine, run by any user, can
   drive FilmCraft through the port, and the server warns about it. It is allowed only on a
   loopback address, and not together with `--allow-host` (the names containers, tunnels, proxies
-  and other machines reach the server by), `--allow-origin null`, `--token-file` or a set
-  `FILMCRAFT_MCP_TOKEN`; each of those exits 2.
+  and other machines reach the server by), an `--allow-origin` other than a page on this machine
+  (`localhost`, a name under it or a loopback address: `null` is any web page, and another site's
+  pages, or scripts injected into them, would drive FilmCraft from your browser), `--token-file`
+  or a set `FILMCRAFT_MCP_TOKEN`; each of those exits 2.
 
 #### Connecting clients
 
 **Claude Code.** Paste the `claude mcp add` line the server prints, in another terminal. It reads
 the token from where the server got it, so the token is never shown on screen: on Linux and macOS
 with `$(cat '…')` (bash, zsh and fish 3.4+), on Windows in PowerShell with
-`$(Get-Content -Raw '…')`, and with `$FILMCRAFT_MCP_TOKEN` (`$env:FILMCRAFT_MCP_TOKEN`) when the
-token came from that variable. `--scope user` makes it available in every project; the default
+`$((Get-Content -LiteralPath '…' -TotalCount 1).Trim())`, and with `$FILMCRAFT_MCP_TOKEN`
+(`$env:FILMCRAFT_MCP_TOKEN`) when the token came from that variable. For a `--token-file` it takes
+the first line as the server does, also from a file with Windows line breaks, a byte-order mark or
+UTF-16 (`$(LC_ALL=C tr -d … < '…' | head -n 1)` on Linux and macOS). `--scope user` makes it available in every project; the default
 scope is the current project only:
 
 ```sh
@@ -221,8 +236,9 @@ Claude Code fill it in from the environment when it starts:
 
 Then start Claude Code where `FILMCRAFT_MCP_TOKEN` holds the token:
 `export FILMCRAFT_MCP_TOKEN="$(filmcraft-cli mcp-token)"` in bash or zsh, or
-`$env:FILMCRAFT_MCP_TOKEN = (& filmcraft-cli.exe mcp-token)` in PowerShell, which lasts only for
-that window. A server started in the same environment reads the variable and so uses the same
+`$env:FILMCRAFT_MCP_TOKEN = (& .\target\release\filmcraft-cli.exe mcp-token)` in PowerShell (or
+the full path of your `filmcraft-cli.exe`, e.g. `& "C:\Program Files\FilmCraft\filmcraft-cli.exe"`:
+neither puts it on `PATH`), which lasts only for that window. A server started in the same environment reads the variable and so uses the same
 token. Without the variable, `claude mcp list` warns that it is missing and Claude Code sends the
 text `${FILMCRAFT_MCP_TOKEN}` as the token: every request gets 401, and after 10 of them 429 for a
 minute.
@@ -301,12 +317,16 @@ a LAN address; allow it on private networks only.
 
 The first start makes the token and says where it stored it, normally
 `C:\Users\<you>\AppData\Roaming\FilmCraft\mcp-token` (in a portable FilmCraft folder, one with
-`portable.txt` next to the program: `data\mcp-token` there). Its last line is the command for
-Claude Code, which the server prints for PowerShell on Windows. Copy it into another PowerShell
-window (not cmd.exe: `$(...)` is PowerShell), then check the connection:
+`portable.txt` next to the program: `data\mcp-token` there). A portable folder outside your
+profile, such as one made directly under `C:\`, usually lets the other users of the PC read and
+change what is in it, token included: the server warns about it at every start. On a PC others use,
+add `--data-dir "$env:APPDATA\FilmCraft"` to the server's command (and to `mcp-token`'s). The
+server's last line is the command for Claude Code, which it prints for PowerShell on Windows. Copy
+it into another PowerShell window (not cmd.exe: `$(...)` is PowerShell), then check the
+connection:
 
 ```powershell
-claude mcp add --transport http --scope user filmcraft-http http://127.0.0.1:9877/mcp --header "Authorization: Bearer $(Get-Content -Raw 'C:\Users\<you>\AppData\Roaming\FilmCraft\mcp-token')"
+claude mcp add --transport http --scope user filmcraft-http http://127.0.0.1:9877/mcp --header "Authorization: Bearer $((Get-Content -LiteralPath 'C:\Users\<you>\AppData\Roaming\FilmCraft\mcp-token' -TotalCount 1).Trim())"
 claude mcp list                     # filmcraft-http: ✔ Connected
 ```
 
@@ -326,7 +346,8 @@ Over HTTP any program that can open a socket can reach the server, and the tools
 wherever the user can, so the endpoint is locked down by default:
 
 - Every request needs the bearer token (see [The token](#the-token)), unless `--no-token`, which
-  only a loopback address without `--allow-host` or `--allow-origin null` takes.
+  only a loopback address takes, without `--allow-host` and without an `--allow-origin` that is
+  `null` or another machine's.
 - It listens on a loopback address. Any other address (`0.0.0.0:9877`, a LAN IP) needs a token of at
   least 32 characters (the stored one has 64; a shorter `FILMCRAFT_MCP_TOKEN` or `--token-file`
   exits 2), and a warning says that plain HTTP carries the token and every request in clear text:
@@ -381,8 +402,8 @@ wherever the user can, so the endpoint is locked down by default:
   `Set-Content -Encoding ascii -Path $env:USERPROFILE\filmcraft-token.txt -Value ([guid]::NewGuid().ToString("N") + [guid]::NewGuid().ToString("N"))`
   in PowerShell, `(umask 077; openssl rand -hex 32 > token.txt)` elsewhere. On Linux and macOS a
   token file (the stored one too) that other users can read or change gets a warning
-  (`chmod 600` it). On Windows, your profile folder is readable only by you and administrators by
-  default.
+  (`chmod 600` it). On Windows a file has its folder's permissions: private in your profile, often
+  not elsewhere (see [The token](#the-token)).
 - After 10 wrong tokens within a minute, an address gets 429 (`Retry-After`) instead of 401 for its
   wrong tokens, for a minute. The right token still gets in: one of 32+ characters cannot be
   guessed anyway, and every local client connects from the same address (127.0.0.1), so a local
