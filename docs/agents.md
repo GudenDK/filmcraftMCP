@@ -456,7 +456,8 @@ the server get the lines through `HttpOptions::log` instead.
 #### Protocol details
 
 - Clients on MCP revisions before 2026-07-28 `initialize` and get an `Mcp-Session-Id`; `DELETE`
-  ends a session (see Limits for idle ones). 2026-07-28 clients (current Claude Code) send
+  ends a session (see Limits for idle ones) and cancels the calls still running in it: an export
+  stops at once and deletes its partial file. 2026-07-28 clients (current Claude Code) send
   self-contained requests and get no session.
 - Replies come as an SSE stream (`text/event-stream`) that carries the call's progress notifications
   before its result; a request must `Accept` both `application/json` and `text/event-stream`.

@@ -337,6 +337,32 @@ impl FilmcraftMcp {
     /// [`Self::run`], unless `cancelled()` says so once the engine is free to run it (a headless
     /// engine runs one command at a time): an error `cancelled` then, and the command never ran.
     pub(crate) async fn run_unless(&self, id: &str, params: Value, cancelled: impl Fn() -> bool + Send + 'static) -> Result<Value, AutomationError> {
+        self.run_unless_then(id, params, cancelled, |_, _| ()).await.map(|(v, _)| v)
+    }
+
+    /// [`Self::run_unless`] for a command that starts an engine job (`{"job": id, ...}`), plus, in
+    /// a headless engine, a handle on that job: its progress, cancel flag and result, which can
+    /// then be read and set without the engine's lock (another client's call may hold it for a
+    /// while).
+    pub(crate) async fn start_job_unless(
+        &self,
+        id: &str,
+        params: Value,
+        cancelled: impl Fn() -> bool + Send + 'static,
+    ) -> Result<(Value, Option<filmcraft_engine::Job>), AutomationError> {
+        let job = |s: &Session, v: &Value| v.get("job").and_then(Value::as_u64).and_then(|id| s.jobs.iter().find(|j| j.id == id).cloned());
+        self.run_unless_then(id, params, cancelled, job).await.map(|(v, j)| (v, j.flatten()))
+    }
+
+    /// [`Self::run_unless`], and in a headless engine `then` on the session and the result, under
+    /// the same lock.
+    async fn run_unless_then<T: Send + 'static>(
+        &self,
+        id: &str,
+        params: Value,
+        cancelled: impl Fn() -> bool + Send + 'static,
+        then: impl FnOnce(&Session, &Value) -> T + Send + 'static,
+    ) -> Result<(Value, Option<T>), AutomationError> {
         let gone = || AutomationError::Other("cancelled".into());
         match &*self.backend {
             Backend::Headless(s) => {
@@ -348,13 +374,24 @@ impl FilmcraftMcp {
                     if cancelled() {
                         return Err(gone());
                     }
-                    g.execute(&id, params).map_err(AutomationError::from)
+                    let v = g.execute(&id, params).map_err(AutomationError::from)?;
+                    let t = then(&g, &v);
+                    Ok((v, Some(t)))
                 })
                 .await
                 .map_err(join_error)?
             }
             Backend::Bridge(_) if cancelled() => Err(gone()),
-            Backend::Bridge(b) => b.execute(id, params).await,
+            Backend::Bridge(b) => b.execute(id, params).await.map(|v| (v, None)),
+        }
+    }
+
+    /// The headless engine session (tests hold its lock to keep the engine busy).
+    #[cfg(test)]
+    pub(crate) fn headless_session(&self) -> Option<Arc<Mutex<Session>>> {
+        match &*self.backend {
+            Backend::Headless(s) => Some(s.clone()),
+            Backend::Bridge(_) => None,
         }
     }
 

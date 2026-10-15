@@ -48,10 +48,11 @@ impl Initializing {
     }
 }
 
-/// [`LocalSessionManager`], reporting to [`Sessions`].
+/// [`LocalSessionManager`], reporting to [`Sessions`]; closing a session cancels its long calls.
 pub(super) struct TrackedSessions {
     pub(super) inner: Arc<LocalSessionManager>,
     pub(super) sessions: Arc<Sessions>,
+    pub(super) long_calls: Arc<crate::long_job::LongCalls>,
 }
 
 impl SessionManager for TrackedSessions {
@@ -94,7 +95,11 @@ impl SessionManager for TrackedSessions {
     /// request that is handing a message to a session holds for a while. A close cut short there
     /// would leave rmcp a session that the gate no longer counts or closes, and a client could
     /// pile those up without limit.
+    ///
+    /// The session's long calls (exports) are cancelled first, at once: rmcp would cancel them only
+    /// after waiting up to 5 s for their responses, and meanwhile they would go on encoding.
     async fn close_session(&self, id: &SessionId) -> Result<(), Self::Error> {
+        self.long_calls.cancel_session(id);
         let (inner, sessions, id) = (self.inner.clone(), self.sessions.clone(), id.clone());
         let closing = tokio::spawn(async move {
             let closed = inner.close_session(&id).await;

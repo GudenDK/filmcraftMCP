@@ -471,7 +471,7 @@ impl FilmcraftMcp {
         });
 
         let tracked = sessions::Sessions::new(limits.sessions);
-        let rmcp_sessions = Arc::new(TrackedSessions { inner: Arc::new(session_manager()), sessions: tracked.clone() });
+        let rmcp_sessions = Arc::new(TrackedSessions { inner: Arc::new(session_manager()), sessions: tracked.clone(), long_calls: self.long_calls.clone() });
         // rmcp repeats the gate's Host and Origin checks with the same lists
         let config = StreamableHttpServerConfig::default()
             .with_allowed_hosts(hosts.clone())

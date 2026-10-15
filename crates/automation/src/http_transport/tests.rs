@@ -1624,9 +1624,102 @@ async fn a_hurried_stop_deletes_partial_exports_within_its_grace() {
                 assert_eq!(last["result"]["error"], "cancelled", "{jobs}");
                 break;
             }
-            assert!(t0.elapsed() < Duration::from_millis(4500), "the export was cancelled at once: {jobs}");
+            assert!(t0.elapsed() < Duration::from_millis(2000), "the export was cancelled at once: {jobs}");
             tokio::time::sleep(Duration::from_millis(50)).await;
         }
+        let _ = std::fs::remove_dir_all(&dir);
+    })
+    .await;
+}
+
+/// Read `r` (an export call's stream) up to its first progress notification.
+async fn first_progress(r: &mut Reply, id: u64) {
+    loop {
+        let m = r.next().await.expect("progress");
+        assert_ne!(m["id"], id, "finished before its first progress: {m}");
+        if m["method"] == "notifications/progress" {
+            return;
+        }
+    }
+}
+
+/// A stop that comes while a session's export waits for the engine (another client's call keeps it
+/// busy) cancels the export at once. The export used to go on to report its progress to the
+/// session the stop had just closed, and wait there until rmcp's 5 s drain for that session was
+/// over: it kept encoding all that time, and a hurried stop deleted its file under it.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_stop_cancels_an_export_waiting_for_the_busy_engine() {
+    within(async {
+        let dir = std::env::temp_dir().join(format!("filmcraft-mcp-http-busy-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let out = dir.join("busy.mp4");
+        let mut srv = Server::start(demo(), HttpOptions::default()).await;
+        let (sid, _) = init(srv.addr, &[]).await;
+        let mut r = post(srv.addr, Some(&sid), &[], &export_call(1, &out.to_string_lossy(), 30.0, Some(json!("b")), None)).await;
+        first_progress(&mut r, 1).await;
+        // another client's call holds the engine across the stop: the export's next poll waits
+        let session = srv.mcp.headless_session().unwrap();
+        let (locked, is_locked) = tokio::sync::oneshot::channel();
+        let busy = tokio::task::spawn_blocking(move || {
+            let _busy = session.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+            let _ = locked.send(());
+            std::thread::sleep(Duration::from_millis(400));
+        });
+        is_locked.await.unwrap();
+        tokio::time::sleep(Duration::from_millis(150)).await;
+        let t0 = std::time::Instant::now();
+        let _ = srv.stop.take().unwrap().send(Stop::Graceful);
+        // the server returns once the export's call has ended (or after the 15 s grace)
+        let done = tokio::time::timeout(Duration::from_secs(20), &mut srv.done).await.expect("stopped").unwrap();
+        let took = t0.elapsed();
+        busy.await.unwrap();
+        assert!(done.is_ok(), "{done:?}");
+        assert!(!out.exists(), "the partial export is deleted");
+        let jobs = srv.mcp.run("jobs.list", json!({})).await.unwrap();
+        let last = jobs.as_array().and_then(|a| a.last()).cloned().unwrap_or_default();
+        assert_eq!((&last["finished"], &last["result"]["error"]), (&json!(true), &json!("cancelled")), "{jobs}");
+        assert!(took < Duration::from_secs(2), "the export was cancelled at once, not after rmcp's 5 s drain: {took:?}");
+        drop(r);
+        let _ = std::fs::remove_dir_all(&dir);
+    })
+    .await;
+}
+
+/// A client that ends its session (`DELETE`) while an export of that session runs gets the export
+/// cancelled and its partial file deleted at once. It used to go on encoding for rmcp's 5 s drain,
+/// while the gate no longer counted the session or its call.
+#[tokio::test(flavor = "multi_thread")]
+async fn ending_a_session_cancels_its_export() {
+    within(async {
+        let dir = std::env::temp_dir().join(format!("filmcraft-mcp-http-delete-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let out = dir.join("deleted.mp4");
+        let srv = Server::start(demo(), HttpOptions::default()).await;
+        let (sid, _) = init(srv.addr, &[]).await;
+        let (other, _) = init(srv.addr, &[]).await;
+        let mut r = post(srv.addr, Some(&sid), &[], &export_call(1, &out.to_string_lossy(), 30.0, Some(json!("d")), None)).await;
+        first_progress(&mut r, 1).await;
+        // another session's export goes on
+        let kept = dir.join("kept.mp4");
+        let mut k = post(srv.addr, Some(&other), &[], &export_call(2, &kept.to_string_lossy(), 30.0, Some(json!("k")), None)).await;
+        first_progress(&mut k, 2).await;
+        assert_eq!(srv.mcp.long_calls.count(), 2);
+        let t0 = std::time::Instant::now();
+        let d = send(srv.addr, "DELETE", &[("Mcp-Session-Id", &sid)], "").await;
+        assert_eq!(d.status, 202);
+        while srv.mcp.long_calls.count() > 1 {
+            assert!(t0.elapsed() < Duration::from_secs(2), "the export was cancelled at once, not after rmcp's 5 s drain");
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        assert!(!out.exists(), "the partial export is deleted");
+        let jobs = srv.mcp.run("jobs.list", json!({})).await.unwrap();
+        let states: Vec<(Value, Value)> = jobs.as_array().unwrap().iter().map(|j| (j["finished"].clone(), j["result"]["error"].clone())).collect();
+        assert_eq!(states, [(json!(true), json!("cancelled")), (json!(false), Value::Null)], "{jobs}");
+        // the other session's export is cancelled the usual way
+        let c = post(srv.addr, Some(&other), &[], &json!({"jsonrpc":"2.0","method":"notifications/cancelled","params":{"requestId":2}})).await;
+        assert_eq!(c.status, 202);
+        wait_gone(&kept).await;
+        drop((r, k));
         let _ = std::fs::remove_dir_all(&dir);
     })
     .await;

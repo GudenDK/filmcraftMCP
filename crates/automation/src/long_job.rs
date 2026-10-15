@@ -40,10 +40,13 @@ struct Running {
     stopping: bool,
 }
 
-/// A running long call: cancelled when the server stops, and the file its export writes.
+/// A running long call: cancelled when the server stops or its session closes, and the file its
+/// export writes.
 struct Call {
     cancel: CancellationToken,
     output: Option<Output>,
+    /// The HTTP session (`Mcp-Session-Id`) it came in, if any.
+    session: Option<String>,
 }
 
 /// The file a running export writes, and since when.
@@ -62,16 +65,26 @@ impl LongCalls {
         self.running.lock().unwrap_or_else(PoisonError::into_inner)
     }
 
-    /// Counts one long call for as long as the returned guard lives.
-    fn enter(self: &Arc<Self>) -> LongCall {
+    /// Counts one long call, of HTTP session `session` if any, for as long as the returned guard
+    /// lives.
+    fn enter(self: &Arc<Self>, session: Option<String>) -> LongCall {
         let id = self.next.fetch_add(1, Ordering::Relaxed);
         let cancel = CancellationToken::new();
         let mut running = self.lock();
         if running.stopping {
             cancel.cancel();
         }
-        running.calls.insert(id, Call { cancel: cancel.clone(), output: None });
+        running.calls.insert(id, Call { cancel: cancel.clone(), output: None, session });
         LongCall { calls: self.clone(), id, cancel }
+    }
+
+    /// HTTP session `id` is closing (its client sent `DELETE`, or the server stops): cancel its
+    /// long calls now. rmcp would cancel them only once its wait for their responses is over, up
+    /// to 5 s later, and meanwhile take none of their progress notifications.
+    pub(crate) fn cancel_session(&self, id: &str) {
+        for c in self.lock().calls.values().filter(|c| c.session.as_deref() == Some(id)) {
+            c.cancel.cancel();
+        }
     }
 
     /// The server is stopping: cancel every long call now, and those that begin until
@@ -107,7 +120,7 @@ impl LongCalls {
 struct LongCall {
     calls: Arc<LongCalls>,
     id: u64,
-    /// Cancelled when the server stops.
+    /// Cancelled when the server stops or the call's session closes.
     cancel: CancellationToken,
 }
 
@@ -124,6 +137,21 @@ impl Drop for LongCall {
     fn drop(&mut self) {
         self.calls.lock().calls.remove(&self.id);
     }
+}
+
+/// Until either token is cancelled.
+async fn either_cancelled(a: &CancellationToken, b: &CancellationToken) {
+    tokio::select! {
+        _ = a.cancelled() => {}
+        _ = b.cancelled() => {}
+    }
+}
+
+/// The HTTP session (`Mcp-Session-Id`) a request came in, if any (rmcp hands the handler the
+/// request's HTTP head).
+fn session_of(context: &RequestContext<RoleServer>) -> Option<String> {
+    let head = context.extensions.get::<http::request::Parts>()?;
+    head.headers.get("mcp-session-id")?.to_str().ok().map(str::to_string)
 }
 
 /// Whether `command_run {id, params}` is a long call this module runs.
@@ -155,9 +183,16 @@ impl Reporter {
 
 impl FilmcraftMcp {
     /// Run `id` (a [`LONG_COMMANDS`] entry, `wait: true`) as a job, reporting progress and
-    /// honouring cancellation (by the client, or the server stopping).
+    /// honouring cancellation (by the client, by the server stopping, or by the call's session
+    /// closing).
+    ///
+    /// Every wait here also ends when the call is cancelled: the engine may be busy with another
+    /// client's call for a while, and once its session is closed rmcp no longer takes the
+    /// progress notifications this call sends (each would wait until rmcp's 5 s drain for the
+    /// session is over), while the export goes on writing. In a headless engine the job is then
+    /// stopped through its own handle, without waiting for the engine's lock either.
     pub(crate) async fn run_long(&self, id: &str, mut params: Value, context: &RequestContext<RoleServer>) -> CallToolResult {
-        let call = self.long_calls.enter();
+        let call = self.long_calls.enter(session_of(context));
         let started = SystemTime::now();
         if let Some(p) = params.as_object_mut() {
             p.insert("wait".into(), json!(false));
@@ -168,7 +203,7 @@ impl FilmcraftMcp {
             let (by_client, by_stop) = (context.ct.clone(), call.cancel.clone());
             move || by_client.is_cancelled() || by_stop.is_cancelled()
         };
-        let start = match self.run_unless(id, params, cancelled).await {
+        let (start, handle) = match self.start_job_unless(id, params, cancelled).await {
             Ok(v) => v,
             Err(e) => return CallToolResult::error(vec![Content::text(e.to_string())]),
         };
@@ -178,14 +213,31 @@ impl FilmcraftMcp {
         let path = start.get("path").and_then(Value::as_str).unwrap_or_default().to_string();
         call.writes(&path, started);
         let mut rep = Reporter { peer: context.peer.clone(), token: context.meta.get_progress_token(), last: 0.0 };
+        let stopped = || either_cancelled(&context.ct, &call.cancel);
         loop {
-            let state = self.job_state(job).await;
-            let finished = state.as_ref().is_none_or(|j| j["finished"].as_bool() == Some(true));
+            let state = tokio::select! {
+                s = self.job_state_of(job, handle.as_ref()) => s,
+                _ = stopped() => break,
+            };
+            let finished = state.as_ref().is_none_or(is_finished);
             if let Some(j) = &state {
                 let (done, total) = (j["done"].as_f64().unwrap_or(0.0), j["total"].as_f64().unwrap_or(0.0));
-                rep.report(done, total, j["status"].as_str().unwrap_or_default()).await;
+                tokio::select! {
+                    _ = rep.report(done, total, j["status"].as_str().unwrap_or_default()) => {}
+                    // a finished export's result is returned, and its file kept
+                    _ = stopped() => if !finished { break },
+                }
             }
             if finished {
+                // the full entry (`offlineMedia` too), unless the engine stays busy past a stop
+                let state = if handle.is_some() && state.is_some() {
+                    tokio::select! {
+                        s = self.job_state(job) => s.or(state),
+                        _ = stopped() => state,
+                    }
+                } else {
+                    state
+                };
                 let offline = state.as_ref().and_then(|j| j.get("offlineMedia").cloned());
                 let result = state.map(|j| j["result"].clone()).unwrap_or(Value::Null);
                 if let Some(e) = result.get("error").and_then(Value::as_str) {
@@ -201,15 +253,19 @@ impl FilmcraftMcp {
                 return CallToolResult::success(vec![Content::text(serde_json::to_string_pretty(&out).unwrap_or_default())]);
             }
             tokio::select! {
-                _ = context.ct.cancelled() => break,
-                _ = call.cancel.cancelled() => break,
+                _ = stopped() => break,
                 _ = tokio::time::sleep(POLL) => {}
             }
         }
         // Cancelled: stop the encode at the next batch, wait for the worker, delete the partial file.
-        let _ = self.run("jobs.cancel", json!({"job": job})).await;
+        match &handle {
+            Some(j) => j.progress.cancel.store(true, Ordering::Relaxed),
+            None => {
+                let _ = self.run("jobs.cancel", json!({"job": job})).await;
+            }
+        }
         for _ in 0..600 {
-            if self.job_state(job).await.is_none_or(|j| j["finished"].as_bool() == Some(true)) {
+            if self.job_state_of(job, handle.as_ref()).await.as_ref().is_none_or(is_finished) {
                 break;
             }
             tokio::time::sleep(POLL).await;
@@ -218,11 +274,25 @@ impl FilmcraftMcp {
         CallToolResult::error(vec![Content::text("cancelled")])
     }
 
+    /// The job's state: from its handle in a headless engine (without the engine's lock, and
+    /// without `offlineMedia`), else its `jobs.list` entry.
+    async fn job_state_of(&self, job: u64, handle: Option<&filmcraft_engine::Job>) -> Option<Value> {
+        match handle {
+            Some(j) => Some(j.to_json()),
+            None => self.job_state(job).await,
+        }
+    }
+
     /// The job's `jobs.list` entry.
     async fn job_state(&self, job: u64) -> Option<Value> {
         let jobs = self.run("jobs.list", json!({})).await.ok()?;
         jobs.as_array()?.iter().find(|j| j["id"].as_u64() == Some(job)).cloned()
     }
+}
+
+/// Whether a job's state says it has finished.
+fn is_finished(j: &Value) -> bool {
+    j["finished"].as_bool() == Some(true)
 }
 
 /// Delete what an interrupted export wrote, and nothing else: the output file itself, the numbered
@@ -353,7 +423,7 @@ mod tests {
         std::fs::create_dir_all(&dir).unwrap();
         let (a, b) = (Arc::new(LongCalls::default()), Arc::new(LongCalls::default()));
         let started = SystemTime::now();
-        let call = a.enter();
+        let call = a.enter(None);
         let path = dir.join("out.mp4");
         std::fs::write(&path, b"partial").unwrap();
         std::fs::write(dir.join("other.mp4"), b"x").unwrap();
@@ -376,15 +446,29 @@ mod tests {
     #[tokio::test]
     async fn stop_cancels_running_calls_and_new_ones_until_drained() {
         let calls = Arc::new(LongCalls::default());
-        let running = calls.enter();
+        let running = calls.enter(None);
         assert!(!running.cancel.is_cancelled());
         calls.stop();
         assert!(running.cancel.is_cancelled(), "a running call is cancelled");
-        let late = calls.enter();
+        let late = calls.enter(None);
         assert!(late.cancel.is_cancelled(), "so is one that begins while the server stops");
         drop((running, late));
         calls.drain(tokio::time::Instant::now()).await;
-        assert!(!calls.enter().cancel.is_cancelled(), "the next server's calls run");
+        assert!(!calls.enter(None).cancel.is_cancelled(), "the next server's calls run");
+    }
+
+    /// Closing an HTTP session (its client's `DELETE`) cancels that session's long calls, and no
+    /// others.
+    #[test]
+    fn closing_a_session_cancels_only_its_calls() {
+        let calls = Arc::new(LongCalls::default());
+        let (a, b, stdio) = (calls.enter(Some("a".into())), calls.enter(Some("b".into())), calls.enter(None));
+        calls.cancel_session("a");
+        assert!(a.cancel.is_cancelled());
+        assert!(!b.cancel.is_cancelled() && !stdio.cancel.is_cancelled());
+        calls.cancel_session("unknown");
+        assert!(!b.cancel.is_cancelled());
+        assert_eq!(calls.count(), 3, "cancelled calls count until they end");
     }
 
     #[test]
