@@ -319,28 +319,47 @@ impl FilmcraftMcp {
         opts: HttpOptions,
         shutdown: impl Future<Output = S> + Send + 'static,
     ) -> Result<(), AutomationError> {
-        self.serve_with(listener, opts, Limits::default(), Arc::default(), shutdown).await
+        self.serve_http_listeners(vec![listener], opts, shutdown).await
     }
 
-    /// [`Self::serve_http_listener`] with these limits, counting into `stats`.
+    /// [`Self::serve_http_listener`] on several listeners at once, one server for all: e.g.
+    /// `127.0.0.1:<port>` and `[::1]:<port>`, so that a client resolving `localhost` to either
+    /// reaches this server. Each one's address is an accepted `Host`.
+    pub async fn serve_http_listeners<S: Into<Stop> + Send + 'static>(
+        self,
+        listeners: Vec<tokio::net::TcpListener>,
+        opts: HttpOptions,
+        shutdown: impl Future<Output = S> + Send + 'static,
+    ) -> Result<(), AutomationError> {
+        self.serve_with(listeners, opts, Limits::default(), Arc::default(), shutdown).await
+    }
+
+    /// [`Self::serve_http_listeners`] with these limits, counting into `stats`.
     pub(crate) async fn serve_with<S: Into<Stop> + Send + 'static>(
         self,
-        listener: tokio::net::TcpListener,
+        listeners: Vec<tokio::net::TcpListener>,
         opts: HttpOptions,
         limits: Limits,
         stats: Arc<Stats>,
         shutdown: impl Future<Output = S> + Send + 'static,
     ) -> Result<(), AutomationError> {
-        let bound = listener.local_addr().map_err(|e| AutomationError::Other(format!("listener: {e}")))?;
+        let bound = listeners.iter().map(|l| l.local_addr()).collect::<Result<Vec<_>, _>>().map_err(|e| AutomationError::Other(format!("listener: {e}")))?;
+        if bound.is_empty() {
+            return Err(AutomationError::BadRequest("no address to listen on".into()));
+        }
         let token = opts.token.filter(|t| !t.is_empty());
         if let Some(t) = &token {
             check_token(t)?;
         }
-        check_bind(bound, token.as_deref())?;
+        for addr in &bound {
+            check_bind(*addr, token.as_deref())?;
+        }
         let token = token.map(|t| t.into_bytes().into_boxed_slice());
         let origins = opts.allowed_origins.iter().map(|o| check_allowed_origin(o)).collect::<Result<Vec<_>, _>>()?;
         let extra_hosts = opts.allowed_hosts.iter().map(|h| check_allowed_host(h)).collect::<Result<Vec<_>, _>>()?;
-        let hosts = accepted_hosts(bound, &extra_hosts);
+        let mut hosts: Vec<String> = bound.iter().flat_map(|addr| accepted_hosts(*addr, &extra_hosts)).collect();
+        let mut seen = std::collections::HashSet::new();
+        hosts.retain(|h| seen.insert(h.to_ascii_lowercase()));
 
         let ct = CancellationToken::new();
         let (stop, how) = (ct.clone(), Arc::new(std::sync::Mutex::new(Stop::Graceful)));
@@ -392,9 +411,9 @@ impl FilmcraftMcp {
         if let Some(idle) = opts.session_idle {
             tokio::spawn(reap_idle_sessions(gate.clone(), idle, limits.reap_every, ct.clone()));
         }
-        accept(&listener, &gate, &conns, limits.header_timeout, &ct).await;
+        accept(&listeners, &gate, &conns, limits.header_timeout, &ct).await;
         // Refuse new connections now rather than leave them hanging until the process exits.
-        drop(listener);
+        drop(listeners);
         let grace = match *how.lock().unwrap_or_else(std::sync::PoisonError::into_inner) {
             Stop::Graceful => limits.grace,
             Stop::Hurried => limits.hurried_grace,
@@ -404,14 +423,28 @@ impl FilmcraftMcp {
     }
 }
 
-/// Accept connections until `stop`. One within the limits is served by its own task; one past
-/// them gets a 503.
-async fn accept(listener: &tokio::net::TcpListener, gate: &Arc<gate::Gate>, conns: &Arc<limits::Conns>, header_timeout: Duration, stop: &CancellationToken) {
+/// Accept connections on any of `listeners` until `stop`. One within the limits is served by its
+/// own task; one past them gets a 503.
+async fn accept(listeners: &[tokio::net::TcpListener], gate: &Arc<gate::Gate>, conns: &Arc<limits::Conns>, header_timeout: Duration, stop: &CancellationToken) {
     let refusing = Arc::new(tokio::sync::Semaphore::new(MAX_REFUSING));
+    // the next connection on any listener, each asked first in turn so none waits behind another
+    let mut turn = 0usize;
+    let mut next = || {
+        turn = turn.wrapping_add(1);
+        let first = turn % listeners.len().max(1);
+        std::future::poll_fn(move |cx| {
+            for l in listeners.iter().cycle().skip(first).take(listeners.len()) {
+                if let std::task::Poll::Ready(r) = l.poll_accept(cx) {
+                    return std::task::Poll::Ready(r);
+                }
+            }
+            std::task::Poll::Pending
+        })
+    };
     loop {
         let (stream, peer) = tokio::select! {
             _ = stop.cancelled() => return,
-            accepted = listener.accept() => match accepted {
+            accepted = next() => match accepted {
                 Ok(accepted) => accepted,
                 Err(_) => {
                     // out of file descriptors and the like: back off instead of spinning

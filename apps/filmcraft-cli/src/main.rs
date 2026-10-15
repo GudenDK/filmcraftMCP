@@ -101,8 +101,10 @@ SUBCOMMANDS
                                 long-running server any number of clients connect to by URL;
                                 they all share one project (or the one live app with --bridge).
                                 ADDR is PORT, 127.0.0.1:PORT, [::1]:PORT or localhost:PORT
-                                (loopback); a non-loopback address needs a token of 32+
-                                characters. Ctrl+C stops it
+                                (loopback; localhost listens on 127.0.0.1 and, with IPv6, on
+                                [::1]); a non-loopback address needs a token of 32+
+                                characters. Ctrl+C or SIGTERM stops it (on Windows also
+                                Ctrl+Break and closing the console)
   help                          this text
   --version                     print the version
 
@@ -563,8 +565,10 @@ fn mcp_http_options(a: &Args) -> Option<(std::net::SocketAddr, filmcraft_automat
     Some((addr, opts))
 }
 
-/// Serve MCP over HTTP until Ctrl+C. The listener is bound here so the URL printed (stderr) has the
-/// real port (`--http 127.0.0.1:0` picks a free one).
+/// Serve MCP over HTTP until Ctrl+C or another stop signal. The listener is bound here so the URL
+/// printed (stderr) has the real port (`--http 127.0.0.1:0` picks a free one). `localhost:PORT`
+/// also listens on `[::1]:PORT` where the system has IPv6, as clients may resolve `localhost` to
+/// either address; failing that is not fatal.
 async fn serve_mcp_http(
     a: &Args,
     server: filmcraft_automation::FilmcraftMcp,
@@ -586,6 +590,21 @@ async fn serve_mcp_http(
         }
     };
     let bound = listener.local_addr().unwrap_or(addr);
+    let mut listeners = vec![listener];
+    let mut also = String::new();
+    if a.opt("--http").is_some_and(|h| h.trim().starts_with("localhost:")) {
+        match tokio::net::TcpListener::bind((std::net::Ipv6Addr::LOCALHOST, bound.port())).await {
+            Ok(v6) => {
+                also = format!(" (and [::1]:{})", bound.port());
+                listeners.push(v6);
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::AddrInUse => diag(format_args!(
+                "filmcraft-cli: warning: another program listens on [::1]:{0}, so a client that resolves localhost to ::1 reaches it instead: give clients http://127.0.0.1:{0}/mcp",
+                bound.port()
+            )),
+            Err(_) => {} // no IPv6 here: localhost can only mean 127.0.0.1
+        }
+    }
     let backend = match (a.opt("--bridge"), a.opt("--project")) {
         (Some(b), _) => format!("the live app at {b}"),
         (None, Some(p)) => format!("a headless engine with {p}"),
@@ -603,7 +622,7 @@ async fn serve_mcp_http(
         std::net::IpAddr::V6(ip) if ip.is_unspecified() => std::net::SocketAddr::from((std::net::Ipv6Addr::LOCALHOST, bound.port())),
         _ => bound,
     };
-    diag(format_args!("filmcraft-cli: MCP (Streamable HTTP) on http://{url_addr}/mcp, driving {backend}; {auth}. Ctrl+C stops it."));
+    diag(format_args!("filmcraft-cli: MCP (Streamable HTTP) on http://{url_addr}/mcp{also}, driving {backend}; {auth}. Ctrl+C stops it."));
     if bound.ip().is_unspecified() {
         let hosts = filmcraft_automation::http_transport::accepted_hosts(bound, &opts.allowed_hosts).join(", ");
         diag(format_args!("filmcraft-cli: listening on every interface ({bound}); a request's Host must be one of: {hosts}"));
@@ -623,7 +642,10 @@ async fn serve_mcp_http(
             "filmcraft-cli: warning: {bound} is reachable from the network and HTTP is not encrypted: the token and every request travel in clear text. Prefer 127.0.0.1 with `ssh -L` or a TLS reverse proxy (--allow-host)."
         ));
     }
-    server.serve_http_listener(listener, opts, stop_signal()).await?;
+    // the line to paste, never with the token itself
+    let header = if opts.token.is_some() { " --header \"Authorization: Bearer <token>\"" } else { "" };
+    diag(format_args!("filmcraft-cli: connect Claude Code with: claude mcp add --transport http filmcraft-http http://{url_addr}/mcp{header}"));
+    server.serve_http_listeners(listeners, opts, stop_signal()).await?;
     diag(format_args!("filmcraft-cli: MCP server stopped"));
     Ok(())
 }

@@ -38,7 +38,7 @@ impl Server {
         let addr = listener.local_addr().unwrap();
         let (stop, rx) = tokio::sync::oneshot::channel::<Stop>();
         let mcp = FilmcraftMcp::headless(s);
-        let done = tokio::spawn(mcp.clone().serve_with(listener, opts, limits, stats, async move { rx.await.unwrap_or(Stop::Graceful) }));
+        let done = tokio::spawn(mcp.clone().serve_with(vec![listener], opts, limits, stats, async move { rx.await.unwrap_or(Stop::Graceful) }));
         Self { addr, stop: Some(stop), done, mcp }
     }
     fn host(&self) -> String {
@@ -481,6 +481,41 @@ async fn the_bound_address_is_an_accepted_host() {
     let r = post(srv.addr, None, &[("Host", host.as_str())], &initialize).await;
     assert_eq!(r.status, 200);
     assert_eq!(post(srv.addr, None, &[("Host", "127.0.0.3:1")], &initialize).await.status, 403);
+}
+
+/// One server on several listeners (`--http localhost:P` listens on 127.0.0.1:P and [::1]:P):
+/// each answers, with its own address as an accepted `Host`, and all close when it stops.
+#[tokio::test(flavor = "multi_thread")]
+async fn one_server_on_several_listeners() {
+    let first = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let port = first.local_addr().unwrap().port();
+    // [::1] on the same port where the system has IPv6, else another loopback port
+    let second = match tokio::net::TcpListener::bind(("::1", port)).await {
+        Ok(l) => l,
+        Err(_) => tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap(),
+    };
+    let addrs = [first.local_addr().unwrap(), second.local_addr().unwrap()];
+    let (stop, rx) = tokio::sync::oneshot::channel::<Stop>();
+    let done = tokio::spawn(
+        FilmcraftMcp::headless(demo()).serve_http_listeners(vec![first, second], HttpOptions::default(), async move { rx.await.unwrap_or(Stop::Graceful) }),
+    );
+    let initialize = json!({"jsonrpc":"2.0","id":0,"method":"initialize","params":{"protocolVersion":"2025-06-18","capabilities":{},"clientInfo":{"name":"t","version":"1"}}});
+    for addr in addrs {
+        let host = addr.to_string();
+        let r = post(addr, None, &[("Host", host.as_str())], &initialize).await;
+        assert_eq!(r.status, 200, "{addr}");
+        let r = post(addr, None, &[("Host", &format!("localhost:{}", addr.port()))], &initialize).await;
+        assert_eq!(r.status, 200, "{addr}");
+    }
+    assert_eq!(post(addrs[0], None, &[("Host", "127.0.0.3:1")], &initialize).await.status, 403);
+    stop.send(Stop::Graceful).unwrap();
+    tokio::time::timeout(Duration::from_secs(20), done).await.expect("stopped in time").unwrap().unwrap();
+    for addr in addrs {
+        assert!(TcpStream::connect(addr).await.is_err(), "{addr} still open");
+    }
+    // no listener: an error, not a server that never answers
+    let none = FilmcraftMcp::headless(demo()).serve_http_listeners(Vec::new(), HttpOptions::default(), async {}).await;
+    assert!(matches!(none, Err(AutomationError::BadRequest(_))), "{none:?}");
 }
 
 #[test]

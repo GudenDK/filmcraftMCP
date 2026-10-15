@@ -110,6 +110,27 @@ fn http_initialize(addr: &str, token: Option<&str>) -> String {
     reply
 }
 
+/// `--http localhost:PORT` listens on 127.0.0.1 and, where the system has IPv6, on [::1] at the
+/// same port (clients may resolve `localhost` to either); without IPv6 it still starts. The
+/// banner gives the 127.0.0.1 URL, and the next line the `claude mcp add` command for it.
+#[test]
+fn mcp_http_on_localhost_listens_on_both_loopback_addresses() {
+    let p = Spawned::new(&["mcp", "--demo", "--http", "localhost:0"]);
+    let banner = Spawned::line(&p.err);
+    let addr = url_addr(&banner);
+    assert!(addr.starts_with("127.0.0.1:"), "{banner}");
+    let port = addr.trim_start_matches("127.0.0.1:");
+    let paste = Spawned::line(&p.err);
+    assert!(paste.ends_with(&format!("claude mcp add --transport http filmcraft-http http://{addr}/mcp")), "{paste}");
+    assert!(http_initialize(&addr, None).starts_with("HTTP/1.1 200"));
+    let ipv6 = std::net::TcpListener::bind("[::1]:0").is_ok();
+    assert_eq!(banner.contains(&format!("(and [::1]:{port})")), ipv6, "{banner}");
+    if ipv6 {
+        let reply = http_initialize(&format!("[::1]:{port}"), None);
+        assert!(reply.starts_with("HTTP/1.1 200"), "{reply}");
+    }
+}
+
 /// `--token-file` reads what Windows PowerShell 5.1 writes (`'token' > token.txt`: UTF-16 with a
 /// byte-order mark and CRLF) as the token, and warns, without showing it, when other users can
 /// read the file.
@@ -133,6 +154,9 @@ fn mcp_http_token_file_in_utf16_with_a_permission_warning() {
     }
     assert!(line.contains("bearer token required") && !line.contains(token), "{line}");
     let addr = url_addr(&line);
+    let paste = Spawned::line(&p.err);
+    assert!(paste.contains(&format!("claude mcp add --transport http filmcraft-http http://{addr}/mcp --header \"Authorization: Bearer <token>\"")), "{paste}");
+    assert!(!paste.contains(token), "{paste}");
     assert!(http_initialize(&addr, None).starts_with("HTTP/1.1 401"));
     let reply = http_initialize(&addr, Some(token));
     assert!(reply.starts_with("HTTP/1.1 200"), "{reply}");
