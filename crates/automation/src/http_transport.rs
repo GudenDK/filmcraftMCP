@@ -608,11 +608,13 @@ async fn serve_connection(
 }
 
 /// After the accept loop, with the stop token cancelled: that ended every SSE stream and cancelled
-/// the stateless calls, but session workers outlive it, so close them; their calls then see
-/// `context.ct` cancelled (after rmcp's response drain), and an export stops and deletes its
-/// partial output. Exports get until `deadline` (what one still running then wrote is deleted),
-/// then the connections.
+/// the stateless calls. Exports are cancelled first, also those of sessions (their calls would see
+/// `context.ct` cancelled only after rmcp's response drain, up to 5 s after their session closed):
+/// each stops and deletes its partial output. Session workers outlive the stop token, so close
+/// them. Exports get until `deadline` (what one still running then wrote is deleted), then the
+/// connections.
 async fn wind_down(gate: &gate::Gate, long_calls: &crate::long_job::LongCalls, conns: &limits::Conns, deadline: tokio::time::Instant) {
+    long_calls.stop();
     let ids = gate.sessions.ids();
     let close_all = futures_util::future::join_all(ids.iter().map(|id| async move {
         let _ = gate.rmcp_sessions.close_session(&id.as_str().into()).await;

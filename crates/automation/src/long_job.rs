@@ -14,6 +14,7 @@ use rmcp::RoleServer;
 use rmcp::model::{CallToolResult, ContentBlock as Content, ProgressNotificationParam, ProgressToken};
 use rmcp::service::{Peer, RequestContext};
 use serde_json::{Value, json};
+use tokio_util::sync::CancellationToken;
 
 use crate::server::FilmcraftMcp;
 
@@ -24,12 +25,25 @@ pub const LONG_COMMANDS: &[&str] = &["file.exportMedia"];
 const POLL: Duration = Duration::from_millis(100);
 
 /// The long calls running on one server (every clone of a [`FilmcraftMcp`] shares it), cancelled
-/// ones still deleting their partial output included. Shutdown waits for them, and deletes what
-/// the ones still running at its deadline wrote.
+/// ones still deleting their partial output included. Shutdown cancels them first ([`Self::stop`]),
+/// waits for them, and deletes what the ones still running at its deadline wrote.
 #[derive(Default)]
 pub(crate) struct LongCalls {
-    running: Mutex<HashMap<u64, Option<Output>>>,
+    running: Mutex<Running>,
     next: AtomicU64,
+}
+
+#[derive(Default)]
+struct Running {
+    calls: HashMap<u64, Call>,
+    /// The server is stopping: a call that begins now is cancelled from the start.
+    stopping: bool,
+}
+
+/// A running long call: cancelled when the server stops, and the file its export writes.
+struct Call {
+    cancel: CancellationToken,
+    output: Option<Output>,
 }
 
 /// The file a running export writes, and since when.
@@ -41,28 +55,48 @@ struct Output {
 impl LongCalls {
     /// How many long calls are running.
     pub(crate) fn count(&self) -> usize {
-        self.lock().len()
+        self.lock().calls.len()
     }
 
-    fn lock(&self) -> MutexGuard<'_, HashMap<u64, Option<Output>>> {
+    fn lock(&self) -> MutexGuard<'_, Running> {
         self.running.lock().unwrap_or_else(PoisonError::into_inner)
     }
 
     /// Counts one long call for as long as the returned guard lives.
     fn enter(self: &Arc<Self>) -> LongCall {
         let id = self.next.fetch_add(1, Ordering::Relaxed);
-        self.lock().insert(id, None);
-        LongCall { calls: self.clone(), id }
+        let cancel = CancellationToken::new();
+        let mut running = self.lock();
+        if running.stopping {
+            cancel.cancel();
+        }
+        running.calls.insert(id, Call { cancel: cancel.clone(), output: None });
+        LongCall { calls: self.clone(), id, cancel }
+    }
+
+    /// The server is stopping: cancel every long call now, and those that begin until
+    /// [`Self::drain`] ends. Session calls would otherwise learn of it only once rmcp has closed
+    /// their session, after waiting up to 5 s for their responses.
+    pub(crate) fn stop(&self) {
+        let mut running = self.lock();
+        running.stopping = true;
+        for c in running.calls.values() {
+            c.cancel.cancel();
+        }
     }
 
     /// Wait until no long call runs or `deadline` passes, then delete the partial output of those
     /// still running: the process is about to exit, and an export it stops leaves a truncated file.
-    /// The calls must have been cancelled already.
+    /// The calls must have been cancelled already ([`Self::stop`]).
     pub(crate) async fn drain(&self, deadline: tokio::time::Instant) {
         while self.count() > 0 && tokio::time::Instant::now() < deadline {
             tokio::time::sleep(Duration::from_millis(50)).await;
         }
-        let left: Vec<Output> = self.lock().values_mut().filter_map(Option::take).collect();
+        let left: Vec<Output> = {
+            let mut running = self.lock();
+            running.stopping = false;
+            running.calls.values_mut().filter_map(|c| c.output.take()).collect()
+        };
         for o in left {
             remove_partial(&o.path, o.since);
         }
@@ -73,20 +107,22 @@ impl LongCalls {
 struct LongCall {
     calls: Arc<LongCalls>,
     id: u64,
+    /// Cancelled when the server stops.
+    cancel: CancellationToken,
 }
 
 impl LongCall {
     /// The call's export writes `path`, from `since` on.
     fn writes(&self, path: &str, since: SystemTime) {
-        if let Some(o) = self.calls.lock().get_mut(&self.id) {
-            *o = Some(Output { path: path.to_string(), since });
+        if let Some(c) = self.calls.lock().calls.get_mut(&self.id) {
+            c.output = Some(Output { path: path.to_string(), since });
         }
     }
 }
 
 impl Drop for LongCall {
     fn drop(&mut self) {
-        self.calls.lock().remove(&self.id);
+        self.calls.lock().calls.remove(&self.id);
     }
 }
 
@@ -119,14 +155,20 @@ impl Reporter {
 
 impl FilmcraftMcp {
     /// Run `id` (a [`LONG_COMMANDS`] entry, `wait: true`) as a job, reporting progress and
-    /// honouring cancellation.
+    /// honouring cancellation (by the client, or the server stopping).
     pub(crate) async fn run_long(&self, id: &str, mut params: Value, context: &RequestContext<RoleServer>) -> CallToolResult {
         let call = self.long_calls.enter();
         let started = SystemTime::now();
         if let Some(p) = params.as_object_mut() {
             p.insert("wait".into(), json!(false));
         }
-        let start = match self.run(id, params).await {
+        // the engine may be busy for a while: a call cancelled meanwhile starts no job, which would
+        // write its file with nobody left to stop it
+        let cancelled = {
+            let (by_client, by_stop) = (context.ct.clone(), call.cancel.clone());
+            move || by_client.is_cancelled() || by_stop.is_cancelled()
+        };
+        let start = match self.run_unless(id, params, cancelled).await {
             Ok(v) => v,
             Err(e) => return CallToolResult::error(vec![Content::text(e.to_string())]),
         };
@@ -160,6 +202,7 @@ impl FilmcraftMcp {
             }
             tokio::select! {
                 _ = context.ct.cancelled() => break,
+                _ = call.cancel.cancelled() => break,
                 _ = tokio::time::sleep(POLL) => {}
             }
         }
@@ -326,6 +369,22 @@ mod tests {
         drop(call);
         assert_eq!(a.count(), 0);
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Stopping the server cancels the long calls running then, and those that begin until the
+    /// drain is over; a later server on the same handler starts afresh.
+    #[tokio::test]
+    async fn stop_cancels_running_calls_and_new_ones_until_drained() {
+        let calls = Arc::new(LongCalls::default());
+        let running = calls.enter();
+        assert!(!running.cancel.is_cancelled());
+        calls.stop();
+        assert!(running.cancel.is_cancelled(), "a running call is cancelled");
+        let late = calls.enter();
+        assert!(late.cancel.is_cancelled(), "so is one that begins while the server stops");
+        drop((running, late));
+        calls.drain(tokio::time::Instant::now()).await;
+        assert!(!calls.enter().cancel.is_cancelled(), "the next server's calls run");
     }
 
     #[test]

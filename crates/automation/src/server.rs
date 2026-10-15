@@ -315,6 +315,7 @@ impl FilmcraftMcp {
             Err(r) => (Some(r), crate::http_transport::deadline_after(Stop::Graceful.grace())),
             Ok(how) => {
                 let deadline = crate::http_transport::deadline_after(how.grace());
+                long_calls.stop();
                 quit.cancel();
                 (tokio::time::timeout_at(deadline, &mut waiting).await.ok(), deadline)
             }
@@ -330,6 +331,13 @@ impl FilmcraftMcp {
 
     /// Run an engine command on whichever backend.
     pub async fn run(&self, id: &str, params: Value) -> Result<Value, AutomationError> {
+        self.run_unless(id, params, || false).await
+    }
+
+    /// [`Self::run`], unless `cancelled()` says so once the engine is free to run it (a headless
+    /// engine runs one command at a time): an error `cancelled` then, and the command never ran.
+    pub(crate) async fn run_unless(&self, id: &str, params: Value, cancelled: impl Fn() -> bool + Send + 'static) -> Result<Value, AutomationError> {
+        let gone = || AutomationError::Other("cancelled".into());
         match &*self.backend {
             Backend::Headless(s) => {
                 let s = s.clone();
@@ -337,11 +345,15 @@ impl FilmcraftMcp {
                 tokio::task::spawn_blocking(move || {
                     // A command that panicked earlier poisoned the lock; the session is still usable.
                     let mut g = s.lock().unwrap_or_else(PoisonError::into_inner);
+                    if cancelled() {
+                        return Err(gone());
+                    }
                     g.execute(&id, params).map_err(AutomationError::from)
                 })
                 .await
                 .map_err(join_error)?
             }
+            Backend::Bridge(_) if cancelled() => Err(gone()),
             Backend::Bridge(b) => b.execute(id, params).await,
         }
     }
@@ -1109,20 +1121,28 @@ mod tests {
 
     /// A hurried stop (Windows kills the process about 5 s after its console closes) keeps to its
     /// grace in all: rmcp's wait for a handler that does not finish, the writer and the exports
-    /// share one deadline instead of each getting the grace again.
+    /// share one deadline instead of each getting the grace again. The export's call, cancelled
+    /// while it waited for the busy engine, starts no export once the engine is free: it used to,
+    /// and wrote its file with nobody left to stop it (a partial MP4 in the temp directory after
+    /// every test run).
     #[tokio::test(flavor = "multi_thread")]
     async fn a_hurried_stdio_stop_keeps_to_its_grace() {
         use tokio::io::{AsyncBufReadExt, AsyncWriteExt};
+        let dir = std::env::temp_dir().join(format!("filmcraft-mcp-hurried-stdio-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
         let mcp = FilmcraftMcp::headless(demo());
         // the engine stays busy for longer than the grace: an export's call cannot even start it
         let Backend::Headless(session) = &*mcp.backend else { panic!("headless") };
         let session = session.clone();
         let (locked, is_locked) = std::sync::mpsc::channel();
-        std::thread::spawn(move || {
-            let _busy = session.lock().unwrap_or_else(PoisonError::into_inner);
-            let _ = locked.send(());
-            std::thread::sleep(std::time::Duration::from_secs(5));
-        });
+        let busy = {
+            let session = session.clone();
+            std::thread::spawn(move || {
+                let _busy = session.lock().unwrap_or_else(PoisonError::into_inner);
+                let _ = locked.send(());
+                std::thread::sleep(std::time::Duration::from_secs(5));
+            })
+        };
         is_locked.recv().unwrap();
         let (mut tx, server_in) = tokio::io::duplex(1 << 20);
         let (server_out, rx) = tokio::io::duplex(1 << 20);
@@ -1133,7 +1153,7 @@ mod tests {
         let init = json!({"jsonrpc":"2.0","id":0,"method":"initialize","params":{"protocolVersion":"2025-06-18","capabilities":{},"clientInfo":{"name":"t","version":"1"}}});
         tx.write_all(format!("{init}\n{}\n", json!({"jsonrpc":"2.0","method":"notifications/initialized"})).as_bytes()).await.unwrap();
         assert!(rx.next_line().await.unwrap().unwrap().contains(r#""id":0"#));
-        let out = std::env::temp_dir().join(format!("filmcraft-mcp-hurried-{}.mp4", std::process::id()));
+        let out = dir.join("hurried.mp4");
         let params = json!({"path": out.to_string_lossy(), "format": "h264", "width": 640, "height": 360, "audio": false, "wait": true});
         let call = json!({"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"command_run","arguments":{"id":"file.exportMedia","params":params}}});
         tx.write_all(format!("{call}\n").as_bytes()).await.unwrap();
@@ -1146,7 +1166,16 @@ mod tests {
         assert!(r.is_ok(), "{r:?}");
         let took = t0.elapsed();
         assert!(took < Stop::Hurried.grace() + std::time::Duration::from_millis(700), "within the hurried grace: {took:?}");
-        let _ = std::fs::remove_file(&out);
+        // the engine is free again: the cancelled call gives up without starting the export
+        busy.join().unwrap();
+        while long_calls.count() > 0 {
+            assert!(t0.elapsed() < std::time::Duration::from_secs(30), "the call ended");
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+        let jobs = session.lock().unwrap_or_else(PoisonError::into_inner).execute("jobs.list", json!({})).unwrap();
+        assert_eq!(jobs, json!([]), "no export started: {jobs}");
+        assert!(!out.exists());
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// Bridge screenshots: the app is told to write into the server's private directory (not a

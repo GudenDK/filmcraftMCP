@@ -1203,11 +1203,22 @@ async fn deletes_reset_by_the_client_leave_no_untracked_session() {
         let stop = CancellationToken::new();
         let mut contenders = Vec::new();
         for sid in busy.clone() {
-            let (addr, stop) = (srv.addr, stop.clone());
+            let (addr, host, stop) = (srv.addr, srv.host(), stop.clone());
             contenders.push(tokio::spawn(async move {
                 let mut id = 1;
                 while !stop.is_cancelled() {
-                    let _ = post(addr, Some(&sid), &[], &ping(id)).await.reply().await;
+                    // (a connection may be closed to make room for others: no matter)
+                    let Ok(mut s) = TcpStream::connect(addr).await else { continue };
+                    let body = ping(id).to_string();
+                    let req = format!(
+                        "POST {MCP_PATH} HTTP/1.1\r\nHost: {host}\r\nAccept: {}\r\nContent-Type: {}\r\nMcp-Session-Id: {sid}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                        ACCEPT.1,
+                        JSON.1,
+                        body.len()
+                    );
+                    if s.write_all(req.as_bytes()).await.is_ok() {
+                        let _ = tokio::time::timeout(WAIT, s.read_to_end(&mut Vec::new())).await;
+                    }
                     id += 1;
                 }
             }));
@@ -1484,12 +1495,15 @@ async fn shutdown_deletes_partial_exports_and_closes_the_port_at_once() {
             }
         }
         assert_eq!(srv.mcp.long_calls.count(), 1);
-        // a connection that sends nothing keeps the server in its grace period for a while
-        let _idle = TcpStream::connect(srv.addr).await.unwrap();
+        // a request still arriving keeps the server in its grace period for a while (an idle
+        // connection is closed at once)
+        let mut slow = TcpStream::connect(srv.addr).await.unwrap();
+        slow.write_all(format!("POST {MCP_PATH} HTTP/1.1\r\nHost: {}\r\n", srv.host()).as_bytes()).await.unwrap();
+        tokio::time::sleep(Duration::from_millis(100)).await;
         let _ = srv.stop.take().unwrap().send(Stop::Graceful);
         tokio::time::sleep(Duration::from_millis(300)).await;
         assert!(TcpStream::connect(srv.addr).await.is_err(), "the port closes when shutdown starts");
-        assert!(!srv.done.is_finished(), "still waiting for the open connection");
+        assert!(!srv.done.is_finished(), "still waiting for the request in progress");
         let r = tokio::time::timeout(Duration::from_secs(20), &mut srv.done).await.expect("shut down in time").unwrap();
         assert!(r.is_ok(), "{r:?}");
         assert!(!out.exists(), "the partial export is deleted");
@@ -1501,7 +1515,9 @@ async fn shutdown_deletes_partial_exports_and_closes_the_port_at_once() {
 
 /// When the process is about to be killed (Windows: the console closing, logoff, shutdown), the
 /// server stops within the short grace, exports first: the partial file is deleted even though
-/// a connection is still open.
+/// a connection is still open. A session's export is cancelled at once, not when rmcp gets round
+/// to it (up to 5 s after its session closed): it used to keep encoding past the grace, and only
+/// the deletion at the deadline hid it.
 #[tokio::test(flavor = "multi_thread")]
 async fn a_hurried_stop_deletes_partial_exports_within_its_grace() {
     within(async {
@@ -1519,13 +1535,28 @@ async fn a_hurried_stop_deletes_partial_exports_within_its_grace() {
                 break;
             }
         }
-        let _idle = TcpStream::connect(srv.addr).await.unwrap(); // would hold a graceful stop for 5 s
+        // a request still arriving would hold a graceful stop for 5 s
+        let mut slow = TcpStream::connect(srv.addr).await.unwrap();
+        slow.write_all(format!("POST {MCP_PATH} HTTP/1.1\r\nHost: {}\r\n", srv.host()).as_bytes()).await.unwrap();
+        tokio::time::sleep(Duration::from_millis(100)).await;
         let t0 = std::time::Instant::now();
         let _ = srv.stop.take().unwrap().send(Stop::Hurried);
         let r = tokio::time::timeout(Duration::from_secs(20), &mut srv.done).await.expect("stopped").unwrap();
         assert!(r.is_ok(), "{r:?}");
         assert!(t0.elapsed() < Duration::from_secs(3), "within the hurried grace: {:?}", t0.elapsed());
         assert!(!out.exists(), "the partial export is deleted");
+        // cancelled when the stop came (it stops at its next batch, later under load), not after
+        // rmcp's 5 s wait for the session's responses
+        loop {
+            let jobs = srv.mcp.run("jobs.list", json!({})).await.unwrap();
+            let last = jobs.as_array().and_then(|a| a.last()).cloned().unwrap_or_default();
+            if last["finished"] == true {
+                assert_eq!(last["result"]["error"], "cancelled", "{jobs}");
+                break;
+            }
+            assert!(t0.elapsed() < Duration::from_millis(4500), "the export was cancelled at once: {jobs}");
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
         let _ = std::fs::remove_dir_all(&dir);
     })
     .await;
