@@ -257,6 +257,7 @@ impl FilmcraftMcp {
         let (mut to_service, service_in) = tokio::io::duplex(1 << 20);
         let (service_out, from_service) = tokio::io::duplex(1 << 20);
         let (err_tx, mut err_rx) = tokio::sync::mpsc::unbounded_channel::<String>();
+        let at_eof = self.long_calls.clone();
         let reader = tokio::spawn(async move {
             let mut lines = BufReader::new(input).lines();
             while let Ok(Some(line)) = lines.next_line().await {
@@ -275,7 +276,12 @@ impl FilmcraftMcp {
                     }
                 }
             }
-            // EOF: closing the pipe ends the service
+            // EOF: the client is done (MCP's stdio shutdown starts by closing the server's input).
+            // Long calls are cancelled at once, as on a stop: rmcp would first wait up to 5 s for
+            // their responses, while their exports went on writing, and a client that then kills
+            // the process would leave their partial files.
+            at_eof.stop();
+            // closing the pipe ends the service
             let _ = to_service.shutdown().await;
         });
         let writer = tokio::spawn(async move {
@@ -296,10 +302,19 @@ impl FilmcraftMcp {
         let stop = async move { stop.await.into() };
         tokio::pin!(stop);
         let running = tokio::select! {
-            r = self.serve((service_in, service_out)) => r.map_err(|e| AutomationError::Other(format!("MCP init: {e}")))?,
+            r = self.serve((service_in, service_out)) => match r {
+                Ok(r) => r,
+                Err(e) => {
+                    // the input ended before the client initialized: nothing ran (a later server
+                    // on a clone of this handler starts afresh)
+                    long_calls.drain(tokio::time::Instant::now()).await;
+                    return Err(AutomationError::Other(format!("MCP init: {e}")));
+                }
+            },
             _ = &mut stop => {
                 // stopped before the client initialized: nothing runs yet
                 reader.abort();
+                long_calls.drain(tokio::time::Instant::now()).await;
                 return Ok(());
             }
         };
@@ -316,7 +331,8 @@ impl FilmcraftMcp {
         // waits for handlers that do not finish.
         let (r, deadline) = match stopped {
             Err(r) => {
-                // the calls are over; exports started without `wait` would be cut off at exit
+                // the input ended (the calls were cancelled then); exports started without `wait`
+                // would be cut off at exit
                 long_calls.stop();
                 (Some(r), crate::http_transport::deadline_after(Stop::Graceful.grace()))
             }
@@ -1148,8 +1164,11 @@ mod tests {
     }
 
     /// stdio stops when asked (a signal: SIGTERM, a closing console) or when the client closes its
-    /// input, mid-export either way: the export is cancelled and its partial file deleted before
-    /// `serve_io_until` returns, instead of the process dying with a truncated file on disk.
+    /// input, mid-export either way: the export is cancelled at once and its partial file deleted
+    /// before `serve_io_until` returns, instead of the process dying with a truncated file on disk.
+    /// On a closed input it used to go on encoding while rmcp waited up to 5 s for its response,
+    /// and a client that killed the server meanwhile (MCP's stdio shutdown: close the input, then
+    /// SIGTERM, then SIGKILL) left its partial file.
     #[tokio::test(flavor = "multi_thread")]
     async fn stdio_stops_mid_export_without_leaving_a_partial_file() {
         use tokio::io::{AsyncBufReadExt, AsyncWriteExt};
@@ -1159,8 +1178,9 @@ mod tests {
             let (mut tx, server_in) = tokio::io::duplex(1 << 22);
             let (server_out, rx) = tokio::io::duplex(1 << 22);
             let (stop, stop_rx) = tokio::sync::oneshot::channel::<Stop>();
-            let done =
-                tokio::spawn(FilmcraftMcp::headless(demo()).serve_io_until(server_in, server_out, async move { stop_rx.await.unwrap_or(Stop::Graceful) }));
+            let mcp = FilmcraftMcp::headless(demo());
+            let session = mcp.headless_session().unwrap();
+            let done = tokio::spawn(mcp.serve_io_until(server_in, server_out, async move { stop_rx.await.unwrap_or(Stop::Graceful) }));
             let mut rx = tokio::io::BufReader::new(rx).lines();
             let mut next = async || -> Value { serde_json::from_str(&rx.next_line().await.unwrap().unwrap()).unwrap() };
             let init = json!({"jsonrpc":"2.0","id":0,"method":"initialize","params":{"protocolVersion":"2025-06-18","capabilities":{},"clientInfo":{"name":"t","version":"1"}}});
@@ -1176,14 +1196,30 @@ mod tests {
                     break;
                 }
             }
+            let t0 = std::time::Instant::now();
             if by_signal {
                 let _ = stop.send(Stop::Graceful);
             } else {
                 drop(tx);
             }
+            // told to stop at once (it stops at its next batch, later under load)
+            let told = || {
+                session
+                    .lock()
+                    .unwrap_or_else(PoisonError::into_inner)
+                    .jobs
+                    .first()
+                    .is_some_and(|j| j.progress.cancel.load(std::sync::atomic::Ordering::Relaxed))
+            };
+            while !told() {
+                assert!(t0.elapsed() < std::time::Duration::from_secs(1), "{name}: the export was not cancelled at once");
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            }
             let r = tokio::time::timeout(std::time::Duration::from_secs(30), done).await.expect("stopped in time").unwrap();
             assert!(r.is_ok(), "{r:?}");
             assert!(!out.exists(), "{name}: the partial export is deleted");
+            let jobs = session.lock().unwrap_or_else(PoisonError::into_inner).execute("jobs.list", json!({})).unwrap();
+            assert_eq!(jobs[0]["result"]["error"], "cancelled", "{name}: {jobs}");
         }
     }
 
