@@ -118,10 +118,14 @@ struct Spawned {
 
 impl Spawned {
     fn new(args: &[&str]) -> Self {
+        Self::with_env(args, &[])
+    }
+    fn with_env(args: &[&str], env: &[(&str, &str)]) -> Self {
         use std::io::BufRead;
         let mut child = Command::new(env!("CARGO_BIN_EXE_filmcraft-cli"))
             .args(args)
             .env_remove("FILMCRAFT_MCP_TOKEN")
+            .envs(env.iter().copied())
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
@@ -163,6 +167,36 @@ impl Drop for Spawned {
         let _ = self.child.kill();
         let _ = self.child.wait();
     }
+}
+
+/// `mcp --http 0.0.0.0:PORT` (all interfaces, a token required) prints a URL a client can use
+/// (loopback, not `http://0.0.0.0:PORT`), the Host values it accepts, and what LAN clients need.
+#[test]
+fn mcp_http_on_every_interface_prints_usable_addresses() {
+    let token = "banner-test-token-0123456789-abcdefgh";
+    let p = Spawned::with_env(&["mcp", "--demo", "--http", "0.0.0.0:0"], &[("FILMCRAFT_MCP_TOKEN", token)]);
+    let banner = Spawned::line(&p.err);
+    let addr = banner.split("http://").nth(1).and_then(|r| r.split("/mcp").next()).unwrap_or_else(|| panic!("no URL in {banner:?}")).to_string();
+    assert!(addr.starts_with("127.0.0.1:"), "{banner}");
+    let hosts = Spawned::line(&p.err);
+    assert!(hosts.contains("listening on every interface (0.0.0.0:") && hosts.contains(&format!("Host must be one of: {addr}")), "{hosts}");
+    let lan = Spawned::line(&p.err);
+    assert!(lan.contains("LAN clients get 403 until you add --allow-host "), "{lan}");
+    assert!(!banner.contains(token) && !hosts.contains(token) && !lan.contains(token));
+    // the printed URL works
+    let body =
+        r#"{"jsonrpc":"2.0","id":0,"method":"initialize","params":{"protocolVersion":"2025-06-18","capabilities":{},"clientInfo":{"name":"t","version":"1"}}}"#;
+    let mut s = std::net::TcpStream::connect(&addr).unwrap();
+    s.set_read_timeout(Some(std::time::Duration::from_secs(60))).unwrap();
+    write!(
+        s,
+        "POST /mcp HTTP/1.1\r\nHost: {addr}\r\nAuthorization: Bearer {token}\r\nAccept: application/json, text/event-stream\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+        body.len()
+    )
+    .unwrap();
+    let mut reply = String::new();
+    std::io::Read::read_to_string(&mut s, &mut reply).unwrap();
+    assert!(reply.starts_with("HTTP/1.1 200"), "{reply}");
 }
 
 /// `mcp` stops cleanly on SIGTERM and SIGHUP (kill, systemd, docker stop, a closed terminal) as

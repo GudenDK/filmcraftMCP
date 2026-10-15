@@ -601,7 +601,24 @@ async fn serve_mcp_http(
         (Some(_), Some(f)) => format!("bearer token required (from {f})"),
         (Some(_), None) => format!("bearer token required (from {})", filmcraft_automation::http_transport::TOKEN_ENV),
     };
-    diag(format_args!("filmcraft-cli: MCP (Streamable HTTP) on http://{bound}/mcp, driving {backend}; {auth}. Ctrl+C stops it."));
+    // 0.0.0.0 / [::] is no address a client can use: show the loopback URL, and what LAN clients need
+    let url_addr = match bound.ip() {
+        std::net::IpAddr::V4(ip) if ip.is_unspecified() => std::net::SocketAddr::from((std::net::Ipv4Addr::LOCALHOST, bound.port())),
+        std::net::IpAddr::V6(ip) if ip.is_unspecified() => std::net::SocketAddr::from((std::net::Ipv6Addr::LOCALHOST, bound.port())),
+        _ => bound,
+    };
+    diag(format_args!("filmcraft-cli: MCP (Streamable HTTP) on http://{url_addr}/mcp, driving {backend}; {auth}. Ctrl+C stops it."));
+    if bound.ip().is_unspecified() {
+        let hosts = filmcraft_automation::http_transport::accepted_hosts(bound, &opts.allowed_hosts).join(", ");
+        diag(format_args!("filmcraft-cli: listening on every interface ({bound}); a request's Host must be one of: {hosts}"));
+        match lan_address(bound.is_ipv6()).map(|ip| std::net::SocketAddr::new(ip, bound.port()).to_string()) {
+            Some(lan) if opts.allowed_hosts.iter().any(|h| h.eq_ignore_ascii_case(&lan)) => {
+                diag(format_args!("filmcraft-cli: LAN clients: http://{lan}/mcp"));
+            }
+            Some(lan) => diag(format_args!("filmcraft-cli: LAN clients get 403 until you add --allow-host {lan} (then they use http://{lan}/mcp)")),
+            None => diag(format_args!("filmcraft-cli: LAN clients get 403 until you add --allow-host <this machine's IP>:{}", bound.port())),
+        }
+    }
     if let Some(n) = opts.token.as_ref().map(String::len).filter(|n| *n < filmcraft_automation::http_transport::MIN_REMOTE_TOKEN_LEN) {
         diag(format_args!("filmcraft-cli: warning: the MCP token is short ({n} characters); use 32+ random characters"));
     }
@@ -613,6 +630,16 @@ async fn serve_mcp_http(
     server.serve_http_listener(listener, opts, stop_signal()).await?;
     diag(format_args!("filmcraft-cli: MCP server stopped"));
     Ok(())
+}
+
+/// This machine's address on its default route, if it has one (asks the routing table; sends
+/// nothing).
+fn lan_address(v6: bool) -> Option<std::net::IpAddr> {
+    let (any, probe) = if v6 { ("[::]:0", "[2001:db8::1]:9") } else { ("0.0.0.0:0", "192.0.2.1:9") };
+    let socket = std::net::UdpSocket::bind(any).ok()?;
+    socket.connect(probe).ok()?;
+    let ip = socket.local_addr().ok()?.ip();
+    (!ip.is_unspecified() && !ip.is_loopback()).then_some(ip)
 }
 
 /// Resolves when the process is asked to stop: Ctrl+C, SIGTERM or SIGHUP (kill, systemd, docker
