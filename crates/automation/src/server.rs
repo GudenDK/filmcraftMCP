@@ -43,6 +43,8 @@ pub struct FilmcraftMcp {
     /// Long calls (exports) running on this server, shared by its clones (HTTP serves each client
     /// with a clone): shutdown waits for them.
     pub(crate) long_calls: Arc<crate::long_job::LongCalls>,
+    /// Where the app writes bridge screenshots for this server.
+    shots: Arc<crate::shots::ShotDir>,
 }
 
 #[derive(Debug, Default, Deserialize, JsonSchema)]
@@ -209,7 +211,13 @@ impl FilmcraftMcp {
         Ok(Self::with_backend(Backend::Bridge(Arc::new(BridgeClient::new(addr)?))))
     }
     fn with_backend(backend: Backend) -> Self {
-        Self { backend: Arc::new(backend), tool_router: Self::tool_router(), view: Arc::new(tokio::sync::Mutex::new(())), long_calls: Arc::default() }
+        Self {
+            backend: Arc::new(backend),
+            tool_router: Self::tool_router(),
+            view: Arc::new(tokio::sync::Mutex::new(())),
+            long_calls: Arc::default(),
+            shots: Arc::default(),
+        }
     }
 
     /// Serve MCP on stdin/stdout until the client closes stdin.
@@ -606,18 +614,20 @@ impl FilmcraftMcp {
 
 impl FilmcraftMcp {
     async fn screenshot(&self, b: &BridgeClient, panel: Option<String>, max: u32) -> Result<CallToolResult, McpError> {
-        // one file per call: concurrent screenshots (several HTTP clients) must not share one
-        static SHOT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-        let n = SHOT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        let path = std::env::temp_dir().join(format!("filmcraft-mcp-{}-{n}.png", std::process::id()));
-        if let Err(e) = b.call("ui.screenshot", json!({"path": path.to_string_lossy(), "panel": panel})).await {
+        // one file per call (concurrent HTTP clients), in the server's private directory, removed
+        // when `file` drops: on success, on error, and when the call is cancelled
+        let file = match self.shots.file() {
+            Ok(f) => f,
+            Err(e) => return Ok(fail(format!("screenshot: cannot make a private temporary directory: {e}"))),
+        };
+        if let Err(e) = b.call("ui.screenshot", json!({"path": file.path().to_string_lossy(), "panel": panel})).await {
             return Ok(fail(e));
         }
-        let bytes = match std::fs::read(&path) {
+        let bytes = match file.read() {
             Ok(b) => b,
             Err(e) => return Ok(fail(format!("screenshot: {e}"))),
         };
-        let _ = std::fs::remove_file(&path);
+        drop(file);
         let bytes = match image::load_from_memory(&bytes) {
             Ok(img) => {
                 let rgba = img.to_rgba8();
@@ -1088,6 +1098,63 @@ mod tests {
             assert!(!out.exists(), "{name}: the partial export is deleted");
         }
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Bridge screenshots: the app is told to write into the server's private directory (not a
+    /// guessable name in the shared temp directory), and the file is removed whether the call
+    /// succeeds or the app fails after writing it; the directory goes with the server.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn bridge_screenshots_use_private_files_that_are_always_removed() {
+        use tokio::io::{AsyncBufReadExt, AsyncWriteExt};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let paths = Arc::new(Mutex::new(Vec::<String>::new()));
+        let seen = paths.clone();
+        // a stand-in for `filmcraft --control`: writes the screenshot where it is told to, and
+        // fails the second request after writing it
+        tokio::spawn(async move {
+            loop {
+                let (s, _) = listener.accept().await.unwrap();
+                let seen = seen.clone();
+                tokio::spawn(async move {
+                    let (r, mut w) = s.into_split();
+                    let mut lines = tokio::io::BufReader::new(r).lines();
+                    while let Ok(Some(l)) = lines.next_line().await {
+                        let v: Value = serde_json::from_str(&l).unwrap();
+                        let path = v["params"]["path"].as_str().unwrap().to_string();
+                        std::fs::write(&path, crate::png_rgba(4, 4, vec![200; 64], 0).unwrap()).unwrap();
+                        let fails = {
+                            let mut seen = seen.lock().unwrap();
+                            seen.push(path);
+                            seen.len() == 2
+                        };
+                        let reply = if fails {
+                            json!({"id": v["id"], "ok": false, "error": "window minimized"})
+                        } else {
+                            json!({"id": v["id"], "ok": true, "result": {}})
+                        };
+                        w.write_all(format!("{reply}\n").as_bytes()).await.unwrap();
+                    }
+                });
+            }
+        });
+        let m = FilmcraftMcp::bridge(&addr.to_string()).unwrap();
+        let b = m.bridge_client().unwrap();
+        let ok = m.screenshot(&b, None, 64).await.unwrap();
+        assert_ne!(ok.is_error, Some(true), "{ok:?}");
+        let failed = m.screenshot(&b, Some("Timeline".into()), 64).await.unwrap();
+        assert_eq!(failed.is_error, Some(true));
+        let paths = paths.lock().unwrap().clone();
+        assert_eq!(paths.len(), 2);
+        let dir = std::path::Path::new(&paths[0]).parent().unwrap().to_path_buf();
+        assert_ne!(dir, std::env::temp_dir());
+        for p in &paths {
+            let p = std::path::Path::new(p);
+            assert!(!p.exists(), "{} removed", p.display());
+            assert_eq!(p.parent(), Some(dir.as_path()));
+        }
+        drop((b, m));
+        assert!(!dir.exists(), "the directory is removed with the server");
     }
 
     /// A command that panicked used to poison the session lock, and every later call failed with

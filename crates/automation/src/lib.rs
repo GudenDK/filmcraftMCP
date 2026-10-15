@@ -17,6 +17,7 @@ pub mod bridge;
 pub mod http_transport;
 pub mod long_job;
 pub mod server;
+mod shots;
 
 pub use bridge::BridgeClient;
 pub use http_transport::HttpOptions;
