@@ -25,4 +25,5 @@ FilmCraft is a clean-room, open-source, pure-Rust non-linear video editor target
 - `cargo run -p filmcraft -- --control 9876` opens the desktop app with the JSON-lines control server (see `docs/control-protocol.md`).
 - For UI work, **look at the result**: drive via the control channel and take `ui.screenshot`, compare with `plan/premiere/screenshots/` (maintainer-local; see [`docs/agents.md`](docs/agents.md) §3).
 - Parallel agents: separate git worktrees and `CARGO_TARGET_DIR=target/agent-<name>`; keep every `Cargo.toml` valid at all times (the `crates/*` glob means one broken manifest breaks everyone).
+- Dependency sources (e.g. `rmcp`) are in the Cargo registry: `ls -d ~/.cargo/registry/src/*/rmcp-*`. Never search from the filesystem root (`find /`): in Git Bash on Windows it never finishes, pins a CPU core, and keeps running after the command times out.
 - Test fixtures: generate with ffmpeg into `target/fixtures/` (never commit media). See [`docs/testing.md`](docs/testing.md).
