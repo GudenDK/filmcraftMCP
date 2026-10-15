@@ -12,7 +12,9 @@
 //!   checked next, else 401; a peer that sends 10 wrong tokens in a minute gets 429 for its
 //!   wrong ones for a minute (and for the right one too if it is shorter than 32 characters);
 //! * an `allowed_hosts` name that is not this machine (a LAN name, a tunnel, a proxy) means clients
-//!   from the network, so it needs a token of 32+ characters too ([`check_host_exposure`]).
+//!   from the network, so it needs a token of 32+ characters too ([`check_host_exposure`]), and so
+//!   does a request that a proxy or tunnel relayed (it carries `X-Forwarded-For`, `Via`, ...) even
+//!   when the proxy rewrote `Host` to this server's own, else 403.
 //!
 //! The gate (`gate.rs`) runs these checks before reading a body, maps a non-JSON body to a
 //! JSON-RPC parse error (`-32700`, as `serve_io` does on stdio), and keeps rmcp's per-tool-name

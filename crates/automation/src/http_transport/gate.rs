@@ -27,6 +27,11 @@ use super::tracked::{INITIALIZING, Initializing, TrackedSessions};
 use super::{HttpBody, MAX_BODY, MCP_PATH, MIN_REMOTE_TOKEN_LEN, Mcp};
 use crate::FilmcraftMcp;
 
+/// Headers that reverse proxies and tunnels (nginx with the usual settings, Caddy, Traefik, Apache,
+/// cloudflared, ngrok, ...) add to the requests they relay.
+pub(super) const RELAY_HEADERS: [&str; 8] =
+    ["forwarded", "x-forwarded-for", "x-forwarded-host", "x-forwarded-proto", "x-real-ip", "via", "cf-connecting-ip", "true-client-ip"];
+
 /// Request headers a listed browser origin may send (answer to its CORS preflight).
 const CORS_ALLOW_HEADERS: &str = "content-type, accept, authorization, mcp-session-id, mcp-protocol-version, mcp-method, mcp-name, last-event-id";
 
@@ -125,6 +130,7 @@ impl Gate {
         // counts as a failed authentication of this address.
         self.check_host(&req)?;
         self.check_origin(req.headers())?;
+        self.check_relayed(req.headers())?;
         self.check_token(peer, req.headers())?;
         trusted.store(true, Ordering::Relaxed);
         let session = session_id(req.headers());
@@ -287,6 +293,21 @@ impl Gate {
             self.log.line(format_args!("too many failed authentications from {}: refusing wrong tokens from it with 429 for a while", peer.ip()));
         }
         Err(refusal(StatusCode::UNAUTHORIZED, "Unauthorized: missing or wrong bearer token"))
+    }
+
+    /// A request that a reverse proxy or tunnel relayed (it carries a forwarding header) comes from
+    /// the network, even when the proxy rewrote `Host` to this server's own (nginx's default
+    /// `proxy_pass`, `ngrok --host-header=rewrite`), so no `--allow-host`, and with it no token,
+    /// was needed. Without a token too long to guess, 403.
+    fn check_relayed(&self, headers: &HeaderMap) -> Result<(), Refusal> {
+        if self.token.as_ref().is_some_and(|t| t.len() >= MIN_REMOTE_TOKEN_LEN) {
+            return Ok(());
+        }
+        let Some(relayed) = RELAY_HEADERS.into_iter().find(|h| headers.contains_key(*h)) else { return Ok(()) };
+        let mut no =
+            refusal(StatusCode::FORBIDDEN, "Forbidden: requests relayed by a proxy or tunnel need a bearer token of 32+ characters (FILMCRAFT_MCP_TOKEN)");
+        no.detail = Some(format!("{relayed} header"));
+        Err(no)
     }
 
     /// rmcp's DNS-rebinding check: `Host` (or, without one, the request's authority) must name this

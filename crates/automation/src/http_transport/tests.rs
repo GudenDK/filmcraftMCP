@@ -795,6 +795,51 @@ async fn bearer_token_is_required() {
     .await;
 }
 
+/// A request a reverse proxy or tunnel relayed comes from the network, even when the proxy
+/// rewrote `Host` to this server's (nginx's default `proxy_pass`): with no token, or one short
+/// enough to guess, it gets 403, and the log says why. With a token of 32+ characters it is
+/// accepted like any other.
+#[tokio::test(flavor = "multi_thread")]
+async fn relayed_requests_need_a_long_token() {
+    within(async {
+        let initialize = json!({"jsonrpc":"2.0","id":0,"method":"initialize","params":{"protocolVersion":"2025-06-18","capabilities":{},"clientInfo":{"name":"t","version":"1"}}});
+        let relays = [
+            ("X-Forwarded-For", "203.0.113.9"),
+            ("Forwarded", "for=203.0.113.9;proto=https"),
+            ("X-Forwarded-Host", "mcp.example"),
+            ("X-Forwarded-Proto", "https"),
+            ("X-Real-IP", "203.0.113.9"),
+            ("Via", "1.1 nginx"),
+            ("CF-Connecting-IP", "203.0.113.9"),
+            ("True-Client-IP", "203.0.113.9"),
+        ];
+        let (log, lines) = log_capture();
+        let open = Server::start(demo(), HttpOptions { log, ..HttpOptions::default() }).await;
+        for relay in relays {
+            let r = post(open.addr, None, &[relay], &initialize).await;
+            assert_eq!(r.status, 403, "{relay:?}");
+            assert!(r.text().await.contains("relayed by a proxy or tunnel need a bearer token of 32+ characters (FILMCRAFT_MCP_TOKEN)"));
+        }
+        assert_eq!(post(open.addr, None, &[], &initialize).await.status, 200, "a local client");
+        let l = lines.lock().unwrap().join("\n");
+        assert!(l.contains("403 Forbidden: requests relayed by a proxy or tunnel") && l.contains("(x-forwarded-for header)"), "{l}");
+        assert_eq!(TOKEN_ENV, "FILMCRAFT_MCP_TOKEN", "the refusal names the variable");
+        assert_eq!(gate::RELAY_HEADERS.len(), relays.len());
+        let short = "short-token";
+        let srv = Server::start(demo(), HttpOptions { token: Some(short.into()), ..HttpOptions::default() }).await;
+        let bearer = format!("Bearer {short}");
+        assert_eq!(post(srv.addr, None, &[("Authorization", &bearer), relays[0]], &initialize).await.status, 403, "a short token");
+        let long = "relay-test-token-0123456789-abcdefgh";
+        let srv = Server::start(demo(), HttpOptions { token: Some(long.into()), ..HttpOptions::default() }).await;
+        let bearer = format!("Bearer {long}");
+        for relay in relays {
+            assert_eq!(post(srv.addr, None, &[("Authorization", &bearer), relay], &initialize).await.status, 200, "{relay:?}");
+        }
+        assert_eq!(post(srv.addr, None, &[relays[0]], &initialize).await.status, 401, "still needs the token");
+    })
+    .await;
+}
+
 /// A peer that sends wrong tokens too often gets 429 (with Retry-After) instead of 401 for a
 /// while; it is logged, and the block ends. With a token of 32+ characters (too long to guess) the
 /// right one still gets in meanwhile: every local client shares 127.0.0.1, so a local process, or a

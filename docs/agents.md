@@ -261,6 +261,15 @@ wherever the user can, so the endpoint is locked down by default:
   least 32 characters (else exit 2), as a non-loopback address does. Behind a proxy every request
   comes from the proxy's address (on this machine: 127.0.0.1, like local clients), so the
   per-address limits (connections, wrong tokens) count them all together; the first lines say so.
+- **Proxies and tunnels.** Anything that relays network traffic to the port (a reverse proxy,
+  `cloudflared`, `ngrok`, `ssh -R`) lets whoever reaches it drive FilmCraft, also when it rewrites
+  `Host` to `127.0.0.1:<port>` or `localhost:<port>` so that no `--allow-host` is needed: nginx's
+  default `proxy_pass http://127.0.0.1:9877;` does that, and so does
+  `ngrok http 9877 --host-header=rewrite`. Always set a token of 32+ characters for it. A request
+  carrying a header that proxies and tunnels add (`Forwarded`, `X-Forwarded-For`,
+  `X-Forwarded-Host`, `X-Forwarded-Proto`, `X-Real-IP`, `Via`, `CF-Connecting-IP`,
+  `True-Client-IP`) gets 403 without one. nginx's default adds none of them, though, and `ssh -R`
+  relays plain TCP, so the server cannot always tell: the token is up to you.
 - A request with an `Origin` header comes from a browser and gets 403, unless the origin is listed
   with `--allow-origin` (repeatable). MCP clients send no `Origin`. An entry is `scheme://host:port`
   with the port written out, exactly as the browser sends it: `http://localhost:6274` and
@@ -342,6 +351,7 @@ its body holds, and has its connection closed.
 | 204 | a listed origin's CORS preflight |
 | 400 / 403 | a malformed / foreign `Host` |
 | 403 | an `Origin` that is not listed |
+| 403 | a request relayed by a proxy or tunnel (it has `X-Forwarded-For`, `Via` or another forwarding header), without a token of 32+ characters |
 | 429 | a wrong token from an address that sent 10 wrong ones in a minute (for a minute; `Retry-After`); with a token under 32 characters, the right one too |
 | 401 | no or wrong bearer token (`WWW-Authenticate: Bearer realm="filmcraft"`) |
 | 405 | a method other than `GET`, `POST`, `DELETE`, such as an `OPTIONS` that is no CORS preflight |
