@@ -55,6 +55,13 @@ fn log_capture() -> (Option<LogSink>, Arc<std::sync::Mutex<Vec<String>>>) {
 
 /// How long a test waits for any one network read.
 const WAIT: Duration = Duration::from_secs(60);
+/// How long one test may take in all: a hang fails it instead of stalling the whole run.
+const TEST_LIMIT: Duration = Duration::from_secs(120);
+
+/// `test`, failing when it takes longer than [`TEST_LIMIT`].
+async fn within<T>(test: impl Future<Output = T>) -> T {
+    tokio::time::timeout(TEST_LIMIT, test).await.expect("the test finished within its time limit")
+}
 
 /// One HTTP/1.1 exchange on its own connection (`Connection: close`), read incrementally so
 /// SSE events can be taken one at a time.
@@ -259,75 +266,81 @@ fn tool_json(r: &Value) -> Value {
 /// clients share one engine session.
 #[tokio::test(flavor = "multi_thread")]
 async fn sessions_share_one_engine_session() {
-    let srv = Server::start(demo(), HttpOptions::default()).await;
-    let (a, init_a) = init(srv.addr, &[]).await;
-    assert_eq!(init_a["result"]["serverInfo"]["name"], "filmcraft", "{init_a}");
-    let mut r = post(srv.addr, Some(&a), &[], &json!({"jsonrpc":"2.0","id":1,"method":"tools/list"})).await;
-    let tools = r.reply().await;
-    let names: Vec<&str> = tools["result"]["tools"].as_array().unwrap().iter().filter_map(|t| t["name"].as_str()).collect();
-    assert!(names.contains(&"command_run") && names.contains(&"render_frame"), "{names:?}");
-    let r = call(srv.addr, &a, 2, "command_list", json!({"filter": "razor"})).await;
-    assert!(r["result"]["content"][0]["text"].as_str().unwrap().contains("timeline.razor"), "{r}");
-    // strict arguments: an in-band invalid-params error
-    let r = call(srv.addr, &a, 3, "command_list", json!({"filtr": "x"})).await;
-    assert_eq!(r["error"]["code"], -32602, "{r}");
-    let r = call(srv.addr, &a, 4, "render_frame", json!({"max_side": 64})).await;
-    assert_eq!(r["result"]["content"][0]["type"], "image", "{r}");
-    let mut r = post(srv.addr, Some(&a), &[], &json!({"jsonrpc":"2.0","id":5,"method":"resources/read","params":{"uri":"filmcraft://document"}})).await;
-    let doc = r.reply().await;
-    assert!(doc["result"]["contents"][0]["text"].as_str().unwrap().contains("\"sequence\""), "{doc}");
+    within(async {
+        let srv = Server::start(demo(), HttpOptions::default()).await;
+        let (a, init_a) = init(srv.addr, &[]).await;
+        assert_eq!(init_a["result"]["serverInfo"]["name"], "filmcraft", "{init_a}");
+        let mut r = post(srv.addr, Some(&a), &[], &json!({"jsonrpc":"2.0","id":1,"method":"tools/list"})).await;
+        let tools = r.reply().await;
+        let names: Vec<&str> = tools["result"]["tools"].as_array().unwrap().iter().filter_map(|t| t["name"].as_str()).collect();
+        assert!(names.contains(&"command_run") && names.contains(&"render_frame"), "{names:?}");
+        let r = call(srv.addr, &a, 2, "command_list", json!({"filter": "razor"})).await;
+        assert!(r["result"]["content"][0]["text"].as_str().unwrap().contains("timeline.razor"), "{r}");
+        // strict arguments: an in-band invalid-params error
+        let r = call(srv.addr, &a, 3, "command_list", json!({"filtr": "x"})).await;
+        assert_eq!(r["error"]["code"], -32602, "{r}");
+        let r = call(srv.addr, &a, 4, "render_frame", json!({"max_side": 64})).await;
+        assert_eq!(r["result"]["content"][0]["type"], "image", "{r}");
+        let mut r = post(srv.addr, Some(&a), &[], &json!({"jsonrpc":"2.0","id":5,"method":"resources/read","params":{"uri":"filmcraft://document"}})).await;
+        let doc = r.reply().await;
+        assert!(doc["result"]["contents"][0]["text"].as_str().unwrap().contains("\"sequence\""), "{doc}");
 
-    // an edit in one session is seen by another
-    let (b, _) = init(srv.addr, &[]).await;
-    assert_ne!(a, b);
-    let before = tool_json(&call(srv.addr, &b, 6, "project_inspect", json!({})).await).to_string();
-    assert!(!before.contains("FromSessionA"), "{before}");
-    let r = call(srv.addr, &a, 7, "command_run", json!({"id": "file.newBin", "params": {"name": "FromSessionA"}})).await;
-    assert_eq!(r["result"]["isError"], false, "{r}");
-    let after = tool_json(&call(srv.addr, &b, 8, "project_inspect", json!({})).await).to_string();
-    assert!(after.contains("FromSessionA"), "{after}");
+        // an edit in one session is seen by another
+        let (b, _) = init(srv.addr, &[]).await;
+        assert_ne!(a, b);
+        let before = tool_json(&call(srv.addr, &b, 6, "project_inspect", json!({})).await).to_string();
+        assert!(!before.contains("FromSessionA"), "{before}");
+        let r = call(srv.addr, &a, 7, "command_run", json!({"id": "file.newBin", "params": {"name": "FromSessionA"}})).await;
+        assert_eq!(r["result"]["isError"], false, "{r}");
+        let after = tool_json(&call(srv.addr, &b, 8, "project_inspect", json!({})).await).to_string();
+        assert!(after.contains("FromSessionA"), "{after}");
 
-    // DELETE ends a session; it is then unknown (404)
-    let d = send(srv.addr, "DELETE", &[("Mcp-Session-Id", &a)], "").await;
-    assert_eq!(d.status, 202);
-    let r = post(srv.addr, Some(&a), &[], &json!({"jsonrpc":"2.0","id":9,"method":"ping"})).await;
-    assert_eq!(r.status, 404);
+        // DELETE ends a session; it is then unknown (404)
+        let d = send(srv.addr, "DELETE", &[("Mcp-Session-Id", &a)], "").await;
+        assert_eq!(d.status, 202);
+        let r = post(srv.addr, Some(&a), &[], &json!({"jsonrpc":"2.0","id":9,"method":"ping"})).await;
+        assert_eq!(r.status, 404);
+    })
+    .await;
 }
 
 /// MCP 2026-07-28 clients (current Claude Code) send self-contained requests: no session, the
 /// protocol fields in `_meta` and SEP-2243 headers. Unknown tool names are answered in-band.
 #[tokio::test(flavor = "multi_thread")]
 async fn stateless_2026_07_28_requests() {
-    let srv = Server::start(demo(), HttpOptions::default()).await;
-    let meta = json!({
-        "io.modelcontextprotocol/protocolVersion": "2026-07-28",
-        "io.modelcontextprotocol/clientInfo": {"name": "t", "version": "1"},
-        "io.modelcontextprotocol/clientCapabilities": {},
-    });
-    let h = |method: &'static str| vec![("MCP-Protocol-Version", "2026-07-28"), ("Mcp-Method", method)];
-    let mut r = post(srv.addr, None, &h("server/discover"), &json!({"jsonrpc":"2.0","id":1,"method":"server/discover","params":{"_meta":meta}})).await;
-    assert_eq!(r.status, 200);
-    assert!(r.header("mcp-session-id").is_none());
-    let v = r.reply().await;
-    assert!(v["result"]["supportedVersions"].as_array().unwrap().contains(&json!("2026-07-28")), "{v}");
-    let mut r = post(srv.addr, None, &h("tools/list"), &json!({"jsonrpc":"2.0","id":2,"method":"tools/list","params":{"_meta":meta}})).await;
-    let v = r.reply().await;
-    assert_eq!(v["result"]["resultType"], "complete", "{v}");
-    assert!(v["result"]["ttlMs"].is_u64(), "{v}");
-    let mut hh = h("tools/call");
-    hh.push(("Mcp-Name", "command_list"));
-    let msg = json!({"jsonrpc":"2.0","id":3,"method":"tools/call","params":{"_meta":meta,"name":"command_list","arguments":{"filter":"razor"}}});
-    let mut r = post(srv.addr, None, &hh, &msg).await;
-    let v = r.reply().await;
-    assert!(v["result"]["content"][0]["text"].as_str().unwrap().contains("timeline.razor"), "{v}");
-    // an unknown tool: answered here, in-band, without growing rmcp's schema cache
-    let mut hh = h("tools/call");
-    hh.push(("Mcp-Name", "no_such_tool"));
-    let msg = json!({"jsonrpc":"2.0","id":4,"method":"tools/call","params":{"_meta":meta,"name":"no_such_tool","arguments":{}}});
-    let mut r = post(srv.addr, None, &hh, &msg).await;
-    assert_eq!(r.status, 200);
-    let v = r.reply().await;
-    assert_eq!((v["id"].as_u64(), v["error"]["code"].as_i64()), (Some(4), Some(-32602)), "{v}");
+    within(async {
+        let srv = Server::start(demo(), HttpOptions::default()).await;
+        let meta = json!({
+            "io.modelcontextprotocol/protocolVersion": "2026-07-28",
+            "io.modelcontextprotocol/clientInfo": {"name": "t", "version": "1"},
+            "io.modelcontextprotocol/clientCapabilities": {},
+        });
+        let h = |method: &'static str| vec![("MCP-Protocol-Version", "2026-07-28"), ("Mcp-Method", method)];
+        let mut r = post(srv.addr, None, &h("server/discover"), &json!({"jsonrpc":"2.0","id":1,"method":"server/discover","params":{"_meta":meta}})).await;
+        assert_eq!(r.status, 200);
+        assert!(r.header("mcp-session-id").is_none());
+        let v = r.reply().await;
+        assert!(v["result"]["supportedVersions"].as_array().unwrap().contains(&json!("2026-07-28")), "{v}");
+        let mut r = post(srv.addr, None, &h("tools/list"), &json!({"jsonrpc":"2.0","id":2,"method":"tools/list","params":{"_meta":meta}})).await;
+        let v = r.reply().await;
+        assert_eq!(v["result"]["resultType"], "complete", "{v}");
+        assert!(v["result"]["ttlMs"].is_u64(), "{v}");
+        let mut hh = h("tools/call");
+        hh.push(("Mcp-Name", "command_list"));
+        let msg = json!({"jsonrpc":"2.0","id":3,"method":"tools/call","params":{"_meta":meta,"name":"command_list","arguments":{"filter":"razor"}}});
+        let mut r = post(srv.addr, None, &hh, &msg).await;
+        let v = r.reply().await;
+        assert!(v["result"]["content"][0]["text"].as_str().unwrap().contains("timeline.razor"), "{v}");
+        // an unknown tool: answered here, in-band, without growing rmcp's schema cache
+        let mut hh = h("tools/call");
+        hh.push(("Mcp-Name", "no_such_tool"));
+        let msg = json!({"jsonrpc":"2.0","id":4,"method":"tools/call","params":{"_meta":meta,"name":"no_such_tool","arguments":{}}});
+        let mut r = post(srv.addr, None, &hh, &msg).await;
+        assert_eq!(r.status, 200);
+        let v = r.reply().await;
+        assert_eq!((v["id"].as_u64(), v["error"]["code"].as_i64()), (Some(4), Some(-32602)), "{v}");
+    })
+    .await;
 }
 
 /// rmcp caches a schema lookup for every tools/call name it sees on a 2026-07-28 message, without
@@ -335,43 +348,47 @@ async fn stateless_2026_07_28_requests() {
 /// notification naming one is accepted and dropped (a notification gets no reply).
 #[tokio::test(flavor = "multi_thread")]
 async fn unknown_tool_names_never_reach_rmcp() {
-    let stats = Arc::new(Stats::default());
-    let srv = Server::start_with(demo(), HttpOptions::default(), stats.clone()).await;
-    let meta = json!({
-        "io.modelcontextprotocol/protocolVersion": "2026-07-28",
-        "io.modelcontextprotocol/clientInfo": {"name": "t", "version": "1"},
-        "io.modelcontextprotocol/clientCapabilities": {},
-    });
-    let before = stats.services.load(Ordering::Relaxed);
-    for i in 0..40u64 {
-        let name = format!("no_such_tool_{i}");
-        let h = [("MCP-Protocol-Version", "2026-07-28"), ("Mcp-Method", "tools/call"), ("Mcp-Name", name.as_str())];
-        let msg = json!({"jsonrpc":"2.0","id":i,"method":"tools/call","params":{"_meta":meta,"name":name,"arguments":{}}});
-        let mut r = post(srv.addr, None, &h, &msg).await;
-        assert_eq!(r.status, 200);
-        let v = r.reply().await;
-        assert_eq!((v["id"].as_u64(), v["error"]["code"].as_i64(), v["error"]["message"].as_str()), (Some(i), Some(-32602), Some("tool not found")), "{v}");
-        let note = json!({"jsonrpc":"2.0","method":"tools/call","params":{"_meta":meta,"name":name,"arguments":{}}});
-        let r = post(srv.addr, None, &h, &note).await;
-        assert_eq!(r.status, 202, "a notification is not answered");
-        assert_eq!(r.text().await, "");
-    }
-    assert_eq!(stats.services.load(Ordering::Relaxed), before, "rmcp made no handler (and cached no schema) for an unknown name");
-    // a known tool still reaches rmcp
-    let h = [("MCP-Protocol-Version", "2026-07-28"), ("Mcp-Method", "tools/call"), ("Mcp-Name", "command_list")];
-    let msg = json!({"jsonrpc":"2.0","id":99,"method":"tools/call","params":{"_meta":meta,"name":"command_list","arguments":{"filter":"razor"}}});
-    let v = post(srv.addr, None, &h, &msg).await.reply().await;
-    assert_eq!(v["result"]["isError"], false, "{v}");
-    assert!(stats.services.load(Ordering::Relaxed) > before);
-    // a session client (before 2026-07-28) gets the same wording from rmcp's tool router
-    let (sid, _) = init(srv.addr, &[]).await;
-    let v = call(srv.addr, &sid, 1, "no_such_tool", json!({})).await;
-    assert_eq!(v["error"]["message"], "tool not found", "{v}");
+    within(async {
+        let stats = Arc::new(Stats::default());
+        let srv = Server::start_with(demo(), HttpOptions::default(), stats.clone()).await;
+        let meta = json!({
+            "io.modelcontextprotocol/protocolVersion": "2026-07-28",
+            "io.modelcontextprotocol/clientInfo": {"name": "t", "version": "1"},
+            "io.modelcontextprotocol/clientCapabilities": {},
+        });
+        let before = stats.services.load(Ordering::Relaxed);
+        for i in 0..40u64 {
+            let name = format!("no_such_tool_{i}");
+            let h = [("MCP-Protocol-Version", "2026-07-28"), ("Mcp-Method", "tools/call"), ("Mcp-Name", name.as_str())];
+            let msg = json!({"jsonrpc":"2.0","id":i,"method":"tools/call","params":{"_meta":meta,"name":name,"arguments":{}}});
+            let mut r = post(srv.addr, None, &h, &msg).await;
+            assert_eq!(r.status, 200);
+            let v = r.reply().await;
+            assert_eq!((v["id"].as_u64(), v["error"]["code"].as_i64(), v["error"]["message"].as_str()), (Some(i), Some(-32602), Some("tool not found")), "{v}");
+            let note = json!({"jsonrpc":"2.0","method":"tools/call","params":{"_meta":meta,"name":name,"arguments":{}}});
+            let r = post(srv.addr, None, &h, &note).await;
+            assert_eq!(r.status, 202, "a notification is not answered");
+            assert_eq!(r.text().await, "");
+        }
+        assert_eq!(stats.services.load(Ordering::Relaxed), before, "rmcp made no handler (and cached no schema) for an unknown name");
+        // a known tool still reaches rmcp
+        let h = [("MCP-Protocol-Version", "2026-07-28"), ("Mcp-Method", "tools/call"), ("Mcp-Name", "command_list")];
+        let msg = json!({"jsonrpc":"2.0","id":99,"method":"tools/call","params":{"_meta":meta,"name":"command_list","arguments":{"filter":"razor"}}});
+        let v = post(srv.addr, None, &h, &msg).await.reply().await;
+        assert_eq!(v["result"]["isError"], false, "{v}");
+        assert!(stats.services.load(Ordering::Relaxed) > before);
+        // a session client (before 2026-07-28) gets the same wording from rmcp's tool router
+        let (sid, _) = init(srv.addr, &[]).await;
+        let v = call(srv.addr, &sid, 1, "no_such_tool", json!({})).await;
+        assert_eq!(v["error"]["message"], "tool not found", "{v}");
+    })
+    .await;
 }
 
 /// Hostile requests get an HTTP error and change nothing; the server keeps serving.
 #[tokio::test(flavor = "multi_thread")]
 async fn rejects_hostile_requests() {
+    within(async {
     let srv = Server::start(demo(), HttpOptions { allowed_origins: vec!["http://localhost:6274".into()], ..HttpOptions::default() }).await;
     let initialize = json!({"jsonrpc":"2.0","id":0,"method":"initialize","params":{"protocolVersion":"2025-06-18","capabilities":{},"clientInfo":{"name":"t","version":"1"}}});
     // DNS rebinding: a Host that isn't this server, or the right host on another port
@@ -417,6 +434,8 @@ async fn rejects_hostile_requests() {
     let (sid, _) = init(srv.addr, &[]).await;
     let r = call(srv.addr, &sid, 1, "command_list", json!({"filter": "razor"})).await;
     assert_eq!(r["result"]["isError"], false, "{r}");
+    })
+    .await;
 }
 
 /// Host, Origin, Accept and Content-Type are checked before the body is read: a refused request
@@ -424,46 +443,50 @@ async fn rejects_hostile_requests() {
 /// page cannot tell a parse error or a tool name from a refusal), and logged.
 #[tokio::test(flavor = "multi_thread")]
 async fn refusals_come_before_the_body_is_read() {
-    let (log, lines) = log_capture();
-    let srv = Server::start(demo(), HttpOptions { allowed_origins: vec!["http://localhost:6274".into()], log, ..HttpOptions::default() }).await;
-    let unknown_tool = json!({"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"probe_tool","arguments":{}}}).to_string();
-    let modern = ("MCP-Protocol-Version", "2026-07-28");
-    for body in ["{\"jsonrpc\": \"2.0\", \"id\": 5, BROKEN", unknown_tool.as_str()] {
-        let cases: [(&[(&str, &str)], u16); 4] = [
-            (&[ACCEPT, JSON, modern, ("Host", "evil.example:80")], 403),
-            (&[ACCEPT, JSON, modern, ("Origin", "http://evil.example")], 403),
-            (&[("Accept", "application/json"), JSON, modern], 406),
-            (&[ACCEPT, ("Content-Type", "text/plain"), modern], 415),
-        ];
-        for (headers, status) in cases {
-            // declares 4 MiB but sends a few bytes: an answer proves the body was not waited for
-            let r = send_declaring(srv.addr, "POST", headers, MAX_BODY, body).await;
-            assert_eq!(r.status, status, "{headers:?}");
-            assert!(r.header("content-type").is_some_and(|c| c.starts_with("text/plain")), "a plain refusal, not JSON-RPC: {headers:?}");
+    within(async {
+        let (log, lines) = log_capture();
+        let srv = Server::start(demo(), HttpOptions { allowed_origins: vec!["http://localhost:6274".into()], log, ..HttpOptions::default() }).await;
+        let unknown_tool = json!({"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"probe_tool","arguments":{}}}).to_string();
+        let modern = ("MCP-Protocol-Version", "2026-07-28");
+        for body in ["{\"jsonrpc\": \"2.0\", \"id\": 5, BROKEN", unknown_tool.as_str()] {
+            let cases: [(&[(&str, &str)], u16); 4] = [
+                (&[ACCEPT, JSON, modern, ("Host", "evil.example:80")], 403),
+                (&[ACCEPT, JSON, modern, ("Origin", "http://evil.example")], 403),
+                (&[("Accept", "application/json"), JSON, modern], 406),
+                (&[ACCEPT, ("Content-Type", "text/plain"), modern], 415),
+            ];
+            for (headers, status) in cases {
+                // declares 4 MiB but sends a few bytes: an answer proves the body was not waited for
+                let r = send_declaring(srv.addr, "POST", headers, MAX_BODY, body).await;
+                assert_eq!(r.status, status, "{headers:?}");
+                assert!(r.header("content-type").is_some_and(|c| c.starts_with("text/plain")), "a plain refusal, not JSON-RPC: {headers:?}");
+            }
         }
-    }
-    // the same bodies with acceptable headers: a parse error, and an in-band unknown tool
-    assert_eq!(send(srv.addr, "POST", &[ACCEPT, JSON], "{\"jsonrpc\": \"2.0\", \"id\": 5, BROKEN").await.status, 400);
-    let mut r = send(srv.addr, "POST", &[ACCEPT, JSON, modern, ("Mcp-Method", "tools/call"), ("Mcp-Name", "probe_tool")], &unknown_tool).await;
-    assert_eq!(r.next().await.unwrap()["error"]["message"], "tool not found");
-    let l = lines.lock().unwrap().join("\n");
-    for want in [
-        "refused POST from 127.0.0.1:",
-        "403 Forbidden: Host header is not allowed (Host \"evil.example:80\")",
-        "403 Forbidden: Origin header is not allowed (Origin \"http://evil.example\")",
-        "406 Not Acceptable",
-        "415 Unsupported Media Type",
-    ] {
-        assert!(l.contains(want), "log lacks {want:?}:\n{l}");
-    }
-    // one line per peer and reason: each case ran twice
-    assert_eq!(l.matches("406 Not Acceptable").count(), 1, "{l}");
+        // the same bodies with acceptable headers: a parse error, and an in-band unknown tool
+        assert_eq!(send(srv.addr, "POST", &[ACCEPT, JSON], "{\"jsonrpc\": \"2.0\", \"id\": 5, BROKEN").await.status, 400);
+        let mut r = send(srv.addr, "POST", &[ACCEPT, JSON, modern, ("Mcp-Method", "tools/call"), ("Mcp-Name", "probe_tool")], &unknown_tool).await;
+        assert_eq!(r.next().await.unwrap()["error"]["message"], "tool not found");
+        let l = lines.lock().unwrap().join("\n");
+        for want in [
+            "refused POST from 127.0.0.1:",
+            "403 Forbidden: Host header is not allowed (Host \"evil.example:80\")",
+            "403 Forbidden: Origin header is not allowed (Origin \"http://evil.example\")",
+            "406 Not Acceptable",
+            "415 Unsupported Media Type",
+        ] {
+            assert!(l.contains(want), "log lacks {want:?}:\n{l}");
+        }
+        // one line per peer and reason: each case ran twice
+        assert_eq!(l.matches("406 Not Acceptable").count(), 1, "{l}");
+    })
+    .await;
 }
 
 /// The bound address is an accepted `Host` too, so any loopback address works (127.0.0.2), and
 /// the list has no duplicates.
 #[tokio::test(flavor = "multi_thread")]
 async fn the_bound_address_is_an_accepted_host() {
+    within(async {
     let h = |a: &str, extra: &[&str]| accepted_hosts(a.parse().unwrap(), &extra.iter().map(|e| e.to_string()).collect::<Vec<_>>());
     assert!(h("127.0.0.2:9000", &[]).contains(&"127.0.0.2:9000".to_string()));
     assert!(h("192.168.1.5:9000", &[]).contains(&"192.168.1.5:9000".to_string()));
@@ -481,12 +504,15 @@ async fn the_bound_address_is_an_accepted_host() {
     let r = post(srv.addr, None, &[("Host", host.as_str())], &initialize).await;
     assert_eq!(r.status, 200);
     assert_eq!(post(srv.addr, None, &[("Host", "127.0.0.3:1")], &initialize).await.status, 403);
+    })
+    .await;
 }
 
 /// One server on several listeners (`--http localhost:P` listens on 127.0.0.1:P and [::1]:P):
 /// each answers, with its own address as an accepted `Host`, and all close when it stops.
 #[tokio::test(flavor = "multi_thread")]
 async fn one_server_on_several_listeners() {
+    within(async {
     let first = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let port = first.local_addr().unwrap().port();
     // [::1] on the same port where the system has IPv6, else another loopback port
@@ -516,6 +542,8 @@ async fn one_server_on_several_listeners() {
     // no listener: an error, not a server that never answers
     let none = FilmcraftMcp::headless(demo()).serve_http_listeners(Vec::new(), HttpOptions::default(), async {}).await;
     assert!(matches!(none, Err(AutomationError::BadRequest(_))), "{none:?}");
+    })
+    .await;
 }
 
 #[test]
@@ -558,6 +586,7 @@ fn allowed_origins_and_hosts_are_checked() {
 /// every answer to it carries the CORS headers, errors included. Any other origin gets none.
 #[tokio::test(flavor = "multi_thread")]
 async fn cors_for_listed_origins_only() {
+    within(async {
     let token = "cors-test-token-0123456789-abcdefgh";
     let bearer = format!("Bearer {token}");
     let page = "http://localhost:6274";
@@ -601,12 +630,15 @@ async fn cors_for_listed_origins_only() {
     // without an Origin it is no preflight: the token, then rmcp's 405
     assert_eq!(send(srv.addr, "OPTIONS", &[], "").await.status, 401);
     assert_eq!(send(srv.addr, "OPTIONS", &[("Authorization", &bearer)], "").await.status, 405);
+    })
+    .await;
 }
 
 /// Refused requests are logged with the peer's address, at most once per peer and reason every
 /// few seconds, and never with the token (right or wrong).
 #[tokio::test(flavor = "multi_thread")]
 async fn refusals_are_logged_without_credentials() {
+    within(async {
     let (log, lines) = log_capture();
     let token = "log-test-token-0123456789-abcdefgh";
     let srv = Server::start(demo(), HttpOptions { token: Some(token.into()), log, ..HttpOptions::default() }).await;
@@ -620,6 +652,8 @@ async fn refusals_are_logged_without_credentials() {
     assert_eq!(l.matches("401 Unauthorized").count(), 1, "rate limited: {l}");
     assert!(l.contains("refused POST from 127.0.0.1:") && l.contains("403 Forbidden: Host header is not allowed"), "{l}");
     assert!(!l.contains(token) && !l.contains("wrong-secret-guess"), "credentials leaked: {l}");
+    })
+    .await;
 }
 
 /// One address cannot take every connection, with or without credentials: past its share (or
@@ -628,6 +662,7 @@ async fn refusals_are_logged_without_credentials() {
 /// a timeout.
 #[tokio::test(flavor = "multi_thread")]
 async fn connections_are_capped_per_peer_and_timed_out() {
+    within(async {
     let (log, lines) = log_capture();
     let limits = Limits {
         connections: 5,
@@ -692,11 +727,14 @@ async fn connections_are_capped_per_peer_and_timed_out() {
     let l = lines.lock().unwrap().join("\n");
     assert!(l.contains("refused a connection from 127.0.0.1:") && l.contains("503: too many connections from this address"), "{l}");
     assert!(l.contains("408 Request Timeout"), "{l}");
+    })
+    .await;
 }
 
 /// With a token, every request needs `Authorization: Bearer <token>`, checked first.
 #[tokio::test(flavor = "multi_thread")]
 async fn bearer_token_is_required() {
+    within(async {
     let token = "s3cret-token-0123456789";
     let srv = Server::start(demo(), HttpOptions { token: Some(token.into()), ..HttpOptions::default() }).await;
     let initialize = json!({"jsonrpc":"2.0","id":0,"method":"initialize","params":{"protocolVersion":"2025-06-18","capabilities":{},"clientInfo":{"name":"t","version":"1"}}});
@@ -722,6 +760,8 @@ async fn bearer_token_is_required() {
         // the session id alone is not a credential
         assert_eq!(post(srv.addr, Some(&sid), &[], &msg).await.status, 401);
     }
+    })
+    .await;
 }
 
 /// A peer that fails authentication too often is refused for a while (429 with Retry-After),
@@ -729,6 +769,7 @@ async fn bearer_token_is_required() {
 /// are not affected, and the block ends.
 #[tokio::test(flavor = "multi_thread")]
 async fn failed_authentications_get_a_peer_refused_for_a_while() {
+    within(async {
     let (log, lines) = log_capture();
     let token = "backoff-test-token-0123456789-abcdef";
     let bearer = format!("Bearer {token}");
@@ -754,6 +795,8 @@ async fn failed_authentications_get_a_peer_refused_for_a_while() {
     assert!(l.contains("too many failed authentications from 127.0.0.1: refusing it for a while"), "{l}");
     assert!(l.contains("429 Too Many Requests"), "{l}");
     assert!(!l.contains(token), "{l}");
+    })
+    .await;
 }
 
 fn ping(id: u64) -> Value {
@@ -772,6 +815,7 @@ async fn open_stream(addr: SocketAddr, sid: &str) -> Reply {
 /// when every session has something in flight does `initialize` get 503.
 #[tokio::test(flavor = "multi_thread")]
 async fn sessions_are_capped_and_idle_ones_make_room() {
+    within(async {
     let (log, lines) = log_capture();
     let srv = Server::start_limited(demo(), HttpOptions { log, ..HttpOptions::default() }, Limits { sessions: 3, ..Limits::default() }).await;
     let initialize = json!({"jsonrpc":"2.0","id":0,"method":"initialize","params":{"protocolVersion":"2025-06-18","capabilities":{},"clientInfo":{"name":"t","version":"1"}}});
@@ -812,25 +856,30 @@ async fn sessions_are_capped_and_idle_ones_make_room() {
     let l = lines.lock().unwrap().join("\n");
     assert!(l.contains("closed the least recently used idle MCP session"), "{l}");
     assert!(l.contains("every session has a call in flight"), "{l}");
+    })
+    .await;
 }
 
 /// A session nobody uses (a client that went away without DELETE) is closed after
 /// `session_idle`; a session with something in flight (here its GET stream) is kept.
 #[tokio::test(flavor = "multi_thread")]
 async fn idle_sessions_are_closed_but_busy_ones_kept() {
-    let (log, lines) = log_capture();
-    let opts = HttpOptions { session_idle: Some(Duration::from_millis(400)), log, ..HttpOptions::default() };
-    let srv = Server::start_limited(demo(), opts, Limits { reap_every: Duration::from_millis(50), ..Limits::default() }).await;
-    let (idle, _) = init(srv.addr, &[]).await;
-    let (busy, _) = init(srv.addr, &[]).await;
-    let stream = open_stream(srv.addr, &busy).await;
-    tokio::time::sleep(Duration::from_millis(1000)).await;
-    assert_eq!(post(srv.addr, Some(&idle), &[], &ping(1)).await.status, 404, "the idle session was closed");
-    assert_eq!(post(srv.addr, Some(&busy), &[], &ping(2)).await.status, 200, "the one with a stream open was kept");
-    drop(stream);
-    tokio::time::sleep(Duration::from_millis(1000)).await;
-    assert_eq!(post(srv.addr, Some(&busy), &[], &ping(3)).await.status, 404, "and closed once idle");
-    assert!(lines.lock().unwrap().iter().any(|l| l.contains("MCP session(s) unused for")), "{:?}", lines.lock().unwrap());
+    within(async {
+        let (log, lines) = log_capture();
+        let opts = HttpOptions { session_idle: Some(Duration::from_millis(400)), log, ..HttpOptions::default() };
+        let srv = Server::start_limited(demo(), opts, Limits { reap_every: Duration::from_millis(50), ..Limits::default() }).await;
+        let (idle, _) = init(srv.addr, &[]).await;
+        let (busy, _) = init(srv.addr, &[]).await;
+        let stream = open_stream(srv.addr, &busy).await;
+        tokio::time::sleep(Duration::from_millis(1000)).await;
+        assert_eq!(post(srv.addr, Some(&idle), &[], &ping(1)).await.status, 404, "the idle session was closed");
+        assert_eq!(post(srv.addr, Some(&busy), &[], &ping(2)).await.status, 200, "the one with a stream open was kept");
+        drop(stream);
+        tokio::time::sleep(Duration::from_millis(1000)).await;
+        assert_eq!(post(srv.addr, Some(&busy), &[], &ping(3)).await.status, 404, "and closed once idle");
+        assert!(lines.lock().unwrap().iter().any(|l| l.contains("MCP session(s) unused for")), "{:?}", lines.lock().unwrap());
+    })
+    .await;
 }
 
 /// A call that sends nothing for far longer than `session_idle` (an export without a
@@ -839,28 +888,31 @@ async fn idle_sessions_are_closed_but_busy_ones_kept() {
 /// used to leave the first call's stream open forever); other ids can, and it is free again after.
 #[tokio::test(flavor = "multi_thread")]
 async fn a_long_quiet_call_outlives_the_idle_timeout() {
-    let dir = std::env::temp_dir().join(format!("filmcraft-mcp-http-quiet-{}", std::process::id()));
-    std::fs::create_dir_all(&dir).unwrap();
-    let out = dir.join("quiet.mp4");
-    let idle = Duration::from_millis(200);
-    let opts = HttpOptions { session_idle: Some(idle), ..HttpOptions::default() };
-    let srv = Server::start_limited(demo(), opts, Limits { reap_every: Duration::from_millis(25), ..Limits::default() }).await;
-    let (sid, _) = init(srv.addr, &[]).await;
-    let t0 = std::time::Instant::now();
-    let mut r = post(srv.addr, Some(&sid), &[], &export_call(7, &out.to_string_lossy(), 4.0, None, None)).await;
-    assert_eq!(r.status, 200);
-    tokio::time::sleep(Duration::from_millis(50)).await;
-    let mut dup = post(srv.addr, Some(&sid), &[], &ping(7)).await;
-    assert_eq!(dup.status, 400);
-    let v = dup.next().await.unwrap();
-    assert_eq!((v["id"].as_u64(), v["error"]["code"].as_i64()), (Some(7), Some(-32600)), "{v}");
-    assert_eq!(post(srv.addr, Some(&sid), &[], &ping(8)).await.reply().await["id"], 8);
-    let done = r.reply().await;
-    assert_eq!((done["id"].as_u64(), &done["result"]["isError"]), (Some(7), &json!(false)), "{done}");
-    assert!(t0.elapsed() > idle * 3, "the export ran for several idle periods: {:?}", t0.elapsed());
-    assert!(out.exists());
-    assert_eq!(post(srv.addr, Some(&sid), &[], &ping(7)).await.reply().await["id"], 7, "the id is free again");
-    let _ = std::fs::remove_dir_all(&dir);
+    within(async {
+        let dir = std::env::temp_dir().join(format!("filmcraft-mcp-http-quiet-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let out = dir.join("quiet.mp4");
+        let idle = Duration::from_millis(200);
+        let opts = HttpOptions { session_idle: Some(idle), ..HttpOptions::default() };
+        let srv = Server::start_limited(demo(), opts, Limits { reap_every: Duration::from_millis(25), ..Limits::default() }).await;
+        let (sid, _) = init(srv.addr, &[]).await;
+        let t0 = std::time::Instant::now();
+        let mut r = post(srv.addr, Some(&sid), &[], &export_call(7, &out.to_string_lossy(), 4.0, None, None)).await;
+        assert_eq!(r.status, 200);
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        let mut dup = post(srv.addr, Some(&sid), &[], &ping(7)).await;
+        assert_eq!(dup.status, 400);
+        let v = dup.next().await.unwrap();
+        assert_eq!((v["id"].as_u64(), v["error"]["code"].as_i64()), (Some(7), Some(-32600)), "{v}");
+        assert_eq!(post(srv.addr, Some(&sid), &[], &ping(8)).await.reply().await["id"], 8);
+        let done = r.reply().await;
+        assert_eq!((done["id"].as_u64(), &done["result"]["isError"]), (Some(7), &json!(false)), "{done}");
+        assert!(t0.elapsed() > idle * 3, "the export ran for several idle periods: {:?}", t0.elapsed());
+        assert!(out.exists());
+        assert_eq!(post(srv.addr, Some(&sid), &[], &ping(7)).await.reply().await["id"], 7, "the id is free again");
+        let _ = std::fs::remove_dir_all(&dir);
+    })
+    .await;
 }
 
 #[test]
@@ -872,21 +924,24 @@ fn rmcp_idle_timeout_is_off() {
 /// instead of closing the connection unanswered.
 #[tokio::test]
 async fn a_panic_is_answered_with_500() {
-    let (sink, lines) = log_capture();
-    let log = limits::Log::new(sink, Duration::from_secs(10));
-    let peer: SocketAddr = "127.0.0.1:5555".parse().unwrap();
-    let ok = gate::or_500(&log, peer, &http::Method::GET, "/mcp", async { gate::text(http::StatusCode::OK, "fine") }).await;
-    assert_eq!(ok.status(), 200);
-    let boom = async {
-        if peer.port() == 5555 {
-            panic!("a bug");
-        }
-        gate::text(http::StatusCode::OK, "fine")
-    };
-    let r = gate::or_500(&log, peer, &http::Method::POST, "/mcp", boom).await;
-    assert_eq!(r.status(), 500);
-    let l = lines.lock().unwrap().join("\n");
-    assert!(l.contains("internal error (a panic) while serving POST /mcp from 127.0.0.1:5555; answered 500"), "{l}");
+    within(async {
+        let (sink, lines) = log_capture();
+        let log = limits::Log::new(sink, Duration::from_secs(10));
+        let peer: SocketAddr = "127.0.0.1:5555".parse().unwrap();
+        let ok = gate::or_500(&log, peer, &http::Method::GET, "/mcp", async { gate::text(http::StatusCode::OK, "fine") }).await;
+        assert_eq!(ok.status(), 200);
+        let boom = async {
+            if peer.port() == 5555 {
+                panic!("a bug");
+            }
+            gate::text(http::StatusCode::OK, "fine")
+        };
+        let r = gate::or_500(&log, peer, &http::Method::POST, "/mcp", boom).await;
+        assert_eq!(r.status(), 500);
+        let l = lines.lock().unwrap().join("\n");
+        assert!(l.contains("internal error (a panic) while serving POST /mcp from 127.0.0.1:5555; answered 500"), "{l}");
+    })
+    .await;
 }
 
 #[test]
@@ -934,57 +989,67 @@ fn bearer_header_matching() {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn a_non_loopback_bind_needs_a_token() {
-    let m = FilmcraftMcp::headless(Session::default());
-    let r = m.serve_http("0.0.0.0:0".parse().unwrap(), HttpOptions::default(), async {}).await;
-    assert!(matches!(r, Err(AutomationError::BadRequest(_))), "{r:?}");
-    let m = FilmcraftMcp::headless(Session::default());
-    let r = m.serve_http("0.0.0.0:0".parse().unwrap(), HttpOptions { token: Some("only-20-characters-x".into()), ..HttpOptions::default() }, async {}).await;
-    assert!(matches!(r, Err(AutomationError::BadRequest(_))), "{r:?}");
-    let m = FilmcraftMcp::headless(Session::default());
-    let r = m.serve_http("127.0.0.1:0".parse().unwrap(), HttpOptions { token: Some("bad token".into()), ..HttpOptions::default() }, async {}).await;
-    assert!(matches!(r, Err(AutomationError::BadRequest(_))), "{r:?}");
+    within(async {
+        let m = FilmcraftMcp::headless(Session::default());
+        let r = m.serve_http("0.0.0.0:0".parse().unwrap(), HttpOptions::default(), async {}).await;
+        assert!(matches!(r, Err(AutomationError::BadRequest(_))), "{r:?}");
+        let m = FilmcraftMcp::headless(Session::default());
+        let r =
+            m.serve_http("0.0.0.0:0".parse().unwrap(), HttpOptions { token: Some("only-20-characters-x".into()), ..HttpOptions::default() }, async {}).await;
+        assert!(matches!(r, Err(AutomationError::BadRequest(_))), "{r:?}");
+        let m = FilmcraftMcp::headless(Session::default());
+        let r = m.serve_http("127.0.0.1:0".parse().unwrap(), HttpOptions { token: Some("bad token".into()), ..HttpOptions::default() }, async {}).await;
+        assert!(matches!(r, Err(AutomationError::BadRequest(_))), "{r:?}");
+    })
+    .await;
 }
 
 /// Shutdown ends the accept loop and returns; the port is closed.
 #[tokio::test(flavor = "multi_thread")]
 async fn shutdown_returns() {
-    let mut srv = Server::start(demo(), HttpOptions::default()).await;
-    let (_sid, _) = init(srv.addr, &[]).await;
-    let _ = srv.stop.take().unwrap().send(Stop::Graceful);
-    let r = tokio::time::timeout(Duration::from_secs(20), &mut srv.done).await.expect("shut down in time").unwrap();
-    assert!(r.is_ok(), "{r:?}");
-    assert!(TcpStream::connect(srv.addr).await.is_err());
+    within(async {
+        let mut srv = Server::start(demo(), HttpOptions::default()).await;
+        let (_sid, _) = init(srv.addr, &[]).await;
+        let _ = srv.stop.take().unwrap().send(Stop::Graceful);
+        let r = tokio::time::timeout(Duration::from_secs(20), &mut srv.done).await.expect("shut down in time").unwrap();
+        assert!(r.is_ok(), "{r:?}");
+        assert!(TcpStream::connect(srv.addr).await.is_err());
+    })
+    .await;
 }
 
 /// Shutdown cancels a session's export and deletes its partial file, and the port closes as soon
 /// as shutdown starts, while the server still waits for open connections.
 #[tokio::test(flavor = "multi_thread")]
 async fn shutdown_deletes_partial_exports_and_closes_the_port_at_once() {
-    let dir = std::env::temp_dir().join(format!("filmcraft-mcp-http-shutdown-{}", std::process::id()));
-    std::fs::create_dir_all(&dir).unwrap();
-    let out = dir.join("partial.mp4");
-    let mut srv = Server::start(demo(), HttpOptions::default()).await;
-    let (sid, _) = init(srv.addr, &[]).await;
-    let mut r = post(srv.addr, Some(&sid), &[], &export_call(1, &out.to_string_lossy(), 30.0, Some(json!("p")), None)).await;
-    loop {
-        let m = tokio::time::timeout(Duration::from_secs(30), r.next()).await.expect("progress in time").expect("progress");
-        assert_ne!(m["id"], 1, "finished before the shutdown: {m}");
-        if m["method"] == "notifications/progress" {
-            break;
+    within(async {
+        let dir = std::env::temp_dir().join(format!("filmcraft-mcp-http-shutdown-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let out = dir.join("partial.mp4");
+        let mut srv = Server::start(demo(), HttpOptions::default()).await;
+        let (sid, _) = init(srv.addr, &[]).await;
+        let mut r = post(srv.addr, Some(&sid), &[], &export_call(1, &out.to_string_lossy(), 30.0, Some(json!("p")), None)).await;
+        loop {
+            let m = tokio::time::timeout(Duration::from_secs(30), r.next()).await.expect("progress in time").expect("progress");
+            assert_ne!(m["id"], 1, "finished before the shutdown: {m}");
+            if m["method"] == "notifications/progress" {
+                break;
+            }
         }
-    }
-    assert_eq!(srv.mcp.long_calls.count(), 1);
-    // a connection that sends nothing keeps the server in its grace period for a while
-    let _idle = TcpStream::connect(srv.addr).await.unwrap();
-    let _ = srv.stop.take().unwrap().send(Stop::Graceful);
-    tokio::time::sleep(Duration::from_millis(300)).await;
-    assert!(TcpStream::connect(srv.addr).await.is_err(), "the port closes when shutdown starts");
-    assert!(!srv.done.is_finished(), "still waiting for the open connection");
-    let r = tokio::time::timeout(Duration::from_secs(20), &mut srv.done).await.expect("shut down in time").unwrap();
-    assert!(r.is_ok(), "{r:?}");
-    assert!(!out.exists(), "the partial export is deleted");
-    assert_eq!(srv.mcp.long_calls.count(), 0);
-    let _ = std::fs::remove_dir_all(&dir);
+        assert_eq!(srv.mcp.long_calls.count(), 1);
+        // a connection that sends nothing keeps the server in its grace period for a while
+        let _idle = TcpStream::connect(srv.addr).await.unwrap();
+        let _ = srv.stop.take().unwrap().send(Stop::Graceful);
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        assert!(TcpStream::connect(srv.addr).await.is_err(), "the port closes when shutdown starts");
+        assert!(!srv.done.is_finished(), "still waiting for the open connection");
+        let r = tokio::time::timeout(Duration::from_secs(20), &mut srv.done).await.expect("shut down in time").unwrap();
+        assert!(r.is_ok(), "{r:?}");
+        assert!(!out.exists(), "the partial export is deleted");
+        assert_eq!(srv.mcp.long_calls.count(), 0);
+        let _ = std::fs::remove_dir_all(&dir);
+    })
+    .await;
 }
 
 /// When the process is about to be killed (Windows: the console closing, logoff, shutdown), the
@@ -992,28 +1057,31 @@ async fn shutdown_deletes_partial_exports_and_closes_the_port_at_once() {
 /// a connection is still open.
 #[tokio::test(flavor = "multi_thread")]
 async fn a_hurried_stop_deletes_partial_exports_within_its_grace() {
-    let dir = std::env::temp_dir().join(format!("filmcraft-mcp-http-hurried-{}", std::process::id()));
-    std::fs::create_dir_all(&dir).unwrap();
-    let out = dir.join("partial.mp4");
-    let limits = Limits { hurried_grace: Duration::from_millis(1500), ..Limits::default() };
-    let mut srv = Server::start_limited(demo(), HttpOptions::default(), limits).await;
-    let (sid, _) = init(srv.addr, &[]).await;
-    let mut r = post(srv.addr, Some(&sid), &[], &export_call(1, &out.to_string_lossy(), 30.0, Some(json!("h")), None)).await;
-    loop {
-        let m = r.next().await.expect("progress");
-        assert_ne!(m["id"], 1, "finished before the stop: {m}");
-        if m["method"] == "notifications/progress" {
-            break;
+    within(async {
+        let dir = std::env::temp_dir().join(format!("filmcraft-mcp-http-hurried-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let out = dir.join("partial.mp4");
+        let limits = Limits { hurried_grace: Duration::from_millis(1500), ..Limits::default() };
+        let mut srv = Server::start_limited(demo(), HttpOptions::default(), limits).await;
+        let (sid, _) = init(srv.addr, &[]).await;
+        let mut r = post(srv.addr, Some(&sid), &[], &export_call(1, &out.to_string_lossy(), 30.0, Some(json!("h")), None)).await;
+        loop {
+            let m = r.next().await.expect("progress");
+            assert_ne!(m["id"], 1, "finished before the stop: {m}");
+            if m["method"] == "notifications/progress" {
+                break;
+            }
         }
-    }
-    let _idle = TcpStream::connect(srv.addr).await.unwrap(); // would hold a graceful stop for 5 s
-    let t0 = std::time::Instant::now();
-    let _ = srv.stop.take().unwrap().send(Stop::Hurried);
-    let r = tokio::time::timeout(Duration::from_secs(20), &mut srv.done).await.expect("stopped").unwrap();
-    assert!(r.is_ok(), "{r:?}");
-    assert!(t0.elapsed() < Duration::from_secs(3), "within the hurried grace: {:?}", t0.elapsed());
-    assert!(!out.exists(), "the partial export is deleted");
-    let _ = std::fs::remove_dir_all(&dir);
+        let _idle = TcpStream::connect(srv.addr).await.unwrap(); // would hold a graceful stop for 5 s
+        let t0 = std::time::Instant::now();
+        let _ = srv.stop.take().unwrap().send(Stop::Hurried);
+        let r = tokio::time::timeout(Duration::from_secs(20), &mut srv.done).await.expect("stopped").unwrap();
+        assert!(r.is_ok(), "{r:?}");
+        assert!(t0.elapsed() < Duration::from_secs(3), "within the hurried grace: {:?}", t0.elapsed());
+        assert!(!out.exists(), "the partial export is deleted");
+        let _ = std::fs::remove_dir_all(&dir);
+    })
+    .await;
 }
 
 fn export_call(id: u64, path: &str, seconds: f64, token: Option<Value>, meta: Option<&Value>) -> Value {
@@ -1055,86 +1123,92 @@ async fn wait_gone(path: &std::path::Path) {
 /// either way the export stops and its partial file is deleted.
 #[tokio::test(flavor = "multi_thread")]
 async fn export_progress_and_cancel_over_http() {
-    let dir = std::env::temp_dir().join(format!("filmcraft-mcp-http-{}", std::process::id()));
-    std::fs::create_dir_all(&dir).unwrap();
-    let srv = Server::start(demo(), HttpOptions::default()).await;
-    let (sid, _) = init(srv.addr, &[]).await;
-    let path = |n: &str| dir.join(n).to_string_lossy().to_string();
+    within(async {
+        let dir = std::env::temp_dir().join(format!("filmcraft-mcp-http-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let srv = Server::start(demo(), HttpOptions::default()).await;
+        let (sid, _) = init(srv.addr, &[]).await;
+        let path = |n: &str| dir.join(n).to_string_lossy().to_string();
 
-    // progress, then the result, on one stream
-    let mut done = None;
-    let mut notes = 0;
-    for (i, seconds) in [2.0, 8.0, 20.0].into_iter().enumerate() {
-        let name = format!("a{i}.mp4");
-        let mut r = post(srv.addr, Some(&sid), &[], &export_call(10 + i as u64, &path(&name), seconds, Some(json!("tok")), None)).await;
-        notes = 0;
-        let m = loop {
-            let m = r.next().await.expect("progress or result");
-            if m["method"] == "notifications/progress" {
-                assert_eq!(m["params"]["progressToken"], "tok", "{m}");
-                notes += 1;
-            } else {
-                break m;
+        // progress, then the result, on one stream
+        let mut done = None;
+        let mut notes = 0;
+        for (i, seconds) in [2.0, 8.0, 20.0].into_iter().enumerate() {
+            let name = format!("a{i}.mp4");
+            let mut r = post(srv.addr, Some(&sid), &[], &export_call(10 + i as u64, &path(&name), seconds, Some(json!("tok")), None)).await;
+            notes = 0;
+            let m = loop {
+                let m = r.next().await.expect("progress or result");
+                if m["method"] == "notifications/progress" {
+                    assert_eq!(m["params"]["progressToken"], "tok", "{m}");
+                    notes += 1;
+                } else {
+                    break m;
+                }
+            };
+            assert_eq!(m["result"]["isError"], false, "{m}");
+            assert!(dir.join(&name).exists());
+            done = Some(m);
+            if notes >= 2 {
+                break;
             }
-        };
-        assert_eq!(m["result"]["isError"], false, "{m}");
-        assert!(dir.join(&name).exists());
-        done = Some(m);
-        if notes >= 2 {
-            break;
         }
-    }
-    assert!(notes >= 2 && done.is_some(), "{notes} progress notifications");
+        assert!(notes >= 2 && done.is_some(), "{notes} progress notifications");
 
-    // session client: cancel by notification
-    let b = path("b.mp4");
-    let mut r = post(srv.addr, Some(&sid), &[], &export_call(20, &b, 30.0, Some(json!(7)), None)).await;
-    loop {
-        let m = r.next().await.expect("progress");
-        assert_ne!(m["id"], 20, "finished before the cancel: {m}");
-        if m["method"] == "notifications/progress" {
-            break;
+        // session client: cancel by notification
+        let b = path("b.mp4");
+        let mut r = post(srv.addr, Some(&sid), &[], &export_call(20, &b, 30.0, Some(json!(7)), None)).await;
+        loop {
+            let m = r.next().await.expect("progress");
+            assert_ne!(m["id"], 20, "finished before the cancel: {m}");
+            if m["method"] == "notifications/progress" {
+                break;
+            }
         }
-    }
-    let c = post(srv.addr, Some(&sid), &[], &json!({"jsonrpc":"2.0","method":"notifications/cancelled","params":{"requestId":20}})).await;
-    assert_eq!(c.status, 202);
-    wait_gone(std::path::Path::new(&b)).await;
-    let jobs = last_job_once_finished(srv.addr, &sid, 21).await;
-    assert_eq!(jobs.as_array().and_then(|a| a.last()).map(|j| j["result"]["error"].clone()), Some(json!("cancelled")), "{jobs}");
-    // no response for a cancelled request
-    while let Some(m) = r.next().await {
-        assert_ne!(m["id"], 20, "{m}");
-    }
+        let c = post(srv.addr, Some(&sid), &[], &json!({"jsonrpc":"2.0","method":"notifications/cancelled","params":{"requestId":20}})).await;
+        assert_eq!(c.status, 202);
+        wait_gone(std::path::Path::new(&b)).await;
+        let jobs = last_job_once_finished(srv.addr, &sid, 21).await;
+        assert_eq!(jobs.as_array().and_then(|a| a.last()).map(|j| j["result"]["error"].clone()), Some(json!("cancelled")), "{jobs}");
+        // no response for a cancelled request
+        while let Some(m) = r.next().await {
+            assert_ne!(m["id"], 20, "{m}");
+        }
 
-    // 2026-07-28 client: cancel by closing the stream
-    let meta = json!({
-        "io.modelcontextprotocol/protocolVersion": "2026-07-28",
-        "io.modelcontextprotocol/clientInfo": {"name": "t", "version": "1"},
-        "io.modelcontextprotocol/clientCapabilities": {},
-    });
-    let c = path("c.mp4");
-    let h = [("MCP-Protocol-Version", "2026-07-28"), ("Mcp-Method", "tools/call"), ("Mcp-Name", "command_run")];
-    let mut r = post(srv.addr, None, &h, &export_call(30, &c, 30.0, Some(json!("t2")), Some(&meta))).await;
-    assert_eq!(r.status, 200);
-    loop {
-        let m = r.next().await.expect("progress");
-        assert_ne!(m["id"], 30, "finished before the disconnect: {m}");
-        if m["method"] == "notifications/progress" {
-            break;
+        // 2026-07-28 client: cancel by closing the stream
+        let meta = json!({
+            "io.modelcontextprotocol/protocolVersion": "2026-07-28",
+            "io.modelcontextprotocol/clientInfo": {"name": "t", "version": "1"},
+            "io.modelcontextprotocol/clientCapabilities": {},
+        });
+        let c = path("c.mp4");
+        let h = [("MCP-Protocol-Version", "2026-07-28"), ("Mcp-Method", "tools/call"), ("Mcp-Name", "command_run")];
+        let mut r = post(srv.addr, None, &h, &export_call(30, &c, 30.0, Some(json!("t2")), Some(&meta))).await;
+        assert_eq!(r.status, 200);
+        loop {
+            let m = r.next().await.expect("progress");
+            assert_ne!(m["id"], 30, "finished before the disconnect: {m}");
+            if m["method"] == "notifications/progress" {
+                break;
+            }
         }
-    }
-    drop(r);
-    wait_gone(std::path::Path::new(&c)).await;
-    let jobs = last_job_once_finished(srv.addr, &sid, 31).await;
-    assert_eq!(jobs.as_array().and_then(|a| a.last()).map(|j| j["result"]["error"].clone()), Some(json!("cancelled")), "{jobs}");
-    let _ = std::fs::remove_dir_all(&dir);
+        drop(r);
+        wait_gone(std::path::Path::new(&c)).await;
+        let jobs = last_job_once_finished(srv.addr, &sid, 31).await;
+        assert_eq!(jobs.as_array().and_then(|a| a.last()).map(|j| j["result"]["error"].clone()), Some(json!("cancelled")), "{jobs}");
+        let _ = std::fs::remove_dir_all(&dir);
+    })
+    .await;
 }
 
 /// Methods the endpoint doesn't serve get 405 with a reason.
 #[tokio::test(flavor = "multi_thread")]
 async fn other_methods_get_405() {
-    let srv = Server::start(demo(), HttpOptions::default()).await;
-    let r = send(srv.addr, "PUT", &[], "").await;
-    assert_eq!(r.status, 405);
-    assert!(r.text().await.contains("Method Not Allowed"));
+    within(async {
+        let srv = Server::start(demo(), HttpOptions::default()).await;
+        let r = send(srv.addr, "PUT", &[], "").await;
+        assert_eq!(r.status, 405);
+        assert!(r.text().await.contains("Method Not Allowed"));
+    })
+    .await;
 }
