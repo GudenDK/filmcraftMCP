@@ -1761,6 +1761,123 @@ async fn a_stop_cancels_exports_started_without_wait() {
     .await;
 }
 
+/// A `command_batch` step that exports with `wait: true` is a long call, as one from `command_run`
+/// is: it reports progress (on through the batch's steps), the engine is free for other calls
+/// while it encodes, and a stop cancels it and deletes its partial file at once. It used to run
+/// the whole encode holding the engine's lock, uncancellable, and a stop left its truncated file
+/// under the name the client asked for.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_batch_export_that_waits_is_a_long_call() {
+    within(async {
+        let dir = crate::TestDir::new("http-batch-wait");
+        let (short, long) = (dir.join("short.mp4"), dir.join("long.mp4"));
+        let mut srv = Server::start(demo(), HttpOptions::default()).await;
+        let (sid, _) = init(srv.addr, &[]).await;
+        let step = |path: &std::path::Path, seconds: f64| {
+            let params = export_call(0, &path.to_string_lossy(), seconds, None, None)["params"]["arguments"]["params"].clone();
+            json!({"id": "file.exportMedia", "params": params})
+        };
+        // the result of a whole one is a blocking export's
+        let r = tool_json(&call(srv.addr, &sid, 1, "command_batch", json!({"steps": [step(&short, 0.25)]})).await);
+        let done = &r["results"][0]["result"];
+        assert_eq!((&r["completed"], &done["path"]), (&json!(1), &json!(short.to_string_lossy())), "{r}");
+        assert!(done["result"]["frames"].as_u64().is_some_and(|f| f > 0) && done["offlineMedia"].is_array(), "{r}");
+        assert!(short.exists());
+        std::fs::remove_file(&short).unwrap();
+        let steps = json!({"steps": [{"id": "playhead.set", "params": {"seconds": 0.5}}, step(&short, 0.5), step(&long, 30.0)]});
+        let batch = json!({"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"command_batch","arguments":steps,"_meta":{"progressToken":"b"}}});
+        let mut r = post(srv.addr, Some(&sid), &[], &batch).await;
+        // progress only ever increases, through both exports
+        let (mut last, mut totals) = (0.0, Vec::new());
+        while totals.len() < 2 || !long.exists() {
+            let m = r.next().await.expect("progress");
+            assert_ne!(m["id"], 2, "no progress, or finished before the stop: {m}");
+            assert_eq!(m["method"], "notifications/progress", "{m}");
+            let (p, t) = (m["params"]["progress"].as_f64().unwrap(), m["params"]["total"].as_f64().unwrap());
+            assert!(p > last && t >= p, "{m}");
+            last = p;
+            if !totals.contains(&t.to_bits()) {
+                totals.push(t.to_bits());
+            }
+        }
+        assert!(short.exists(), "the first export finished");
+        assert_eq!(srv.mcp.long_calls.count(), 1);
+        // the engine is free while it encodes: another call is answered at once
+        let t = std::time::Instant::now();
+        let jobs = tool_json(&call(srv.addr, &sid, 3, "command_run", json!({"id": "jobs.list"})).await);
+        assert!(t.elapsed() < Duration::from_secs(2), "the engine was busy for {:?}", t.elapsed());
+        assert_eq!(jobs.as_array().and_then(|a| a.last()).map(|j| j["finished"].clone()), Some(json!(false)), "{jobs}");
+        let _ = srv.stop.take().unwrap().send(Stop::Graceful);
+        cancel_requested_within(&srv.mcp, 2, Duration::from_secs(1)).await;
+        let stopped = tokio::time::timeout(Duration::from_secs(20), &mut srv.done).await.expect("stopped").unwrap();
+        assert!(stopped.is_ok(), "{stopped:?}");
+        assert!(!long.exists(), "the partial export is deleted");
+        assert!(short.exists(), "the finished one is kept");
+        let jobs = srv.mcp.run("jobs.list", json!({})).await.unwrap();
+        let errors: Vec<Value> = jobs.as_array().unwrap().iter().map(|j| j["result"]["error"].clone()).collect();
+        assert_eq!(errors, [Value::Null, Value::Null, json!("cancelled")], "{jobs}");
+        drop(r);
+    })
+    .await;
+}
+
+/// A stop that comes while an export's call waits for the engine (another call holds it, such as
+/// an export that waits in a batch) returns at once: the call starts no export once the engine is
+/// free. The stop used to wait for the engine, as long as its whole grace.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_stop_does_not_wait_for_an_export_that_waits_for_the_engine() {
+    within(async {
+        let dir = crate::TestDir::new("http-waits-for-engine");
+        let out = dir.join("never.mp4");
+        let mut srv = Server::start(demo(), HttpOptions::default()).await;
+        let (sid, _) = init(srv.addr, &[]).await;
+        let session = srv.mcp.headless_session().unwrap();
+        let (locked, is_locked) = tokio::sync::oneshot::channel();
+        let busy = tokio::task::spawn_blocking(move || {
+            let _busy = session.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+            let _ = locked.send(());
+            std::thread::sleep(Duration::from_secs(5));
+        });
+        is_locked.await.unwrap();
+        let r = post(srv.addr, Some(&sid), &[], &export_call(1, &out.to_string_lossy(), 30.0, Some(json!("w")), None)).await;
+        while srv.mcp.long_calls.count() == 0 {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        let t0 = std::time::Instant::now();
+        let _ = srv.stop.take().unwrap().send(Stop::Graceful);
+        let stopped = tokio::time::timeout(Duration::from_secs(20), &mut srv.done).await.expect("stopped").unwrap();
+        let took = t0.elapsed();
+        assert!(stopped.is_ok(), "{stopped:?}");
+        assert!(took < Duration::from_secs(2), "the stop did not wait for the engine: {took:?}");
+        busy.await.unwrap();
+        // the engine is free again: the cancelled call started no export
+        let jobs = srv.mcp.run("jobs.list", json!({})).await.unwrap();
+        assert_eq!(jobs, json!([]), "{jobs}");
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        assert!(!out.exists());
+        drop(r);
+    })
+    .await;
+}
+
+/// The cancel flags of the engine's jobs, in the order they started.
+fn cancel_flags(mcp: &FilmcraftMcp) -> Vec<bool> {
+    let session = mcp.headless_session().unwrap();
+    let s = session.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+    s.jobs.iter().map(|j| j.progress.cancel.load(Ordering::Relaxed)).collect()
+}
+
+/// Wait until job `i` is told to stop, failing after `limit`. An export stops only at its next
+/// batch, later under load: this is when it was cancelled.
+async fn cancel_requested_within(mcp: &FilmcraftMcp, i: usize, limit: Duration) {
+    let t0 = std::time::Instant::now();
+    while !cancel_flags(mcp).get(i).copied().unwrap_or(false) {
+        assert!(t0.elapsed() < limit, "job {i} was not cancelled within {limit:?}: {:?}", cancel_flags(mcp));
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+}
+
 fn export_call(id: u64, path: &str, seconds: f64, token: Option<Value>, meta: Option<&Value>) -> Value {
     let params = json!({"path": path, "format": "h264", "width": 640, "height": 360, "audio": false, "range": "custom", "startSeconds": 0, "endSeconds": seconds, "wait": true});
     let mut call = json!({"jsonrpc":"2.0","id":id,"method":"tools/call","params":{"name":"command_run","arguments":{"id":"file.exportMedia","params":params}}});

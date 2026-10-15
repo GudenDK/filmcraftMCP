@@ -1,12 +1,13 @@
-//! Long exports over MCP (docs/agents.md § Long exports): `file.exportMedia` with `wait: true`
-//! runs as a background engine job; the server reports its progress as MCP
-//! `notifications/progress` (when the request carried a `progressToken`) and stops it on
-//! `notifications/cancelled`, deleting the partial output. The session lock is only held for
-//! short polls, so other requests are answered while the export runs.
+//! Long exports over MCP (docs/agents.md § Long exports): `file.exportMedia` with `wait: true`,
+//! from `command_run` or a `command_batch` step, runs as a background engine job; the server
+//! reports its progress as MCP `notifications/progress` (when the request carried a
+//! `progressToken`) and stops it on `notifications/cancelled`, deleting the partial output. The
+//! session lock is only held for short polls, so other requests are answered while the export
+//! runs.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::path::Path;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU8, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use std::time::{Duration, SystemTime};
 
@@ -23,6 +24,9 @@ pub const LONG_COMMANDS: &[&str] = &["file.exportMedia"];
 
 /// How often the job is polled (and at most how often progress is reported).
 const POLL: Duration = Duration::from_millis(100);
+
+/// How many closed sessions [`LongCalls`] remembers (see [`LongCalls::cancel_session`]).
+const CLOSED_KEPT: usize = 1024;
 
 /// The long calls running on one server (every clone of a [`FilmcraftMcp`] shares it), cancelled
 /// ones still deleting their partial output included, and the exports its clients started in a
@@ -41,6 +45,9 @@ struct Running {
     background: Vec<Background>,
     /// The server is stopping: a call that begins now is cancelled from the start.
     stopping: bool,
+    /// The sessions closed last (at most [`CLOSED_KEPT`], newest last): a call of one of them
+    /// that begins now is cancelled from the start.
+    closed: VecDeque<String>,
 }
 
 /// An export a client started without `wait`: a job of the headless engine that goes on after the
@@ -71,10 +78,18 @@ struct Call {
     session: Option<String>,
 }
 
-/// The file a running export writes, and since when.
+/// The file a running export writes, and since when; in a headless engine, its job.
 struct Output {
     path: String,
     since: SystemTime,
+    job: Option<filmcraft_engine::Job>,
+}
+
+impl Output {
+    /// Whether what it wrote must go: an export that finished anyway is whole, and kept.
+    fn cut(&self) -> bool {
+        !self.job.as_ref().is_some_and(job_succeeded)
+    }
 }
 
 impl LongCalls {
@@ -89,12 +104,13 @@ impl LongCalls {
     }
 
     /// Counts one long call, of HTTP session `session` if any, for as long as the returned guard
-    /// lives.
+    /// lives. It is cancelled from the start when the server is stopping or its session was
+    /// closed already.
     fn enter(self: &Arc<Self>, session: Option<String>) -> LongCall {
         let id = self.next.fetch_add(1, Ordering::Relaxed);
         let cancel = CancellationToken::new();
         let mut running = self.lock();
-        if running.stopping {
+        if running.stopping || session.as_ref().is_some_and(|s| running.closed.contains(s)) {
             cancel.cancel();
         }
         running.calls.insert(id, Call { cancel: cancel.clone(), output: None, session });
@@ -104,9 +120,20 @@ impl LongCalls {
     /// HTTP session `id` is closing (its client sent `DELETE`, or the server stops): cancel its
     /// long calls now. rmcp would cancel them only once its wait for their responses is over, up
     /// to 5 s later, and meanwhile take none of their progress notifications.
+    ///
+    /// A call rmcp had already taken from that session, but whose handler has not yet begun, is
+    /// cancelled when it begins ([`Self::enter`]): it would otherwise start its export, and encode
+    /// until rmcp's wait was over, with nobody tracking its session any more.
     pub(crate) fn cancel_session(&self, id: &str) {
-        for c in self.lock().calls.values().filter(|c| c.session.as_deref() == Some(id)) {
+        let mut running = self.lock();
+        for c in running.calls.values().filter(|c| c.session.as_deref() == Some(id)) {
             c.cancel.cancel();
+        }
+        if !running.closed.iter().any(|c| c == id) {
+            if running.closed.len() >= CLOSED_KEPT {
+                running.closed.pop_front();
+            }
+            running.closed.push_back(id.to_string());
         }
     }
 
@@ -124,7 +151,7 @@ impl LongCalls {
         if stopped {
             job.progress.cancel.store(true, Ordering::Relaxed);
         }
-        running.background.push(Background { job, output: Output { path: path.to_string(), since }, stopped });
+        running.background.push(Background { job, output: Output { path: path.to_string(), since, job: None }, stopped });
     }
 
     /// The server is stopping: cancel every long call now, and those that begin until
@@ -147,7 +174,8 @@ impl LongCalls {
     /// Wait until no long call runs and every export the stop cancelled has ended, or `deadline`
     /// passes. Then delete the partial output of the calls still running and of the exports the
     /// stop cut short: the process is about to exit, and an export it stops leaves a truncated
-    /// file. The calls must have been cancelled already ([`Self::stop`]).
+    /// file. One that finished anyway, its last frames written before the stop reached it, is
+    /// whole: kept. The calls must have been cancelled already ([`Self::stop`]).
     pub(crate) async fn drain(&self, deadline: tokio::time::Instant) {
         let busy = || {
             let running = self.lock();
@@ -159,7 +187,7 @@ impl LongCalls {
         let left: Vec<Output> = {
             let mut running = self.lock();
             running.stopping = false;
-            let calls = running.calls.values_mut().filter_map(|c| c.output.take());
+            let calls = running.calls.values_mut().filter_map(|c| c.output.take()).filter(Output::cut);
             let calls: Vec<Output> = calls.collect();
             // an export that finished anyway (its last frames) is whole: kept
             let cut = std::mem::take(&mut running.background).into_iter().filter(|b| b.stopped && !job_succeeded(&b.job)).map(|b| b.output);
@@ -180,10 +208,17 @@ struct LongCall {
 }
 
 impl LongCall {
-    /// The call's export writes `path`, from `since` on.
-    fn writes(&self, path: &str, since: SystemTime) {
+    /// The call's export writes `path`, from `since` on, as `job` (in a headless engine).
+    fn writes(&self, path: &str, since: SystemTime, job: Option<&filmcraft_engine::Job>) {
         if let Some(c) = self.calls.lock().calls.get_mut(&self.id) {
-            c.output = Some(Output { path: path.to_string(), since });
+            c.output = Some(Output { path: path.to_string(), since, job: job.cloned() });
+        }
+    }
+
+    /// The call's export finished and is whole: its file is never deleted.
+    fn kept(&self) {
+        if let Some(c) = self.calls.lock().calls.get_mut(&self.id) {
+            c.output = None;
         }
     }
 }
@@ -209,22 +244,31 @@ fn session_of(context: &RequestContext<RoleServer>) -> Option<String> {
     head.headers.get("mcp-session-id")?.to_str().ok().map(str::to_string)
 }
 
-/// Whether `command_run {id, params}` is a long call this module runs.
+/// Whether `command_run {id, params}`, or a `command_batch` step, is a long call this module runs.
 pub fn is_long(id: &str, params: &Value) -> bool {
     LONG_COMMANDS.contains(&id) && params.get("wait").and_then(Value::as_bool) == Some(true)
 }
 
-/// Sends `notifications/progress` for one request; progress only ever increases.
-struct Reporter {
+/// Sends `notifications/progress` for one request; progress only ever increases, also across the
+/// long steps of one `command_batch` ([`Reporter::next_step`]).
+pub(crate) struct Reporter {
     peer: Peer<RoleServer>,
     token: Option<ProgressToken>,
     last: f64,
+    /// Where this step's progress starts: what the earlier steps of a batch reported.
+    base: f64,
 }
 
 impl Reporter {
+    /// For the request of `context`: reports only when it carries a `progressToken`.
+    pub(crate) fn new(context: &RequestContext<RoleServer>) -> Self {
+        Self { peer: context.peer.clone(), token: context.meta.get_progress_token(), last: 0.0, base: 0.0 }
+    }
+
     async fn report(&mut self, done: f64, total: f64, message: &str) {
         let Some(token) = self.token.clone() else { return };
-        if total <= 0.0 || done <= self.last {
+        let (done, total) = (self.base + done, self.base + total);
+        if total <= self.base || done <= self.last {
             return;
         }
         self.last = done;
@@ -234,41 +278,101 @@ impl Reporter {
         }
         let _ = self.peer.notify_progress(p).await;
     }
+
+    /// The next long step of a batch reports on from where this one got to.
+    pub(crate) fn next_step(&mut self) {
+        self.base = self.last;
+    }
 }
 
+/// Why a long call returned no result.
+#[derive(Debug, PartialEq)]
+pub(crate) enum LongError {
+    /// Cancelled (by its client, by the server stopping or by its session closing) before its
+    /// export finished: it started none, or what it wrote is deleted.
+    Cancelled,
+    /// The command failed, or its export did.
+    Failed(String),
+}
+
+impl std::fmt::Display for LongError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            LongError::Cancelled => f.write_str("cancelled"),
+            LongError::Failed(m) => f.write_str(m),
+        }
+    }
+}
+
+/// Who has the start of a long call's export, between the call and the engine (see
+/// [`FilmcraftMcp::long_call`]).
+const WAITING: u8 = 0;
+/// The engine runs the command that starts the export.
+const STARTING: u8 = 1;
+/// The call was cancelled while it waited for the engine, and returned: the engine must not start
+/// the export.
+const ABANDONED: u8 = 2;
+
 impl FilmcraftMcp {
-    /// Run `id` (a [`LONG_COMMANDS`] entry, `wait: true`) as a job, reporting progress and
-    /// honouring cancellation (by the client, by the server stopping, or by the call's session
-    /// closing).
+    /// [`Self::long_call`] as a tool result.
+    pub(crate) async fn run_long(&self, id: &str, params: Value, context: &RequestContext<RoleServer>) -> CallToolResult {
+        match self.long_call(id, params, context, &mut Reporter::new(context)).await {
+            Ok(v) => CallToolResult::success(vec![Content::text(serde_json::to_string_pretty(&v).unwrap_or_default())]),
+            Err(e) => CallToolResult::error(vec![Content::text(e.to_string())]),
+        }
+    }
+
+    /// Run `id` (a [`LONG_COMMANDS`] entry, `wait: true`) as a job, reporting progress through
+    /// `rep` and honouring cancellation (by the client, by the server stopping, or by the call's
+    /// session closing). The result is a blocking export's: `{job, path, result, offlineMedia}`.
     ///
     /// Every wait here also ends when the call is cancelled: the engine may be busy with another
     /// client's call for a while, and once its session is closed rmcp no longer takes the
     /// progress notifications this call sends (each would wait until rmcp's 5 s drain for the
     /// session is over), while the export goes on writing. In a headless engine the job is then
     /// stopped through its own handle, without waiting for the engine's lock either.
-    pub(crate) async fn run_long(&self, id: &str, mut params: Value, context: &RequestContext<RoleServer>) -> CallToolResult {
+    pub(crate) async fn long_call(&self, id: &str, mut params: Value, context: &RequestContext<RoleServer>, rep: &mut Reporter) -> Result<Value, LongError> {
         let call = self.long_calls.enter(session_of(context));
         let started = SystemTime::now();
         if let Some(p) = params.as_object_mut() {
             p.insert("wait".into(), json!(false));
         }
-        // the engine may be busy for a while: a call cancelled meanwhile starts no job, which would
-        // write its file with nobody left to stop it
+        let stopped = || either_cancelled(&context.ct, &call.cancel);
+        // The engine may be busy for a while (another client's export that waits, a batch): a
+        // call cancelled meanwhile returns at once, instead of holding a stop for its whole
+        // grace. Once the engine is free it starts no job, which would write its file with
+        // nobody left to stop it. `claim` settles a cancel that comes just as the engine takes
+        // the command: either the engine has not begun (the call returns, the engine starts
+        // nothing), or it has (the call waits the moment it takes to start, and stops the job).
+        let claim = Arc::new(AtomicU8::new(WAITING));
         let cancelled = {
-            let (by_client, by_stop) = (context.ct.clone(), call.cancel.clone());
-            move || by_client.is_cancelled() || by_stop.is_cancelled()
+            let (by_client, by_stop, claim) = (context.ct.clone(), call.cancel.clone(), claim.clone());
+            move || {
+                by_client.is_cancelled() || by_stop.is_cancelled() || claim.compare_exchange(WAITING, STARTING, Ordering::AcqRel, Ordering::Acquire).is_err()
+            }
         };
-        let (start, handle) = match self.start_job_unless(id, params, cancelled).await {
+        let start = self.start_job_unless(id, params, cancelled);
+        tokio::pin!(start);
+        let begun = tokio::select! {
+            r = &mut start => r,
+            _ = stopped() => {
+                if claim.compare_exchange(WAITING, ABANDONED, Ordering::AcqRel, Ordering::Acquire).is_ok() {
+                    return Err(LongError::Cancelled);
+                }
+                // the engine is starting it right now: take the job, to stop it
+                start.await
+            }
+        };
+        let (start, handle) = match begun {
             Ok(v) => v,
-            Err(e) => return CallToolResult::error(vec![Content::text(e.to_string())]),
+            Err(_) if context.ct.is_cancelled() || call.cancel.is_cancelled() => return Err(LongError::Cancelled),
+            Err(e) => return Err(LongError::Failed(e.to_string())),
         };
         let Some(job) = start.get("job").and_then(Value::as_u64) else {
-            return CallToolResult::error(vec![Content::text(format!("{id} started no job: {start}"))]);
+            return Err(LongError::Failed(format!("{id} started no job: {start}")));
         };
         let path = start.get("path").and_then(Value::as_str).unwrap_or_default().to_string();
-        call.writes(&path, started);
-        let mut rep = Reporter { peer: context.peer.clone(), token: context.meta.get_progress_token(), last: 0.0 };
-        let stopped = || either_cancelled(&context.ct, &call.cancel);
+        call.writes(&path, started, handle.as_ref());
         loop {
             let state = tokio::select! {
                 s = self.job_state_of(job, handle.as_ref()) => s,
@@ -293,19 +397,10 @@ impl FilmcraftMcp {
                 } else {
                     state
                 };
-                let offline = state.as_ref().and_then(|j| j.get("offlineMedia").cloned());
-                let result = state.map(|j| j["result"].clone()).unwrap_or(Value::Null);
-                if let Some(e) = result.get("error").and_then(Value::as_str) {
-                    return CallToolResult::error(vec![Content::text(format!("export failed: {e}"))]);
+                if ended_whole(state.as_ref()) {
+                    call.kept();
                 }
-                let mut out = start;
-                if let Some(o) = out.as_object_mut() {
-                    o.insert("result".into(), result);
-                    if let Some(off) = offline {
-                        o.insert("offlineMedia".into(), off);
-                    }
-                }
-                return CallToolResult::success(vec![Content::text(serde_json::to_string_pretty(&out).unwrap_or_default())]);
+                return finished_result(start, state);
             }
             tokio::select! {
                 _ = stopped() => break,
@@ -319,14 +414,23 @@ impl FilmcraftMcp {
                 let _ = self.run("jobs.cancel", json!({"job": job})).await;
             }
         }
+        let mut last = None;
         for _ in 0..600 {
-            if self.job_state_of(job, handle.as_ref()).await.as_ref().is_none_or(is_finished) {
+            last = self.job_state_of(job, handle.as_ref()).await;
+            if last.as_ref().is_none_or(is_finished) {
                 break;
             }
             tokio::time::sleep(POLL).await;
         }
+        // It may have finished just before the cancel reached it (its last batch written while this
+        // call waited to poll again): then the file is whole, and deleting it would lose a finished
+        // export. Its result is returned (a client that cancelled ignores it).
+        if ended_whole(last.as_ref()) {
+            call.kept();
+            return finished_result(start, last);
+        }
         remove_partial(&path, started);
-        CallToolResult::error(vec![Content::text("cancelled")])
+        Err(LongError::Cancelled)
     }
 
     /// The job's state: from its handle in a headless engine (without the engine's lock, and
@@ -343,6 +447,31 @@ impl FilmcraftMcp {
         let jobs = self.run("jobs.list", json!({})).await.ok()?;
         jobs.as_array()?.iter().find(|j| j["id"].as_u64() == Some(job)).cloned()
     }
+}
+
+/// A finished export's call result: `start` (`{job, path}`) with the job's `result` and
+/// `offlineMedia` from `state`, its job entry; an error when the export failed.
+fn finished_result(start: Value, state: Option<Value>) -> Result<Value, LongError> {
+    let offline = state.as_ref().and_then(|j| j.get("offlineMedia").cloned());
+    let result = state.map(|j| j["result"].clone()).unwrap_or(Value::Null);
+    if let Some(e) = result.get("error").and_then(Value::as_str) {
+        return Err(LongError::Failed(format!("export failed: {e}")));
+    }
+    let mut out = start;
+    if let Some(o) = out.as_object_mut() {
+        o.insert("result".into(), result);
+        if let Some(off) = offline {
+            o.insert("offlineMedia".into(), off);
+        }
+    }
+    Ok(out)
+}
+
+/// Whether a job's state (its `jobs.list` entry, or its handle's JSON) says its export finished
+/// and succeeded: its file is whole, whether or not a cancel came meanwhile. Unknown, unfinished,
+/// failed or cancelled: not whole.
+fn ended_whole(state: Option<&Value>) -> bool {
+    state.is_some_and(|j| is_finished(j) && j["result"].is_object() && j["result"].get("error").is_none())
 }
 
 /// Whether a job's state says it has finished.
@@ -471,7 +600,7 @@ mod tests {
         let path = dir.join("out.mp4");
         std::fs::write(&path, b"partial").unwrap();
         std::fs::write(dir.join("other.mp4"), b"x").unwrap();
-        call.writes(&path.to_string_lossy(), started);
+        call.writes(&path.to_string_lossy(), started, None);
         assert_eq!((a.count(), b.count()), (1, 0));
         let t0 = std::time::Instant::now();
         b.drain(tokio::time::Instant::now() + Duration::from_secs(10)).await;
@@ -527,6 +656,84 @@ mod tests {
         assert!(t0.elapsed() >= Duration::from_millis(150), "waited for the export to stop writing");
         assert!(!out.exists(), "its partial output is deleted");
         assert!(calls.lock().background.is_empty());
+    }
+
+    /// A call of a session that was closed before the call began (rmcp had taken the request,
+    /// but its handler had not reached [`LongCalls::enter`] when the client's `DELETE` came) is
+    /// cancelled from the start. It used to start its export and encode for rmcp's 5 s drain, while
+    /// the gate no longer tracked its session. Closed sessions are remembered up to a bound.
+    #[test]
+    fn a_call_of_a_session_closed_already_is_cancelled_from_the_start() {
+        let calls = Arc::new(LongCalls::default());
+        calls.cancel_session("a");
+        assert!(calls.enter(Some("a".into())).cancel.is_cancelled(), "its session was closed");
+        assert!(!calls.enter(Some("b".into())).cancel.is_cancelled());
+        assert!(!calls.enter(None).cancel.is_cancelled());
+        calls.cancel_session("a");
+        assert_eq!(calls.lock().closed.len(), 1, "remembered once");
+        for i in 0..CLOSED_KEPT {
+            calls.cancel_session(&format!("s{i}"));
+        }
+        assert_eq!(calls.lock().closed.len(), CLOSED_KEPT, "bounded");
+        assert!(!calls.enter(Some("a".into())).cancel.is_cancelled(), "the oldest is forgotten");
+        assert!(calls.enter(Some(format!("s{}", CLOSED_KEPT - 1))).cancel.is_cancelled());
+    }
+
+    /// A job whose export finished, report in, with `result` as `jobs.list` and its handle give it.
+    fn finished_job(id: u64, result: Result<(), &str>) -> filmcraft_engine::Job {
+        let job = filmcraft_engine::Job { id, label: "export".into(), progress: Default::default(), result: Default::default() };
+        let report =
+            filmcraft_engine::export::Report { path: "out.mp4".into(), frames: 24, seconds: 1.0, bytes: 1000, render_fps: 60.0, extra_files: Vec::new() };
+        *job.result.lock().unwrap() = Some(result.map(|()| report).map_err(str::to_string));
+        job
+    }
+
+    /// An export that finished just before a cancel or a stop reached it is whole: its call
+    /// returns its result and keeps the file. A stop that came while the call waited to poll the
+    /// finished job again used to delete the whole, successful export.
+    #[test]
+    fn an_export_that_finished_before_the_cancel_is_whole() {
+        let ok = finished_job(1, Ok(())).to_json();
+        assert!(ended_whole(Some(&ok)), "{ok}");
+        let out = finished_result(json!({"job": 1, "path": "out.mp4"}), Some(ok.clone())).unwrap();
+        assert_eq!((&out["job"], &out["result"]["frames"]), (&json!(1), &json!(24)), "{out}");
+        // as bridge mode sees it, from `jobs.list`
+        assert!(ended_whole(Some(&json!({"id": 1, "finished": true, "result": {"path": "out.mp4", "frames": 24}}))));
+        let cancelled = finished_job(2, Err("cancelled")).to_json();
+        let running = filmcraft_engine::Job { id: 3, label: "export".into(), progress: Default::default(), result: Default::default() }.to_json();
+        for (what, state) in [("cancelled", Some(&cancelled)), ("still running", Some(&running)), ("unknown", None)] {
+            assert!(!ended_whole(state), "{what}: {state:?}");
+        }
+        assert_eq!(finished_result(json!({"job": 2}), Some(cancelled)), Err(LongError::Failed("export failed: cancelled".into())));
+    }
+
+    /// A stop whose deadline comes while a call still runs deletes that call's output, unless its
+    /// export finished meanwhile: then the file is whole, and kept.
+    #[tokio::test]
+    async fn drain_keeps_the_output_of_an_export_that_finished() {
+        let dir = crate::TestDir::new("drain-finished");
+        let calls = Arc::new(LongCalls::default());
+        let (whole, cut) = (dir.join("whole.mp4"), dir.join("cut.mp4"));
+        let started = SystemTime::now();
+        for p in [&whole, &cut] {
+            std::fs::write(p, b"data").unwrap();
+        }
+        let (done, failed) = (finished_job(1, Ok(())), finished_job(2, Err("cancelled")));
+        let (a, b) = (calls.enter(None), calls.enter(None));
+        a.writes(&whole.to_string_lossy(), started, Some(&done));
+        b.writes(&cut.to_string_lossy(), started, Some(&failed));
+        calls.stop();
+        calls.drain(tokio::time::Instant::now()).await;
+        assert!(whole.exists(), "a finished export is kept");
+        assert!(!cut.exists(), "a cut one is deleted");
+        // a call that saw its export finish (bridge mode: no handle) keeps it too
+        let c = calls.enter(None);
+        c.writes(&cut.to_string_lossy(), started, None);
+        std::fs::write(&cut, b"data").unwrap();
+        c.kept();
+        calls.drain(tokio::time::Instant::now()).await;
+        assert!(cut.exists());
+        drop((a, b, c));
     }
 
     /// Closing an HTTP session (its client's `DELETE`) cancels that session's long calls, and no

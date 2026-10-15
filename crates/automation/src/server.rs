@@ -13,7 +13,10 @@ use schemars::JsonSchema;
 use serde::Deserialize;
 use serde_json::{Value, json};
 
+use crate::long_job::LongError;
 use crate::{AutomationError, BridgeClient, Stop, png_rgba};
+use rmcp::RoleServer;
+use rmcp::service::RequestContext;
 
 pub enum Backend {
     Headless(Arc<Mutex<Session>>),
@@ -481,19 +484,30 @@ impl FilmcraftMcp {
         description = "Run several commands in order: {steps: [{id, params?}], stop_on_error?: true}. Returns {completed, failed, results: [{ok, result | error}]}; each edit is its own undo step.",
         annotations(read_only_hint = false, destructive_hint = true, idempotent_hint = false, open_world_hint = false)
     )]
-    async fn command_batch(&self, Parameters(p): Parameters<BatchParams>) -> Result<CallToolResult, McpError> {
+    async fn command_batch(&self, Parameters(p): Parameters<BatchParams>, context: RequestContext<RoleServer>) -> Result<CallToolResult, McpError> {
         let stop = p.stop_on_error.unwrap_or(true);
         let (mut completed, mut failed, mut results) = (0u32, 0u32, Vec::new());
+        // a step that exports with `wait: true` is a long call, as it is from `command_run`
+        let mut rep = crate::long_job::Reporter::new(&context);
         for st in p.steps {
-            match self.run_command(&st.id, st.params.unwrap_or(json!({}))).await {
+            let params = st.params.unwrap_or(json!({}));
+            let (r, cancelled) = if crate::long_job::is_long(&st.id, &params) {
+                let r = self.long_call(&st.id, params, &context, &mut rep).await;
+                rep.next_step();
+                (r.as_ref().map_err(ToString::to_string).cloned(), r == Err(LongError::Cancelled))
+            } else {
+                (self.run_command(&st.id, params).await.map_err(|e| e.to_string()), false)
+            };
+            match r {
                 Ok(v) => {
                     completed += 1;
                     results.push(json!({"ok": true, "result": v}));
                 }
                 Err(e) => {
                     failed += 1;
-                    results.push(json!({"ok": false, "error": e.to_string()}));
-                    if stop {
+                    results.push(json!({"ok": false, "error": e}));
+                    // a cancelled batch (by its client, the server stopping, its session closing) runs no more steps
+                    if stop || cancelled {
                         break;
                     }
                 }
