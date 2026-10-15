@@ -15,20 +15,23 @@ use futures_util::FutureExt as _;
 use http::header::{self, HeaderName};
 use http::{HeaderMap, HeaderValue, Method, Request, Response, StatusCode};
 use http_body_util::{BodyExt, Full, Limited};
-use hyper::body::Incoming;
 use rmcp::ServerHandler as _;
 use rmcp::model::ProtocolVersion;
 use rmcp::transport::streamable_http_server::SessionManager as _;
-use rmcp::transport::streamable_http_server::session::local::LocalSessionManager;
 use serde_json::{Value, json};
 
 use super::limits::{AuthFailures, Log};
 use super::sessions::{Duplicate, Sessions, hold};
+use super::tracked::{INITIALIZING, Initializing, TrackedSessions};
 use super::{HttpBody, MAX_BODY, MCP_PATH, Mcp};
 use crate::FilmcraftMcp;
 
 /// Request headers a listed browser origin may send (answer to its CORS preflight).
 const CORS_ALLOW_HEADERS: &str = "content-type, accept, authorization, mcp-session-id, mcp-protocol-version, mcp-method, mcp-name, last-event-id";
+
+/// A request body: hyper's `Incoming` (tests hand over others).
+pub(super) trait ReqBody: hyper::body::Body<Data = Bytes> + Send + 'static {}
+impl<B: hyper::body::Body<Data = Bytes> + Send + 'static> ReqBody for B {}
 
 /// What every request is checked against before rmcp sees it.
 pub(super) struct Gate {
@@ -41,8 +44,8 @@ pub(super) struct Gate {
     pub(super) tools: FilmcraftMcp,
     pub(super) mcp: Mcp,
     /// rmcp's sessions, to close the ones [`Self::sessions`] retires.
-    pub(super) rmcp_sessions: Arc<LocalSessionManager>,
-    /// The sessions' traffic (clients before 2026-07-28, when `legacy_session_mode`).
+    pub(super) rmcp_sessions: Arc<TrackedSessions>,
+    /// Every rmcp session and its traffic (clients before 2026-07-28, when `legacy_session_mode`).
     pub(super) sessions: Arc<Sessions>,
     pub(super) legacy_session_mode: bool,
     pub(super) body_timeout: Duration,
@@ -76,13 +79,19 @@ impl Refusal {
 
 impl Gate {
     /// [`Self::route`], with a panic (here or in rmcp) answered with 500 and logged.
-    pub(super) async fn serve(&self, peer: SocketAddr, req: Request<Incoming>) -> Response<HttpBody> {
+    pub(super) async fn serve<B: ReqBody>(&self, peer: SocketAddr, req: Request<B>) -> Response<HttpBody>
+    where
+        B::Error: std::error::Error + Send + Sync + 'static,
+    {
         let (method, path) = (req.method().clone(), req.uri().path().to_string());
         or_500(&self.log, peer, &method, &path, self.route(peer, req)).await
     }
 
     /// Check `req`, then hand it to rmcp. Never fails: errors are responses.
-    pub(super) async fn route(&self, peer: SocketAddr, req: Request<Incoming>) -> Response<HttpBody> {
+    pub(super) async fn route<B: ReqBody>(&self, peer: SocketAddr, req: Request<B>) -> Response<HttpBody>
+    where
+        B::Error: std::error::Error + Send + Sync + 'static,
+    {
         if req.uri().path() != MCP_PATH {
             return text(StatusCode::NOT_FOUND, "Not Found: the MCP endpoint is /mcp");
         }
@@ -99,7 +108,10 @@ impl Gate {
         r
     }
 
-    async fn checked(&self, peer: SocketAddr, req: Request<Incoming>, listed_origin: bool) -> Result<Response<HttpBody>, Refusal> {
+    async fn checked<B: ReqBody>(&self, peer: SocketAddr, req: Request<B>, listed_origin: bool) -> Result<Response<HttpBody>, Refusal>
+    where
+        B::Error: std::error::Error + Send + Sync + 'static,
+    {
         // A browser sends a CORS preflight without credentials: it is answered before the token
         // check, and only for a listed origin.
         if listed_origin && req.method() == Method::OPTIONS && req.headers().contains_key(header::ACCESS_CONTROL_REQUEST_METHOD) {
@@ -121,13 +133,8 @@ impl Gate {
                     None => r,
                 });
             }
-            Method::DELETE => {
-                let r = self.mcp.handle(req).await;
-                if let Some(id) = session.filter(|_| r.status().is_success()) {
-                    self.sessions.ended(&id);
-                }
-                return Ok(r);
-            }
+            // the session is forgotten when rmcp closes it (`tracked.rs`)
+            Method::DELETE => return Ok(self.mcp.handle(req).await),
             _ => return Ok(self.mcp.handle(req).await), // 405
         }
         check_accept_and_type(req.headers())?;
@@ -135,7 +142,10 @@ impl Gate {
     }
 
     /// A POST that passed the header checks: read and parse its body, then hand it to rmcp.
-    async fn post(&self, peer: SocketAddr, req: Request<Incoming>, session: Option<String>) -> Result<Response<HttpBody>, Refusal> {
+    async fn post<B: ReqBody>(&self, peer: SocketAddr, req: Request<B>, session: Option<String>) -> Result<Response<HttpBody>, Refusal>
+    where
+        B::Error: std::error::Error + Send + Sync + 'static,
+    {
         let (parts, body) = req.into_parts();
         let bytes = match tokio::time::timeout(self.body_timeout, Limited::new(body, MAX_BODY).collect()).await {
             Ok(Ok(c)) => c.to_bytes(),
@@ -174,7 +184,12 @@ impl Gate {
                 (None, Some("initialize")) => match self.sessions.reserve() {
                     Some((r, evict)) => {
                         if let Some(old) = evict {
-                            let _ = self.rmcp_sessions.close_session(&old.as_str().into()).await;
+                            // on its own task: this request may be dropped at any await (its
+                            // client gone), and the session is no longer counted
+                            let rmcp = self.rmcp_sessions.clone();
+                            tokio::spawn(async move {
+                                let _ = rmcp.close_session(&old.as_str().into()).await;
+                            });
                             let why = "closed the least recently used idle MCP session to make room for a new one";
                             self.log.event(peer.ip(), why, format_args!("{why} (from {peer})"));
                         }
@@ -200,12 +215,23 @@ impl Gate {
                 _ => {}
             }
         }
-        let r = self.mcp.handle(Request::from_parts(parts, Full::new(bytes))).await;
-        if let Some(reserved) = reservation
-            && let Some(id) = session_id(r.headers())
-        {
-            flight = Some(self.sessions.created(reserved, &id));
-        }
+        let req = Request::from_parts(parts, Full::new(bytes));
+        let r = match reservation {
+            // rmcp's `create_session` takes the place and leaves the session's first flight
+            Some(reserved) => {
+                let initializing = std::sync::Mutex::new(Initializing::Reserved(reserved));
+                let (r, first) = INITIALIZING
+                    .scope(initializing, async {
+                        let r = self.mcp.handle(req).await;
+                        let first = INITIALIZING.try_with(|i| i.lock().unwrap_or_else(std::sync::PoisonError::into_inner).take_flight()).ok().flatten();
+                        (r, first)
+                    })
+                    .await;
+                flight = first;
+                r
+            }
+            None => self.mcp.handle(req).await,
+        };
         Ok(match flight {
             Some(f) => hold(r, f),
             None => r,

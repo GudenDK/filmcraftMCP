@@ -15,13 +15,16 @@
 //! The gate (`gate.rs`) runs these checks before reading a body, maps a non-JSON body to a
 //! JSON-RPC parse error (`-32700`, as `serve_io` does on stdio), and keeps rmcp's per-tool-name
 //! schema cache bounded by answering unknown tool names itself. Resources are bounded per peer and
-//! in all (`limits.rs`: connections, slow or idle clients, bodies) and sessions are tracked
-//! (`sessions.rs`: closed when idle, never with a call in flight). Refused requests are logged
-//! (stderr, or [`HttpOptions::log`]), rate limited per peer.
+//! in all (`limits.rs`: connections, slow or idle clients, bodies). Every session rmcp creates is
+//! tracked from its creation, and every call its handler runs until answered (`tracked.rs`), so
+//! sessions are counted against a cap and closed when idle, never with a call in flight, even one
+//! whose client disconnected (`sessions.rs`). Refused requests are logged (stderr, or
+//! [`HttpOptions::log`]), rate limited per peer.
 
 mod gate;
 mod limits;
 mod sessions;
+mod tracked;
 
 use std::convert::Infallible;
 use std::future::Future;
@@ -43,6 +46,7 @@ use rmcp::transport::streamable_http_server::SessionManager as _;
 use rmcp::transport::streamable_http_server::session::local::LocalSessionManager;
 use rmcp::transport::streamable_http_server::{StreamableHttpServerConfig, StreamableHttpService};
 use tokio_util::sync::CancellationToken;
+use tracked::TrackedSessions;
 
 pub use limits::LogSink;
 
@@ -286,7 +290,7 @@ pub fn accepted_hosts(bound: SocketAddr, extra: &[String]) -> Vec<String> {
 }
 
 type HttpBody = BoxBody<Bytes, Infallible>;
-type Mcp = StreamableHttpService<FilmcraftMcp, LocalSessionManager>;
+type Mcp = StreamableHttpService<FilmcraftMcp, TrackedSessions>;
 
 /// What a server counted (tests read it).
 #[derive(Default)]
@@ -294,6 +298,9 @@ pub(crate) struct Stats {
     /// Handlers rmcp asked for: one per session or stateless request, and one per tool name it
     /// looks up a schema for.
     pub(crate) services: AtomicUsize,
+    /// The server's gate, for tests that hand it requests directly.
+    #[cfg(test)]
+    gate: std::sync::OnceLock<std::sync::Weak<gate::Gate>>,
 }
 
 impl FilmcraftMcp {
@@ -370,7 +377,8 @@ impl FilmcraftMcp {
             stop.cancel();
         });
 
-        let sessions = Arc::new(session_manager());
+        let tracked = sessions::Sessions::new(limits.sessions);
+        let rmcp_sessions = Arc::new(TrackedSessions { inner: session_manager(), sessions: tracked.clone() });
         // rmcp repeats the gate's Host and Origin checks with the same lists
         let config = StreamableHttpServerConfig::default()
             .with_allowed_hosts(hosts.clone())
@@ -384,6 +392,8 @@ impl FilmcraftMcp {
             .with_cancellation_token(ct.child_token());
         let tools = self.clone();
         let long_calls = self.long_calls.clone();
+        #[cfg(test)]
+        let stats_for_tests = stats.clone();
         // Called once per session (pre-2026-07-28 clients) or per request (2026-07-28): every
         // clone shares the one backend (`Arc<Backend>`), so all clients see the same project.
         let mcp: Mcp = StreamableHttpService::new(
@@ -391,7 +401,7 @@ impl FilmcraftMcp {
                 stats.services.fetch_add(1, Ordering::Relaxed);
                 Ok(self.clone())
             },
-            sessions.clone(),
+            rmcp_sessions.clone(),
             config,
         );
         let gate = Arc::new(gate::Gate {
@@ -400,13 +410,15 @@ impl FilmcraftMcp {
             origins,
             tools,
             mcp,
-            rmcp_sessions: sessions.clone(),
-            sessions: sessions::Sessions::new(limits.sessions),
+            rmcp_sessions,
+            sessions: tracked,
             legacy_session_mode: opts.legacy_session_mode,
             body_timeout: limits.body_timeout,
             auth: limits::AuthFailures::new(limits.auth_failures, limits.auth_window, limits.auth_block),
             log: limits::Log::new(opts.log, LOG_EVERY),
         });
+        #[cfg(test)]
+        let _ = stats_for_tests.gate.set(Arc::downgrade(&gate));
         let conns = limits::Conns::new(limits.connections, limits.connections_per_peer);
         if let Some(idle) = opts.session_idle {
             tokio::spawn(reap_idle_sessions(gate.clone(), idle, limits.reap_every, ct.clone()));
@@ -524,7 +536,8 @@ async fn wind_down(gate: &gate::Gate, long_calls: &crate::long_job::LongCalls, c
 
 /// rmcp's session store with its idle timeout off: it counts session events only, so it would cut
 /// off a long call that sends nothing (an export without a `progressToken`) and delete its output.
-/// [`reap_idle_sessions`] closes idle sessions instead, never one with something in flight.
+/// [`reap_idle_sessions`] closes idle sessions instead, never one with something in flight; it
+/// sees every session, as [`TrackedSessions`] reports each one rmcp creates.
 fn session_manager() -> LocalSessionManager {
     let mut sessions = LocalSessionManager::default();
     sessions.session_config.keep_alive = None;

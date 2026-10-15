@@ -1,6 +1,7 @@
 //! Tests for the Streamable HTTP transport: real requests on 127.0.0.1:<free port>.
 
 use super::*;
+use bytes::Bytes;
 use filmcraft_engine::Session;
 use http::HeaderValue;
 use serde_json::{Value, json};
@@ -910,6 +911,159 @@ async fn a_long_quiet_call_outlives_the_idle_timeout() {
         assert!(t0.elapsed() > idle * 3, "the export ran for several idle periods: {:?}", t0.elapsed());
         assert!(out.exists());
         assert_eq!(post(srv.addr, Some(&sid), &[], &ping(7)).await.reply().await["id"], 7, "the id is free again");
+        let _ = std::fs::remove_dir_all(&dir);
+    })
+    .await;
+}
+
+/// The server's gate, once it runs.
+async fn gate_of(stats: &Stats) -> Arc<gate::Gate> {
+    loop {
+        if let Some(g) = stats.gate.get().and_then(std::sync::Weak::upgrade) {
+            return g;
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+}
+
+/// How many sessions rmcp holds, and how many the gate tracks (closes when idle, counts against
+/// the cap).
+async fn session_counts(gate: &gate::Gate) -> (usize, usize) {
+    (gate.rmcp_sessions.inner.sessions.read().await.len(), gate.sessions.len())
+}
+
+/// An `initialize` request as the gate gets it from hyper.
+fn initialize_request(host: &str) -> http::Request<http_body_util::Full<Bytes>> {
+    let body = json!({"jsonrpc":"2.0","id":0,"method":"initialize","params":{"protocolVersion":"2025-06-18","capabilities":{},"clientInfo":{"name":"t","version":"1"}}});
+    http::Request::post(MCP_PATH)
+        .header("host", host)
+        .header("accept", ACCEPT.1)
+        .header("content-type", JSON.1)
+        .body(http_body_util::Full::new(Bytes::from(body.to_string())))
+        .unwrap()
+}
+
+/// A client that goes away while its `initialize` is handled (hyper then drops the request's
+/// future) leaves no session that nothing counts or closes: rmcp has created it, and its handler
+/// may have answered already, but the gate has not seen the answer. Every rmcp session is tracked
+/// from its creation, counted against the cap (the least recently used idle one makes room, and
+/// that close finishes even though the request that asked for it is gone), and closed when idle.
+#[tokio::test(flavor = "current_thread")]
+async fn initializes_dropped_mid_request_leave_no_untracked_session() {
+    within(async {
+        let stats: Arc<Stats> = Arc::default();
+        let opts = HttpOptions { session_idle: Some(Duration::from_millis(500)), ..HttpOptions::default() };
+        let limits = Limits { sessions: 4, reap_every: Duration::from_millis(50), ..Limits::default() };
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let srv = Server::start_on(listener, demo(), opts, limits, stats.clone());
+        let gate = gate_of(&stats).await;
+        let peer: SocketAddr = "127.0.0.1:5555".parse().unwrap();
+        let mut abandoned = 0;
+        for _ in 0..7 {
+            let mut answer = Box::pin(gate.route(peer, initialize_request(&srv.host())));
+            // one poll: the session is created, and the request waits for the handler's answer
+            let pending = std::future::poll_fn(|cx| std::task::Poll::Ready(answer.as_mut().poll(cx).is_pending())).await;
+            // the handler answers (on a single thread, only while this test waits)
+            tokio::time::sleep(Duration::from_millis(100)).await;
+            drop(answer); // the client went away before its answer was read
+            abandoned += usize::from(pending);
+        }
+        assert!(abandoned >= 5, "{abandoned} requests were dropped mid-way");
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        let (rmcp, tracked) = session_counts(&gate).await;
+        assert_eq!(rmcp, tracked, "every rmcp session is tracked");
+        assert!(rmcp <= 4, "and the cap holds: {rmcp}");
+        // a complete initialize still works, and idle sessions are closed in time
+        assert_eq!(post(srv.addr, None, &[], &json!({"jsonrpc":"2.0","id":0,"method":"initialize","params":{"protocolVersion":"2025-06-18","capabilities":{},"clientInfo":{"name":"t","version":"1"}}})).await.status, 200);
+        let t0 = std::time::Instant::now();
+        while session_counts(&gate).await != (0, 0) {
+            assert!(t0.elapsed() < Duration::from_secs(20), "idle sessions are closed: {:?}", session_counts(&gate).await);
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+    })
+    .await;
+}
+
+/// The same over TCP: clients that reset their connection right after sending `initialize`, at
+/// varying moments, leave rmcp no session the gate does not track.
+#[tokio::test(flavor = "multi_thread")]
+async fn initializes_reset_by_the_client_leave_no_untracked_session() {
+    within(async {
+        let stats: Arc<Stats> = Arc::default();
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let limits = Limits { sessions: 8, ..Limits::default() };
+        let srv = Server::start_on(listener, demo(), HttpOptions::default(), limits, stats.clone());
+        let gate = gate_of(&stats).await;
+        let body = json!({"jsonrpc":"2.0","id":0,"method":"initialize","params":{"protocolVersion":"2025-06-18","capabilities":{},"clientInfo":{"name":"t","version":"1"}}}).to_string();
+        let req = format!(
+            "POST {MCP_PATH} HTTP/1.1\r\nHost: {}\r\nAccept: {}\r\nContent-Type: {}\r\nContent-Length: {}\r\n\r\n{body}",
+            srv.host(),
+            ACCEPT.1,
+            JSON.1,
+            body.len()
+        );
+        for i in 0..60u64 {
+            let mut s = TcpStream::connect(srv.addr).await.unwrap();
+            s.write_all(req.as_bytes()).await.unwrap();
+            tokio::time::sleep(Duration::from_micros(100 * (i % 20))).await;
+            s.set_zero_linger().unwrap();
+            drop(s); // RST
+        }
+        tokio::time::sleep(Duration::from_millis(500)).await;
+        let (rmcp, tracked) = session_counts(&gate).await;
+        assert_eq!(rmcp, tracked, "every rmcp session is tracked");
+        assert!(rmcp <= 8, "and the cap holds: {rmcp}");
+    })
+    .await;
+}
+
+/// A session client whose connection drops while its export runs (Wi-Fi, a proxy, a laptop
+/// going to sleep) has not cancelled it (MCP spec): the export goes on, and its session is
+/// neither closed to make room for new ones nor closed as idle, until the call ends.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_call_whose_client_disconnected_keeps_its_session() {
+    within(async {
+        let dir = std::env::temp_dir().join(format!("filmcraft-mcp-http-dropped-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let out = dir.join("dropped.mp4");
+        let (log, lines) = log_capture();
+        let opts = HttpOptions { session_idle: Some(Duration::from_millis(300)), log, ..HttpOptions::default() };
+        let limits = Limits { sessions: 2, reap_every: Duration::from_millis(50), ..Limits::default() };
+        let srv = Server::start_limited(demo(), opts, limits).await;
+        let (sid, _) = init(srv.addr, &[]).await;
+        let mut r = post(srv.addr, Some(&sid), &[], &export_call(5, &out.to_string_lossy(), 30.0, Some(json!("d")), None)).await;
+        loop {
+            let m = r.next().await.expect("progress");
+            assert_ne!(m["id"], 5, "finished before the disconnect: {m}");
+            if m["method"] == "notifications/progress" {
+                break;
+            }
+        }
+        drop(r); // no notifications/cancelled
+        // fill the cap twice over: idle sessions make room, the exporting one does not
+        for _ in 0..3 {
+            init(srv.addr, &[]).await;
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        // and stay idle well past session_idle
+        tokio::time::sleep(Duration::from_millis(1000)).await;
+        let jobs = tool_json(&call(srv.addr, &sid, 6, "command_run", json!({"id": "jobs.list"})).await);
+        let last = jobs.as_array().and_then(|a| a.last()).cloned().unwrap_or_default();
+        assert_eq!(last["finished"], false, "the export still runs: {jobs}");
+        assert!(lines.lock().unwrap().iter().any(|l| l.contains("closed the least recently used idle MCP session")));
+        // it ends only when cancelled; then the session is idle like any other
+        let c = post(srv.addr, Some(&sid), &[], &json!({"jsonrpc":"2.0","method":"notifications/cancelled","params":{"requestId":5}})).await;
+        assert_eq!(c.status, 202);
+        wait_gone(&out).await;
+        // (each try uses the session: wait longer than session_idle between them)
+        let t0 = std::time::Instant::now();
+        loop {
+            tokio::time::sleep(Duration::from_millis(800)).await;
+            if post(srv.addr, Some(&sid), &[], &ping(7)).await.status == 404 {
+                break;
+            }
+            assert!(t0.elapsed() < Duration::from_secs(30), "closed once idle");
+        }
         let _ = std::fs::remove_dir_all(&dir);
     })
     .await;
