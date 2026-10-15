@@ -22,11 +22,14 @@ struct Server {
 
 impl Server {
     async fn start(s: Session, opts: HttpOptions) -> Self {
+        Self::start_with(s, opts, Arc::default()).await
+    }
+    async fn start_with(s: Session, opts: HttpOptions, stats: Arc<Stats>) -> Self {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
         let (stop, rx) = tokio::sync::oneshot::channel::<()>();
         let mcp = FilmcraftMcp::headless(s);
-        let done = tokio::spawn(mcp.clone().serve_http_listener(listener, opts, async move {
+        let done = tokio::spawn(mcp.clone().serve_with(listener, opts, stats, async move {
             let _ = rx.await;
         }));
         Self { addr, stop: Some(stop), done, mcp }
@@ -282,6 +285,45 @@ async fn stateless_2026_07_28_requests() {
     assert_eq!(r.status, 200);
     let v = r.reply().await;
     assert_eq!((v["id"].as_u64(), v["error"]["code"].as_i64()), (Some(4), Some(-32602)), "{v}");
+}
+
+/// rmcp caches a schema lookup for every tools/call name it sees on a 2026-07-28 message, without
+/// bound: unknown names are answered before they reach it, with rmcp's own `tool not found`, and a
+/// notification naming one is accepted and dropped (a notification gets no reply).
+#[tokio::test(flavor = "multi_thread")]
+async fn unknown_tool_names_never_reach_rmcp() {
+    let stats = Arc::new(Stats::default());
+    let srv = Server::start_with(demo(), HttpOptions::default(), stats.clone()).await;
+    let meta = json!({
+        "io.modelcontextprotocol/protocolVersion": "2026-07-28",
+        "io.modelcontextprotocol/clientInfo": {"name": "t", "version": "1"},
+        "io.modelcontextprotocol/clientCapabilities": {},
+    });
+    let before = stats.services.load(Ordering::Relaxed);
+    for i in 0..40u64 {
+        let name = format!("no_such_tool_{i}");
+        let h = [("MCP-Protocol-Version", "2026-07-28"), ("Mcp-Method", "tools/call"), ("Mcp-Name", name.as_str())];
+        let msg = json!({"jsonrpc":"2.0","id":i,"method":"tools/call","params":{"_meta":meta,"name":name,"arguments":{}}});
+        let mut r = post(srv.addr, None, &h, &msg).await;
+        assert_eq!(r.status, 200);
+        let v = r.reply().await;
+        assert_eq!((v["id"].as_u64(), v["error"]["code"].as_i64(), v["error"]["message"].as_str()), (Some(i), Some(-32602), Some("tool not found")), "{v}");
+        let note = json!({"jsonrpc":"2.0","method":"tools/call","params":{"_meta":meta,"name":name,"arguments":{}}});
+        let r = post(srv.addr, None, &h, &note).await;
+        assert_eq!(r.status, 202, "a notification is not answered");
+        assert_eq!(r.text().await, "");
+    }
+    assert_eq!(stats.services.load(Ordering::Relaxed), before, "rmcp made no handler (and cached no schema) for an unknown name");
+    // a known tool still reaches rmcp
+    let h = [("MCP-Protocol-Version", "2026-07-28"), ("Mcp-Method", "tools/call"), ("Mcp-Name", "command_list")];
+    let msg = json!({"jsonrpc":"2.0","id":99,"method":"tools/call","params":{"_meta":meta,"name":"command_list","arguments":{"filter":"razor"}}});
+    let v = post(srv.addr, None, &h, &msg).await.reply().await;
+    assert_eq!(v["result"]["isError"], false, "{v}");
+    assert!(stats.services.load(Ordering::Relaxed) > before);
+    // a session client (before 2026-07-28) gets the same wording from rmcp's tool router
+    let (sid, _) = init(srv.addr, &[]).await;
+    let v = call(srv.addr, &sid, 1, "no_such_tool", json!({})).await;
+    assert_eq!(v["error"]["message"], "tool not found", "{v}");
 }
 
 /// Hostile requests get an HTTP error and change nothing; the server keeps serving.

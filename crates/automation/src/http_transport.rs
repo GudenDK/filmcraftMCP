@@ -19,6 +19,7 @@ use std::convert::Infallible;
 use std::future::Future;
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Duration;
 
 use bytes::Bytes;
@@ -29,6 +30,7 @@ use hyper::server::conn::http1;
 use hyper::service::service_fn;
 use hyper_util::rt::{TokioIo, TokioTimer};
 use rmcp::ServerHandler as _;
+use rmcp::model::ProtocolVersion;
 use rmcp::transport::streamable_http_server::SessionManager as _;
 use rmcp::transport::streamable_http_server::session::local::LocalSessionManager;
 use rmcp::transport::streamable_http_server::{StreamableHttpServerConfig, StreamableHttpService};
@@ -150,6 +152,14 @@ fn allowed_hosts(bound: SocketAddr, extra: &[String]) -> Vec<String> {
 type HttpBody = BoxBody<Bytes, Infallible>;
 type Mcp = StreamableHttpService<FilmcraftMcp, LocalSessionManager>;
 
+/// What a server counted (tests read it).
+#[derive(Default)]
+pub(crate) struct Stats {
+    /// Handlers rmcp asked for: one per session or stateless request, and one per tool name it
+    /// looks up a schema for.
+    pub(crate) services: AtomicUsize,
+}
+
 /// What every request is checked against before rmcp sees it.
 struct Gate {
     token: Option<Box<[u8]>>,
@@ -173,6 +183,17 @@ impl FilmcraftMcp {
         self,
         listener: tokio::net::TcpListener,
         opts: HttpOptions,
+        shutdown: impl Future<Output = ()> + Send + 'static,
+    ) -> Result<(), AutomationError> {
+        self.serve_with(listener, opts, Arc::default(), shutdown).await
+    }
+
+    /// [`Self::serve_http_listener`], counting into `stats`.
+    pub(crate) async fn serve_with(
+        self,
+        listener: tokio::net::TcpListener,
+        opts: HttpOptions,
+        stats: Arc<Stats>,
         shutdown: impl Future<Output = ()> + Send + 'static,
     ) -> Result<(), AutomationError> {
         let bound = listener.local_addr().map_err(|e| AutomationError::Other(format!("listener: {e}")))?;
@@ -207,7 +228,14 @@ impl FilmcraftMcp {
         let long_calls = self.long_calls.clone();
         // Called once per session (pre-2026-07-28 clients) or per request (2026-07-28): every
         // clone shares the one backend (`Arc<Backend>`), so all clients see the same project.
-        let mcp: Mcp = StreamableHttpService::new(move || Ok(self.clone()), sessions.clone(), config);
+        let mcp: Mcp = StreamableHttpService::new(
+            move || {
+                stats.services.fetch_add(1, Ordering::Relaxed);
+                Ok(self.clone())
+            },
+            sessions.clone(),
+            config,
+        );
         let permits = Arc::new(tokio::sync::Semaphore::new(MAX_CONNECTIONS as usize));
 
         loop {
@@ -298,16 +326,19 @@ async fn route(mcp: &Mcp, gate: &Gate, req: Request<Incoming>) -> Response<HttpB
         let id = msg.get("id").cloned().unwrap_or(Value::Null);
         return jsonrpc_error(StatusCode::SERVICE_UNAVAILABLE, id, -32000, format!("too many MCP sessions ({MAX_SESSIONS}); end unused ones with DELETE"));
     }
-    // rmcp caches one schema lookup per distinct tools/call name on requests declaring
-    // MCP-Protocol-Version >= 2026-07-28 (SEP-2243 header checks), without bound: only known tool
-    // names may reach it. Same lexical comparison as rmcp.
-    let modern = parts.headers.get("mcp-protocol-version").and_then(|v| v.to_str().ok()).is_some_and(|v| v >= "2026-07-28");
-    if modern && method == Some("tools/call") {
+    // rmcp caches one schema lookup per distinct tools/call name, without bound, for messages
+    // declaring MCP-Protocol-Version >= 2026-07-28 (SEP-2243 header checks; the same lexical
+    // comparison and header as rmcp): only known tool names may reach it. A request gets rmcp's
+    // own unknown-tool error; a notification is accepted and dropped, as it gets no reply.
+    let checks_headers =
+        parts.headers.get("mcp-protocol-version").and_then(|v| v.to_str().ok()).is_some_and(|v| v >= ProtocolVersion::STANDARD_HEADERS.as_str());
+    if checks_headers && method == Some("tools/call") {
         let name = msg.pointer("/params/name").and_then(Value::as_str).unwrap_or_default();
         if gate.tools.get_tool(name).is_none() {
-            let shown: String = name.chars().take(64).collect();
-            let id = msg.get("id").cloned().unwrap_or(Value::Null);
-            return jsonrpc_error(StatusCode::OK, id, -32602, format!("unknown tool `{shown}`"));
+            return match msg.get("id").filter(|id| !id.is_null()) {
+                Some(id) => jsonrpc_error(StatusCode::OK, id.clone(), -32602, "tool not found".into()),
+                None => accepted(),
+            };
         }
     }
     mcp.handle(Request::from_parts(parts, Full::new(bytes))).await
@@ -336,6 +367,13 @@ fn jsonrpc_error(status: StatusCode, id: Value, code: i64, message: String) -> R
     let mut r = Response::new(Full::new(Bytes::from(body)).boxed());
     *r.status_mut() = status;
     r.headers_mut().insert(header::CONTENT_TYPE, HeaderValue::from_static("application/json"));
+    r
+}
+
+/// `202 Accepted` with no body, as rmcp answers a notification.
+fn accepted() -> Response<HttpBody> {
+    let mut r = Response::new(Full::new(Bytes::new()).boxed());
+    *r.status_mut() = StatusCode::ACCEPTED;
     r
 }
 

@@ -15,8 +15,11 @@ filmcraft-time = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 thiserror = { workspace = true }
-# 3.5.1: a tool's invalid-params error (strict arguments) stays an in-band JSON-RPC error over HTTP
-rmcp = { version = "3.5.1", default-features = false, features = ["server", "macros", "transport-io", "transport-streamable-http-server"] }
+# 3.5.1: a tool's invalid-params error (strict arguments) stays an in-band JSON-RPC error over HTTP.
+# Pinned to 3.5.x: the http_transport module mirrors rmcp's Streamable HTTP checks (Host, Origin, Accept,
+# Content-Type and their wording, the SEP-2243 header comparison that feeds its per-tool-name
+# schema cache) and relies on LocalSessionManager's session semantics; review it before moving on.
+rmcp = { version = "~3.5.1", default-features = false, features = ["server", "macros", "transport-io", "transport-streamable-http-server"] }
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "io-std", "sync", "net", "io-util", "time"] }
 base64 = "0.22"
 schemars = "1"
