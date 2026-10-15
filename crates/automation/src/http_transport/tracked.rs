@@ -2,9 +2,10 @@
 //! every call its sessions' handlers run reported to [`Sessions`], where they happen: an HTTP
 //! request future can be dropped at any await (its client went away), so bookkeeping done there,
 //! after rmcp returns, could miss a session rmcp already created, which nothing would then ever
-//! close or count. Calls are tracked on the session's transport, between rmcp's worker and the
-//! handler, so a call counts as running until the handler answers it, whether or not its client is
-//! still connected.
+//! close or count. For the same reason a session is closed on a task of its own, and forgotten
+//! only once rmcp has closed it. Calls are tracked on the session's transport, between rmcp's
+//! worker and the handler, so a call counts as running until the handler answers it, whether or
+//! not its client is still connected.
 
 use std::sync::{Arc, Mutex, PoisonError};
 
@@ -14,7 +15,7 @@ use rmcp::model::{ClientJsonRpcMessage, ClientNotification, JsonRpcMessage, Serv
 use rmcp::transport::Transport;
 use rmcp::transport::WorkerTransport;
 use rmcp::transport::streamable_http_server::SessionManager;
-use rmcp::transport::streamable_http_server::session::local::{LocalSessionManager, LocalSessionManagerError, LocalSessionWorker};
+use rmcp::transport::streamable_http_server::session::local::{LocalSessionManager, LocalSessionManagerError, LocalSessionWorker, SessionError};
 use rmcp::transport::streamable_http_server::session::{ServerSseMessage, SessionId};
 
 use super::sessions::{Flight, Reservation, Sessions};
@@ -49,7 +50,7 @@ impl Initializing {
 
 /// [`LocalSessionManager`], reporting to [`Sessions`].
 pub(super) struct TrackedSessions {
-    pub(super) inner: LocalSessionManager,
+    pub(super) inner: Arc<LocalSessionManager>,
     pub(super) sessions: Arc<Sessions>,
 }
 
@@ -87,9 +88,22 @@ impl SessionManager for TrackedSessions {
         self.inner.has_session(id).await
     }
 
+    /// Close session `id` (a no-op for one that is unknown or closed already) on a task of its own,
+    /// then forget it. The request that asks (a `DELETE`) can be dropped at any await, when its
+    /// client resets the connection: rmcp first waits for its session map's lock, which every
+    /// request that is handing a message to a session holds for a while. A close cut short there
+    /// would leave rmcp a session that the gate no longer counts or closes, and a client could
+    /// pile those up without limit.
     async fn close_session(&self, id: &SessionId) -> Result<(), Self::Error> {
-        self.sessions.ended(id);
-        self.inner.close_session(id).await
+        let (inner, sessions, id) = (self.inner.clone(), self.sessions.clone(), id.clone());
+        let closing = tokio::spawn(async move {
+            let closed = inner.close_session(&id).await;
+            // either way rmcp no longer has it: it takes the session out of its map, then closes it
+            sessions.ended(&id);
+            closed
+        });
+        // a panic while closing: still tracked, so the reaper closes it later
+        closing.await.unwrap_or_else(|_| Err(SessionError::Io(std::io::Error::other("internal error while closing the session")).into()))
     }
 
     async fn create_stream(

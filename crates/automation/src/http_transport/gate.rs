@@ -190,8 +190,8 @@ impl Gate {
                 (None, Some("initialize")) => match self.sessions.reserve() {
                     Some((r, evict)) => {
                         if let Some(old) = evict {
-                            // on its own task: this request may be dropped at any await (its
-                            // client gone), and the session is no longer counted
+                            // closed on its own task (`tracked.rs`) whether or not this request
+                            // lives on; it need not wait for that
                             let rmcp = self.rmcp_sessions.clone();
                             tokio::spawn(async move {
                                 let _ = rmcp.close_session(&old.as_str().into()).await;

@@ -1072,6 +1072,181 @@ async fn initializes_reset_by_the_client_leave_no_untracked_session() {
     .await;
 }
 
+/// A request on session `sid` as the gate gets it from hyper.
+fn session_request(method: &str, host: &str, sid: &str, body: Option<&Value>) -> http::Request<http_body_util::Full<Bytes>> {
+    let r = http::Request::builder()
+        .method(method)
+        .uri(MCP_PATH)
+        .header("host", host)
+        .header("accept", if method == "GET" { "text/event-stream" } else { ACCEPT.1 })
+        .header("content-type", JSON.1)
+        .header("mcp-session-id", sid)
+        .header("mcp-protocol-version", "2025-06-18");
+    r.body(http_body_util::Full::new(Bytes::from(body.map(Value::to_string).unwrap_or_default()))).unwrap()
+}
+
+/// Poll `fut` `polls` times, letting other tasks run in between, then drop it: a client that
+/// resets its connection there (hyper drops the request's future).
+async fn poll_then_drop<F: Future>(fut: F, polls: usize) {
+    let mut fut = Box::pin(fut);
+    for _ in 0..polls {
+        if std::future::poll_fn(|cx| std::task::Poll::Ready(fut.as_mut().poll(cx).is_ready())).await {
+            break;
+        }
+        tokio::task::yield_now().await;
+    }
+}
+
+/// Wait until rmcp holds no session and the gate tracks none.
+async fn all_sessions_closed(gate: &gate::Gate, within: Duration) {
+    let t0 = std::time::Instant::now();
+    while session_counts(gate).await != (0, 0) {
+        assert!(t0.elapsed() < within, "every session is closed, in rmcp too: (rmcp, tracked) = {:?}", session_counts(gate).await);
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+}
+
+/// A `DELETE` whose client resets the connection while rmcp waits for its session lock (another
+/// request holds it while it hands a message to a session) still closes the session: the gate
+/// used to forget it first, and rmcp's close was cut short with the request, leaving a session
+/// that nothing counted or closed (no idle timeout here, so nothing else would close it).
+#[tokio::test(flavor = "current_thread")]
+async fn a_delete_dropped_mid_request_still_closes_its_session() {
+    within(async {
+        let stats: Arc<Stats> = Arc::default();
+        let opts = HttpOptions { session_idle: None, ..HttpOptions::default() };
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let srv = Server::start_on(listener, demo(), opts, Limits::default(), stats.clone());
+        let gate = gate_of(&stats).await;
+        let (sid, _) = init(srv.addr, &[]).await;
+        assert_eq!(session_counts(&gate).await, (1, 1));
+        let peer: SocketAddr = "127.0.0.1:5555".parse().unwrap();
+        let trusted = std::sync::atomic::AtomicBool::new(false);
+        let busy = gate.rmcp_sessions.inner.sessions.read().await; // another request's
+        let mut delete = Box::pin(gate.route(peer, session_request("DELETE", &srv.host(), &sid, None), &trusted));
+        let pending = std::future::poll_fn(|cx| std::task::Poll::Ready(delete.as_mut().poll(cx).is_pending())).await;
+        assert!(pending, "the DELETE waits for the lock");
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        drop(delete); // the client reset the connection
+        drop(busy);
+        all_sessions_closed(&gate, Duration::from_secs(10)).await;
+        assert_eq!(post(srv.addr, Some(&sid), &[], &ping(1)).await.status, 404);
+    })
+    .await;
+}
+
+/// Every kind of request, dropped (its client gone) after one, two or three polls, while rmcp's
+/// session map is free, read-locked or write-locked by others: no session is left that rmcp holds
+/// and the gate does not track, none stays "in flight" for good, and idle ones are all closed.
+#[tokio::test(flavor = "current_thread")]
+async fn requests_dropped_at_any_stage_leave_no_untracked_session() {
+    within(async {
+        let stats: Arc<Stats> = Arc::default();
+        let opts = HttpOptions { session_idle: Some(Duration::from_millis(300)), ..HttpOptions::default() };
+        let limits = Limits { reap_every: Duration::from_millis(50), ..Limits::default() };
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let srv = Server::start_on(listener, demo(), opts, limits, stats.clone());
+        let gate = gate_of(&stats).await;
+        let peer: SocketAddr = "127.0.0.1:5555".parse().unwrap();
+        let trusted = std::sync::atomic::AtomicBool::new(false);
+        let host = srv.host();
+        let jobs = json!({"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"command_run","arguments":{"id":"jobs.list"}}});
+        let mut cases = 0;
+        for kind in ["initialize", "ping", "call", "GET", "DELETE"] {
+            for lock in ["none", "read", "write"] {
+                for polls in 1..=3 {
+                    let (sid, _) = init(srv.addr, &[]).await;
+                    let req = match kind {
+                        "initialize" => initialize_request(&host),
+                        "ping" => session_request("POST", &host, &sid, Some(&ping(1))),
+                        "call" => session_request("POST", &host, &sid, Some(&jobs)),
+                        "GET" => session_request("GET", &host, &sid, None),
+                        _ => session_request("DELETE", &host, &sid, None),
+                    };
+                    let map = &gate.rmcp_sessions.inner.sessions;
+                    let (_read, _write) = match lock {
+                        "read" => (Some(map.read().await), None),
+                        "write" => (None, Some(map.write().await)),
+                        _ => (None, None),
+                    };
+                    poll_then_drop(gate.route(peer, req, &trusted), polls).await;
+                    cases += 1;
+                }
+                tokio::task::yield_now().await;
+            }
+        }
+        assert_eq!(cases, 45);
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        let (rmcp, tracked) = session_counts(&gate).await;
+        assert_eq!(rmcp, tracked, "every rmcp session is tracked");
+        all_sessions_closed(&gate, Duration::from_secs(20)).await;
+    })
+    .await;
+}
+
+/// Over TCP, with other clients keeping rmcp's session lock busy: clients that reset their
+/// connection right after sending `DELETE`, at varying moments, leave rmcp no session the gate
+/// does not track.
+#[tokio::test(flavor = "multi_thread")]
+async fn deletes_reset_by_the_client_leave_no_untracked_session() {
+    within(async {
+        let stats: Arc<Stats> = Arc::default();
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let opts = HttpOptions { session_idle: None, ..HttpOptions::default() };
+        let srv = Server::start_on(listener, demo(), opts, Limits { sessions: 512, ..Limits::default() }, stats.clone());
+        let gate = gate_of(&stats).await;
+        let mut ids = Vec::new();
+        for _ in 0..408 {
+            ids.push(init(srv.addr, &[]).await.0);
+        }
+        let busy: Vec<String> = ids.drain(..8).collect();
+        let stop = CancellationToken::new();
+        let mut contenders = Vec::new();
+        for sid in busy.clone() {
+            let (addr, stop) = (srv.addr, stop.clone());
+            contenders.push(tokio::spawn(async move {
+                let mut id = 1;
+                while !stop.is_cancelled() {
+                    let _ = post(addr, Some(&sid), &[], &ping(id)).await.reply().await;
+                    id += 1;
+                }
+            }));
+        }
+        let mut deleters = Vec::new();
+        for (n, chunk) in ids.chunks(50).enumerate() {
+            let (addr, host, chunk) = (srv.addr, srv.host(), chunk.to_vec());
+            deleters.push(tokio::spawn(async move {
+                for (i, sid) in chunk.iter().enumerate() {
+                    let mut s = TcpStream::connect(addr).await.unwrap();
+                    let req = format!("DELETE {MCP_PATH} HTTP/1.1\r\nHost: {host}\r\nMcp-Session-Id: {sid}\r\nMCP-Protocol-Version: 2025-06-18\r\n\r\n");
+                    s.write_all(req.as_bytes()).await.unwrap();
+                    tokio::time::sleep(Duration::from_micros(((i + n) % 9) as u64 * 50)).await;
+                    s.set_zero_linger().unwrap();
+                    drop(s); // RST
+                }
+            }));
+        }
+        for d in deleters {
+            d.await.unwrap();
+        }
+        stop.cancel();
+        for c in contenders {
+            c.await.unwrap();
+        }
+        // (a DELETE reset before the server read it closes nothing: then the gate still tracks it)
+        let t0 = std::time::Instant::now();
+        loop {
+            let (rmcp, tracked) = session_counts(&gate).await;
+            if rmcp == tracked {
+                break;
+            }
+            assert!(t0.elapsed() < Duration::from_secs(20), "every rmcp session is tracked: {rmcp} in rmcp, {tracked} tracked");
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await;
+}
+
 /// A session client whose connection drops while its export runs (Wi-Fi, a proxy, a laptop
 /// going to sleep) has not cancelled it (MCP spec): the export goes on, and its session is
 /// neither closed to make room for new ones nor closed as idle, until the call ends.
