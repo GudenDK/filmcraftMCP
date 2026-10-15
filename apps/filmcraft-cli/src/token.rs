@@ -1432,4 +1432,54 @@ mod tests {
             assert_eq!(String::from_utf8_lossy(&out.stdout), format!("--header|Authorization: Bearer {want}"), "{arg}");
         }
     }
+
+    /// The header the server prints on Windows, run by PowerShell, is `Authorization: Bearer
+    /// <token>`: for a stored token in a folder with quotes (straight and typographic), `[ ]`, `$`,
+    /// a backtick and spaces in its name, for token files as PowerShell, cmd.exe and Notepad write
+    /// them, and from the variable. Runs Windows PowerShell 5.1 on Windows, PowerShell 7 (`pwsh`)
+    /// elsewhere when it is installed; skipped when there is neither.
+    #[test]
+    fn the_header_to_paste_works_in_powershell() {
+        let runs =
+            |p: &str| std::process::Command::new(p).args(["-NoProfile", "-NonInteractive", "-Command", "exit 0"]).output().is_ok_and(|o| o.status.success());
+        let Some(ps) = ["powershell", "pwsh"].into_iter().find(|p| runs(p)) else { return };
+        let tmp = TempDir::new("powershell");
+        let dir = tmp.0.join("it's a $HOME `dir` [beta] O\u{2019}Brien");
+        let path = dir.join(STORED_FILE);
+        let token = load_or_create(&path).unwrap().token;
+        let files: Vec<(&str, Vec<u8>)> = vec![
+            ("lf.txt", format!("{TOKEN}\nsecond line\n").into_bytes()),
+            ("crlf.txt", format!("{TOKEN}\r\nsecond\r\n").into_bytes()),
+            ("bom.txt", [&[0xEF, 0xBB, 0xBF][..], format!("{TOKEN}\r\n").as_bytes()].concat()),
+            ("utf16.txt", utf16le(&format!("{TOKEN}\r\n"), true)),
+            ("utf16be.txt", utf16be(&format!("{TOKEN}\r\n"))),
+            ("cmd.txt", format!(" {TOKEN} \r\n").into_bytes()),
+        ];
+        let mut sources = vec![(Source::Stored { path, created: false }, token.clone()), (Source::Env, "from-env".to_string())];
+        for (name, bytes) in files {
+            let file = dir.join(name);
+            std::fs::write(&file, bytes).unwrap();
+            sources.push((Source::File(file), TOKEN.to_string()));
+        }
+        // each header's argument, as PowerShell expands it, on a line of its own
+        let mut script = String::new();
+        for (source, _) in &sources {
+            let arg = header_arg(source, true).unwrap();
+            let quoted = arg.strip_prefix("--header ").unwrap();
+            script.push_str(&format!("[Console]::Out.WriteLine({quoted})\n"));
+        }
+        // a script file in UTF-8 with a byte-order mark, which Windows PowerShell 5.1 needs to read
+        // it as UTF-8 (the typographic quote); `-Command -` would echo terminal escapes in pwsh
+        let ps1 = tmp.0.join("headers.ps1");
+        std::fs::write(&ps1, [&[0xEF, 0xBB, 0xBF][..], script.as_bytes()].concat()).unwrap();
+        let out = std::process::Command::new(ps)
+            .args(["-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass", "-File"])
+            .arg(&ps1)
+            .env(TOKEN_ENV, "from-env")
+            .output()
+            .unwrap();
+        let got: Vec<String> = String::from_utf8_lossy(&out.stdout).lines().map(str::to_string).collect();
+        let want: Vec<String> = sources.iter().map(|(_, t)| format!("Authorization: Bearer {t}")).collect();
+        assert_eq!(got, want, "{script}\nstderr: {}", String::from_utf8_lossy(&out.stderr));
+    }
 }
