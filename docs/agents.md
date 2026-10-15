@@ -46,7 +46,9 @@ The release packages ship `filmcraft-cli` alongside the desktop app, so no build
 | Install | CLI |
 |---|---|
 | Windows (MSI) | `C:\Program Files\FilmCraft\filmcraft-cli.exe` by default (wherever you installed it otherwise), not on `PATH` |
+| Windows (portable zip) | `filmcraft-cli.exe` next to `filmcraft.exe` in the folder you unzipped |
 | Linux (deb, rpm) | `/usr/bin/filmcraft-cli` |
+| Linux (Flatpak) | `flatpak run --command=filmcraft-cli ai.storyteller.filmcraft` |
 | macOS | the separate `filmcraft-cli-<version>-macos-<arch>.zip` release asset (the `.app` holds only the desktop app) |
 
 ```sh
@@ -55,6 +57,10 @@ claude mcp add filmcraft -- "C:\Program Files\FilmCraft\filmcraft-cli.exe" mcp
 # Linux, or macOS with the CLI unzipped onto PATH
 claude mcp add filmcraft -- filmcraft-cli mcp
 ```
+
+To run the CLI yourself in PowerShell, put the call operator `&` in front of a quoted path:
+`& "C:\Program Files\FilmCraft\filmcraft-cli.exe" mcp --demo`. Without it, PowerShell prints the
+string instead of running it.
 
 ### HTTP transport
 
@@ -72,30 +78,57 @@ filmcraft-cli mcp --bridge 127.0.0.1:9876 --http 127.0.0.1:9877   # ... over HTT
 
 ```text
 filmcraft-cli: MCP (Streamable HTTP) on http://127.0.0.1:9877/mcp, driving a headless engine with the demo project; no token: any local process can connect. Ctrl+C stops it.
+filmcraft-cli: connect Claude Code with: claude mcp add --transport http filmcraft-http http://127.0.0.1:9877/mcp
 ```
 
-`ADDR` is `PORT`, `127.0.0.1:PORT`, `[::1]:PORT` or `localhost:PORT` (all loopback);
-`127.0.0.1:0` picks a free port, and the line above, on stderr, shows the real one. Ctrl+C stops the
-server: calls in flight are cancelled, exports delete their partial files (it waits up to 15 s for
-them), and a second Ctrl+C quits at once. A port that is taken exits 1 with a hint (on Windows,
-reserved port ranges show in `netsh int ipv4 show excludedportrange protocol=tcp`).
+`--http` is newer than the 0.8.0 release, whose `filmcraft-cli` stops with "unknown mcp option"
+(exit 2). `filmcraft-cli help` lists `mcp --http <ADDR>` in builds that have it. Until a release
+has it, build from source (see [Windows quick start](#windows-quick-start)).
+
+`ADDR` is `PORT`, `127.0.0.1:PORT`, `[::1]:PORT` or `localhost:PORT`, all loopback. `PORT` alone
+means `127.0.0.1:PORT`. `localhost:PORT` listens on `127.0.0.1` and also on `[::1]` at the same
+port where the system has IPv6, because a client may resolve `localhost` to either address. If
+another program already holds `[::1]:PORT`, it warns. Put `127.0.0.1` in client URLs anyway:
+then the client cannot reach another program on `[::1]`.
+`127.0.0.1:0` picks a free port, and the lines above, on stderr, show the real one. A port that is
+taken exits 1 with a hint (on Windows, reserved port ranges show in
+`netsh int ipv4 show excludedportrange protocol=tcp`).
+
+**Stopping.** Ctrl+C stops the server, and so do `SIGTERM` and `SIGHUP` (`kill`, `systemctl stop`,
+`docker stop`, a closed terminal) and, on Windows, Ctrl+Break, closing its console window, logging
+off and shutting down. The server says which one it got. The port closes at once, calls in flight
+are cancelled and sessions closed, and exports get time to delete their partial files: 15 s, or
+3 s when Windows is closing the console, logging off or shutting down (it ends the process about
+5 s after telling it). The output of an export still running at the end is deleted. A second
+signal quits at once. Stdio mode (`mcp` without `--http`) stops on the same signals.
 
 **Every client shares one backend.** All clients drive the same engine session (headless) or the
 same app (bridge): one project, one undo history. An edit made by one client is what the next
 `doc_inspect` shows the others, `edit.undo` from one client can undo another's edit, and the steps of
 two clients' `command_batch` calls can interleave.
 
-**Connecting.** Use the URL with the client's HTTP transport:
+#### Connecting clients
+
+**Claude Code.** Add the URL with the HTTP transport. `--scope user` makes it available in every
+project; the default scope is the current project only:
 
 ```sh
-claude mcp add --transport http filmcraft-http http://127.0.0.1:9877/mcp
+claude mcp add --transport http --scope user filmcraft-http http://127.0.0.1:9877/mcp
+claude mcp list                     # filmcraft-http: ✔ Connected, while the server runs
 ```
 
-```json
-{ "mcpServers": { "filmcraft-http": { "type": "http", "url": "http://127.0.0.1:9877/mcp" } } }
+With a token (see Security below), add the header after the name and URL, as Claude Code's own
+examples do:
+
+```sh
+claude mcp add --transport http --scope user filmcraft-http http://127.0.0.1:9877/mcp --header "Authorization: Bearer <token>"
 ```
 
-With a token, the client sends it in a header (Claude Code expands `${VAR}` in `.mcp.json`):
+That stores the token in your Claude Code settings (`~/.claude.json`). In a shell where the
+variable is set, write `"Authorization: Bearer $FILMCRAFT_MCP_TOKEN"` (PowerShell:
+`"Authorization: Bearer $env:FILMCRAFT_MCP_TOKEN"`) so you do not have to paste it. To keep the
+token out of the settings file, register the server in a `.mcp.json` instead and let Claude Code
+fill it in from the environment when it starts:
 
 ```json
 {
@@ -109,39 +142,205 @@ With a token, the client sends it in a header (Claude Code expands `${VAR}` in `
 }
 ```
 
+`${FILMCRAFT_MCP_TOKEN}` must then be set in the environment Claude Code starts in. On Windows,
+`$env:FILMCRAFT_MCP_TOKEN = "..."` lasts only for that PowerShell window. Store it for your user
+with `setx FILMCRAFT_MCP_TOKEN "<token>"`, then open a new terminal and start Claude Code (and the
+server) from there: `setx` does not change windows that are already open. Without the variable,
+`claude mcp list` warns that it is missing and Claude Code sends the text `${FILMCRAFT_MCP_TOKEN}`
+as the token: every request gets 401, and after 10 of them 429 for a minute.
+
 The repository's `.mcp.json` keeps the stdio servers, which Claude Code starts by itself; an HTTP
-entry only connects while a server is running. Claude Desktop runs local servers over stdio, so use
-the stdio command there.
+entry only connects while a server is running.
 
-**Security.** Over HTTP any program that can open a socket can reach the server, and the tools write
-files wherever the user can, so the endpoint is locked down by default:
+**Other clients.** Any client with the Streamable HTTP transport takes the same URL, as
+`{"type": "http", "url": "http://127.0.0.1:9877/mcp"}` or its equivalent. Claude Desktop runs local
+servers over stdio, so use the stdio command there. MCP Inspector needs no flag in its default
+proxy mode, where its own Node process makes the requests and sends no `Origin`. Only its direct
+mode, where the browser calls the server, needs `--allow-origin http://localhost:6274` (see
+Security).
 
-- It listens on a loopback address. Any other address (`0.0.0.0:9877`, a LAN IP) needs a token (else
-  exit 2), and a warning says that plain HTTP carries the token and every request in clear text:
-  prefer `ssh -L 9877:127.0.0.1:9877 host`, or a TLS reverse proxy with `--allow-host`.
-- `Host` must name the server (`127.0.0.1:<port>`, `localhost:<port>` or `[::1]:<port>`), so a web
-  page that rebinds its DNS name to 127.0.0.1 gets 403. `--allow-host NAME[:PORT]` (repeatable) adds
-  names: a LAN name, `host.docker.internal:<port>` for a client in Docker, a tunnel.
+**Containers and sandboxes.**
+
+- A client in a Docker Desktop container (Windows, macOS) reaches the host as
+  `host.docker.internal`, which Docker Desktop forwards to the host's loopback, so the server can
+  stay on `127.0.0.1`. Add `--allow-host host.docker.internal:9877` so its `Host` is accepted.
+  Docker Engine on Linux has no such name by default. There, run the client with `--network host`
+  and use `127.0.0.1`. Otherwise, listen on the bridge address (e.g. `--http 172.17.0.1:9877`,
+  which needs a token) and start the client with `--add-host=host.docker.internal:host-gateway`.
+- The Flatpak sandbox has no network by default. The server can listen inside it, but host clients
+  cannot reach it until you grant network access:
+  `flatpak override --user --share=network ai.storyteller.filmcraft`.
+
+**Bridge mode.** The token and the checks below protect only the HTTP endpoint. The app's
+`--control` port has no authentication of its own: any local process can connect to it and drive
+the app directly, token or not. Keep it on loopback (it always is) and only enable it while you use
+it.
+
+#### Windows quick start
+
+For the desktop app driven over HTTP from PowerShell. The 0.8.0 release has no `--http`, so build
+the CLI and the app from a branch that has it, e.g. `mcp-http-prototype` of
+`https://github.com/GudenDK/filmcraftMCP`. You need Git, Rust from <https://rustup.rs> and the
+MSVC build tools (Visual Studio Build Tools, "Desktop development with C++"):
+
+```powershell
+git clone --branch mcp-http-prototype https://github.com/GudenDK/filmcraftMCP.git filmcraft
+cd filmcraft
+cargo build --release -p filmcraft-cli -p filmcraft     # the first build takes a while
+& .\target\release\filmcraft-cli.exe help              # lists `mcp --http <ADDR>`
+```
+
+Pick a port nothing else uses and Windows does not reserve. `9877` usually works; check with:
+
+```powershell
+Get-NetTCPConnection -LocalPort 9877 -ErrorAction SilentlyContinue   # no output: free
+netsh int ipv4 show excludedportrange protocol=tcp                   # 9877 must not be in a range
+```
+
+Start the app with its control channel, then the MCP server in front of it. Leave that window open:
+closing it stops the server. (The control port takes no token: see Bridge mode above.)
+
+```powershell
+Start-Process .\target\release\filmcraft.exe -ArgumentList '--control', '9876'
+& .\target\release\filmcraft-cli.exe mcp --bridge 127.0.0.1:9876 --http 127.0.0.1:9877
+```
+
+Use `& .\target\release\filmcraft-cli.exe mcp --demo --http 127.0.0.1:9877` for a headless engine
+without the app instead. On `127.0.0.1` Windows Firewall does not ask anything, because nothing
+outside the machine can connect. It asks about network access only when you listen on `0.0.0.0` or
+a LAN address; allow it on private networks only.
+
+In another terminal, connect Claude Code and check it:
+
+```powershell
+claude mcp add --transport http --scope user filmcraft-http http://127.0.0.1:9877/mcp
+claude mcp list
+```
+
+To require a token as well, store one for your user. This is optional on a single-user PC, since
+the server only accepts local connections, but use it when others share the machine:
+
+```powershell
+setx FILMCRAFT_MCP_TOKEN ([guid]::NewGuid().ToString("N") + [guid]::NewGuid().ToString("N"))
+```
+
+`setx` changes only windows opened later, so stop the server and close the open PowerShell windows
+(and Claude Code). In a new window, in the `filmcraft` folder, start the server as before: it reads
+`FILMCRAFT_MCP_TOKEN` by itself, and its first line now says `bearer token required`. In another
+new window, register Claude Code again with the token:
+
+```powershell
+claude mcp remove filmcraft-http --scope user
+claude mcp add --transport http --scope user filmcraft-http http://127.0.0.1:9877/mcp --header "Authorization: Bearer $env:FILMCRAFT_MCP_TOKEN"
+```
+
+#### Security
+
+Over HTTP any program that can open a socket can reach the server, and the tools write files
+wherever the user can, so the endpoint is locked down by default:
+
+- It listens on a loopback address. Any other address (`0.0.0.0:9877`, a LAN IP) needs a token of at
+  least 32 characters (else exit 2), and a warning says that plain HTTP carries the token and every
+  request in clear text: prefer `ssh -L 9877:127.0.0.1:9877 host`, or a TLS reverse proxy with
+  `--allow-host`. On `0.0.0.0` the first lines show the loopback URL, the `Host` values accepted, and
+  the `--allow-host <ip>:<port>` LAN clients need (until then they get 403).
+- `Host` must name the server: `127.0.0.1:<port>`, `localhost:<port>`, `[::1]:<port>` or the address
+  it listens on. A web page that rebinds its DNS name to 127.0.0.1 gets 403.
+  `--allow-host NAME[:PORT]` (repeatable) adds names: a LAN name or IP, `host.docker.internal:<port>`,
+  a tunnel. A name without a port matches every port. A malformed entry exits 2.
 - A request with an `Origin` header comes from a browser and gets 403, unless the origin is listed
-  with `--allow-origin` (repeatable, e.g. `--allow-origin http://localhost:6274` for MCP Inspector).
-  MCP clients send no `Origin`. No CORS headers are sent.
+  with `--allow-origin` (repeatable). MCP clients send no `Origin`. An entry is `scheme://host:port`
+  with the port written out, exactly as the browser sends it: `http://localhost:6274` and
+  `http://127.0.0.1:6274` are different origins. Wildcards (`*`, `:*`), an entry without a port
+  (it would match every port), paths and user names exit 2. `null` is accepted with a warning:
+  every sandboxed frame and `file:` page sends it, so use it only with a token.
+- A listed origin gets CORS headers, so a page there can call the server: its preflight
+  (`OPTIONS` with `Access-Control-Request-Method`) gets 204 with `Access-Control-Allow-Origin`,
+  `Access-Control-Allow-Methods: GET, POST, DELETE` and the MCP request headers
+  (`Content-Type`, `Accept`, `Authorization`, `Mcp-Session-Id`, `Mcp-Protocol-Version`,
+  `Mcp-Method`, `Mcp-Name`, `Last-Event-Id`, `Mcp-Param-*`), before the token check because
+  browsers send preflights without credentials. Every answer to it carries
+  `Access-Control-Allow-Origin`, `Vary: Origin` and
+  `Access-Control-Expose-Headers: Mcp-Session-Id, Mcp-Protocol-Version, WWW-Authenticate`. Other
+  origins never get CORS headers.
 - **Token.** Set `FILMCRAFT_MCP_TOKEN`, or pass `--token-file FILE` (its first line), and every
   request (every method, before anything else) needs `Authorization: Bearer <token>`, else 401. The
-  token is compared in constant time and never printed. There is no `--token VALUE`: other users can
-  read a command line. Without a token, any local process (any user, on a shared machine) can drive
-  FilmCraft; use one on shared machines. Generate one with e.g. `openssl rand -hex 32`, or on Windows
-  `[guid]::NewGuid().ToString("N") + [guid]::NewGuid().ToString("N")` in PowerShell.
-- At most 64 connections and 256 sessions at once; request bodies up to 4 MiB (413 above).
+  token is compared in constant time and never printed or logged. There is no `--token VALUE`:
+  other users can read a command line. Without a token, any local process (any user, on a shared
+  machine) can drive FilmCraft; use one on shared machines. Generate one with
+  `openssl rand -hex 32`, or in PowerShell with
+  `[guid]::NewGuid().ToString("N") + [guid]::NewGuid().ToString("N")`.
+- **Token files.** They may be UTF-8 or ASCII, with or without a byte-order mark, or UTF-16 with
+  one; line breaks and surrounding spaces are dropped. That covers Windows PowerShell 5.1's
+  `'token' > token.txt` (UTF-16) and cmd's `echo`. A file with no usable first line exits 2 with
+  a message that never shows its content. A new token written as ASCII always works:
+  `Set-Content -Encoding ascii -Path $env:USERPROFILE\filmcraft-token.txt -Value ([guid]::NewGuid().ToString("N") + [guid]::NewGuid().ToString("N"))`
+  in PowerShell, `(umask 077; openssl rand -hex 32 > token.txt)` elsewhere. On Linux and macOS a
+  token file that other users can read or change gets a warning (`chmod 600` it). On Windows,
+  your profile folder is readable only by you and administrators by default.
+- After 10 failed authentications within a minute, an address gets 429 (`Retry-After`) for a
+  minute, whatever token it sends, so guessing a token gets nowhere. Other addresses are not
+  affected.
 
-**Protocol details.**
+#### Limits and timeouts
+
+- **Connections.** At most 32 at once from one address (an IPv4 address, or an IPv6 /64) and 256
+  in all. Local clients all connect from 127.0.0.1 (or ::1), so they share those 32. One more
+  gets `503 Service Unavailable` with `Retry-After: 1` and is closed.
+- **Slow and idle clients.** A request's line and headers must arrive within 10 s. A keep-alive
+  connection with no request for 10 s is closed. A body must arrive within 30 s, else 408. Bodies
+  are limited to 4 MiB (413 above).
+- **Sessions** (clients on revisions before 2026-07-28). A session with nothing in flight that has
+  not been used for 10 minutes is closed: clients that exit without `DELETE` do not pile up. A
+  call in flight keeps its session open however long it runs (a long export without a
+  `progressToken` included). At most 256 sessions: at the cap, the least recently used idle one is
+  closed to make room. Only when every one has a call in flight does `initialize` get 503 with
+  `Retry-After: 5`. A request to a closed session gets 404 (`Session not found`), and the client
+  should `initialize` again, as the MCP spec says.
+- A request id that is still in flight in the same session gets HTTP 400 with JSON-RPC `-32600`.
+
+#### Status codes and logging
+
+A request is checked in the order of this table, and everything down to `Content-Type` is checked
+before its body is read. A request refused there costs no body read, gets the same answer whatever
+its body holds, and has its connection closed.
+
+| Status | When |
+|---|---|
+| 503 | too many connections (`Retry-After: 1`), answered before the request is read |
+| 404 | a path other than `/mcp` |
+| 204 | a listed origin's CORS preflight |
+| 429 | an address that failed authentication 10 times in a minute (for a minute; `Retry-After`) |
+| 401 | no or wrong bearer token (`WWW-Authenticate: Bearer realm="filmcraft"`) |
+| 400 / 403 | a malformed / foreign `Host` |
+| 403 | an `Origin` that is not listed |
+| 405 | a method other than `GET`, `POST`, `DELETE`, such as an `OPTIONS` that is no CORS preflight |
+| 406 | a `POST` whose `Accept` lacks `application/json` or `text/event-stream` |
+| 415 | a `POST` whose `Content-Type` is not `application/json`; after the body, a JSON-RPC batch (array) |
+| 408 / 413 | a body that takes over 30 s / is over 4 MiB |
+| 400 | a body that is not JSON (JSON-RPC `-32700`, id `null`); a request id already in flight (`-32600`) |
+| 404 | an unknown or closed session (`Session not found`): `initialize` again |
+| 503 | every session has a call in flight (`initialize` only; `Retry-After: 5`) |
+| 500 | an internal error (a panic), logged; the server keeps serving |
+
+Refused requests and failures are logged to stderr as `filmcraft-mcp: refused POST from
+127.0.0.1:53210: 403 Forbidden: Host header is not allowed (Host "evil.example:9877")`, with the
+client's address. There is at most one line per address and reason every 10 s, and the next one
+says how many were left out, so a flood of bad requests cannot flood the log. The `Authorization`
+header is never logged. `Host` and `Origin` values are quoted and cut short. Programs that embed
+the server get the lines through `HttpOptions::log` instead.
+
+#### Protocol details
 
 - Clients on MCP revisions before 2026-07-28 `initialize` and get an `Mcp-Session-Id`; `DELETE`
-  ends a session, and one idle for an hour is dropped (its requests then fail: initialize again).
-  2026-07-28 clients (current Claude Code) send self-contained requests and get no session.
+  ends a session (see Limits for idle ones). 2026-07-28 clients (current Claude Code) send
+  self-contained requests and get no session.
 - Replies come as an SSE stream (`text/event-stream`) that carries the call's progress notifications
   before its result; a request must `Accept` both `application/json` and `text/event-stream`.
 - A body that isn't JSON gets HTTP 400 with the `-32700` parse error (id `null`), as a bad line does
   on stdio. A JSON-RPC batch (array) gets 415.
+- A `tools/call` for a tool that does not exist gets JSON-RPC `-32602` `tool not found`, as on
+  stdio. A notification naming one is accepted (202) and dropped.
 - Cancelling a call: a session client posts `notifications/cancelled`; a 2026-07-28 client closes
   the call's HTTP response (it has no other way: that revision has no session to address it to).
   Either way an export stops and deletes its partial file (see Long exports below). Closing the
