@@ -167,10 +167,12 @@ pub fn resolve(no_token: bool, env: Option<&str>, token_file: Option<&str>, stor
         let path = std::path::absolute(path).unwrap_or_else(|_| path.to_path_buf());
         return Ok(Resolved { token: Some(token), source: Source::File(path), warnings });
     }
-    let instead = format!("pass --token-file FILE or set {TOKEN_ENV} instead");
+    let instead = format!("pass --data-dir DIR or --token-file FILE, or set {TOKEN_ENV}");
     let path = stored().map_err(|e| Problem::Failure(format!("cannot locate the stored MCP token: {e}; {instead}")))?;
-    let stored = load_or_create(&path)
-        .map_err(|e| Problem::Failure(format!("the stored MCP token: {e}; replace it with `filmcraft-cli mcp-token --new`, or {instead}")))?;
+    let stored = load_or_create(&path).map_err(|e| {
+        let replace = if e.unusable { "replace it with `filmcraft-cli mcp-token --new`, or " } else { "" };
+        Problem::Failure(format!("{}; {replace}{instead}", e.message))
+    })?;
     warnings.extend(stored.warning.map(|w| format!("the stored token file {w}")));
     Ok(Resolved { token: Some(stored.token), source: Source::Stored { path, created: stored.created }, warnings })
 }
@@ -219,24 +221,39 @@ pub struct Stored {
     pub warning: Option<String>,
 }
 
+/// Why the stored token could not be had.
+#[derive(Debug)]
+pub struct StoreError {
+    pub message: String,
+    /// Something is at the path but it holds no usable token (`mcp-token --new` replaces it);
+    /// else the path could not be got at or the token not stored there.
+    pub unusable: bool,
+}
+
 /// The token stored at `path`, read as a `--token-file` is. When nothing is there, a new random
 /// one ([`generate_token`]) is stored first, without ever replacing or following what is at
 /// `path`: a file another process (another server, `mcp-token`) stored meanwhile is read instead,
 /// and a dangling link is an error. On unix the file is private (0600), and so is a folder made
 /// for it (0700).
-pub fn load_or_create(path: &Path) -> Result<Stored, String> {
-    let read = || read_token_file(path).map(|(token, warning)| Stored { token, created: false, warning }).map_err(|e| format!("{}: {e}", path.display()));
+pub fn load_or_create(path: &Path) -> Result<Stored, StoreError> {
+    let shown = path.display();
+    let read = || {
+        read_token_file(path)
+            .map(|(token, warning)| Stored { token, created: false, warning })
+            .map_err(|e| StoreError { message: format!("the stored MCP token in {shown} is unusable: {e}"), unusable: true })
+    };
+    let fault = |message: String| StoreError { message, unusable: false };
     match std::fs::symlink_metadata(path) {
         Ok(_) => return read(),
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
-        Err(e) => return Err(format!("{}: {e}", path.display())),
+        Err(e) => return Err(fault(format!("cannot get at the stored MCP token in {shown}: {e}"))),
     }
-    let token = generate_token()?;
+    let token = generate_token().map_err(fault)?;
     match create_token_file(path, &token) {
         Ok(()) => Ok(Stored { token, created: true, warning: None }),
         // another process stored one first: that is the token
         Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => read(),
-        Err(e) => Err(format!("cannot create {}: {e}", path.display())),
+        Err(e) => Err(fault(format!("cannot store a new MCP token in {shown}: {e}"))),
     }
 }
 
@@ -601,7 +618,8 @@ mod tests {
         #[cfg(unix)]
         assert!(s.warning.is_some_and(|w| w.contains("can be read by other users") && !w.contains(TOKEN)));
         std::fs::write(&path, "\n").unwrap();
-        assert!(load_or_create(&path).unwrap_err().contains("first line of the file is empty"));
+        let e = load_or_create(&path).unwrap_err();
+        assert!(e.unusable && e.message.contains("first line of the file is empty"), "{e:?}");
         assert_eq!(std::fs::read(&path).unwrap(), b"\n");
         std::fs::remove_file(&path).unwrap();
         std::fs::create_dir(&path).unwrap();
@@ -611,7 +629,7 @@ mod tests {
         {
             let target = tmp.0.join("elsewhere");
             std::os::unix::fs::symlink(&target, &path).unwrap();
-            assert!(load_or_create(&path).is_err());
+            assert!(load_or_create(&path).unwrap_err().unusable, "mcp-token --new replaces a dangling link");
             assert!(!target.exists(), "nothing written through the link");
             assert!(std::fs::symlink_metadata(&path).unwrap().file_type().is_symlink());
             // a link to a token file is read
@@ -715,12 +733,20 @@ mod tests {
         let off = resolve(true, Some("  "), None, || panic!("not looked up")).unwrap();
         assert_eq!((off.token, off.source), (None, Source::Off));
 
-        // no data directory, or an unusable stored file: a failure (exit 1) that says what to do
+        // no data directory, one that cannot be made, or an unusable stored file: a failure
+        // (exit 1) that says what to do
         let none = resolve(false, None, None, || Err("no HOME".into())).unwrap_err();
         assert!(matches!(&none, Problem::Failure(m) if m.contains("no HOME") && m.contains("--token-file") && m.contains("FILMCRAFT_MCP_TOKEN")), "{none:?}");
+        let blocked = tmp.0.join("blocked");
+        std::fs::write(&blocked, "a file, not a folder").unwrap();
+        let cannot = resolve(false, None, None, || Ok(blocked.join(STORED_FILE))).unwrap_err();
+        assert!(
+            matches!(&cannot, Problem::Failure(m) if m.contains("--data-dir") && m.contains("--token-file") && !m.contains("mcp-token --new")),
+            "{cannot:?}"
+        );
         std::fs::write(&stored, [0xFF, 0xFE, 0x41]).unwrap();
         let bad = resolve(false, None, None, at).unwrap_err();
-        assert!(matches!(&bad, Problem::Failure(m) if m.contains("mcp-token --new") && m.contains("--token-file")), "{bad:?}");
+        assert!(matches!(&bad, Problem::Failure(m) if m.contains("unusable") && m.contains("mcp-token --new") && m.contains("--token-file")), "{bad:?}");
     }
 
     #[test]

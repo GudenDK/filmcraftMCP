@@ -639,7 +639,10 @@ fn mcp_token(a: &Args) {
         ));
         t
     } else {
-        let stored = token::load_or_create(&path).unwrap_or_else(|e| fail(format!("mcp-token: {e}; `filmcraft-cli mcp-token --new` replaces it")));
+        let stored = token::load_or_create(&path).unwrap_or_else(|e| {
+            let what = if e.unusable { "`filmcraft-cli mcp-token --new` replaces it" } else { "pass --data-dir DIR to keep it elsewhere" };
+            fail(format!("mcp-token: {}; {what}", e.message))
+        });
         if let Some(w) = stored.warning {
             diag(format_args!("filmcraft-cli: warning: the stored token file {w}"));
         }
