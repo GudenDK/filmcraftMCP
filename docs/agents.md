@@ -213,12 +213,17 @@ with `$(cat '…')` (bash, zsh and fish 3.4+), on Windows in PowerShell with
 `$((Get-Content -LiteralPath '…' -TotalCount 1).Trim())`, and with `$FILMCRAFT_MCP_TOKEN`
 (`$env:FILMCRAFT_MCP_TOKEN`) when the token came from that variable. For a `--token-file` it takes
 the first line as the server does, also from a file with Windows line breaks, a byte-order mark or
-UTF-16 (`$(LC_ALL=C tr -d … < '…' | head -n 1)` on Linux and macOS). `--scope user` makes it available in every project; the default
-scope is the current project only:
+UTF-16 (`$(LC_ALL=C tr -d … < '…' | head -n 1)` on Linux and macOS). `--scope user` makes it
+available in every project; the default scope is the current project only. With the stored token
+in its default place (see the table above):
 
 ```sh
+# Linux
 claude mcp add --transport http --scope user filmcraft-http http://127.0.0.1:9877/mcp \
   --header "Authorization: Bearer $(cat ~/.local/share/filmcraft/mcp-token)"
+# macOS
+claude mcp add --transport http --scope user filmcraft-http http://127.0.0.1:9877/mcp \
+  --header "Authorization: Bearer $(cat ~/'Library/Application Support/FilmCraft/mcp-token')"
 claude mcp list                     # filmcraft-http: ✔ Connected, while the server runs
 ```
 

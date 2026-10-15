@@ -1482,4 +1482,35 @@ mod tests {
         let want: Vec<String> = sources.iter().map(|(_, t)| format!("Authorization: Bearer {t}")).collect();
         assert_eq!(got, want, "{script}\nstderr: {}", String::from_utf8_lossy(&out.stderr));
     }
+
+    /// The `claude mcp add` examples in docs/agents.md § Connecting clients read the stored token
+    /// from its default place on Linux and on macOS, through a POSIX shell. There was only the
+    /// Linux one, which on macOS reads a file that is not there: an empty token, and Claude Code
+    /// then tries OAuth.
+    #[cfg(unix)]
+    #[test]
+    fn the_documented_header_examples_read_the_stored_token() {
+        let docs = std::fs::read_to_string(Path::new(env!("CARGO_MANIFEST_DIR")).join("../../docs/agents.md")).unwrap();
+        let section = docs.split("#### Connecting clients").nth(1).unwrap();
+        let block = section.split("```sh").nth(1).and_then(|b| b.split("```").next()).unwrap();
+        let home = TempDir::new("docs-home");
+        // `per_user_data_dir` under this home: XDG_DATA_HOME unset on Linux, and macOS
+        let places = [(".local/share/filmcraft", "linux-token"), ("Library/Application Support/FilmCraft", "macos-token")];
+        for (dir, token) in places {
+            std::fs::create_dir_all(home.0.join(dir)).unwrap();
+            std::fs::write(home.0.join(dir).join(STORED_FILE), token).unwrap();
+        }
+        let mut got: Vec<String> = Vec::new();
+        for header in block.lines().filter_map(|l| l.split("--header ").nth(1)) {
+            let out = std::process::Command::new("sh")
+                .arg("-c")
+                .arg(format!("set -- {header}; printf '%s' \"$1\""))
+                .env("HOME", &home.0)
+                .env_remove("XDG_DATA_HOME")
+                .output()
+                .unwrap();
+            got.push(String::from_utf8_lossy(&out.stdout).into_owned());
+        }
+        assert_eq!(got, ["Authorization: Bearer linux-token", "Authorization: Bearer macos-token"], "{block}");
+    }
 }
