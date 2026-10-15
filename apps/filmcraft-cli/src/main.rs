@@ -32,6 +32,7 @@ macro_rules! out {
 
 mod args;
 mod probe;
+mod token;
 
 use args::{Args, parse_value};
 use filmcraft_automation::{BridgeClient, Stop};
@@ -114,7 +115,7 @@ OPTIONS
   --data-dir <dir>              FilmCraft data directory for user export presets (headless;
                                 default: the app's data directory)
   --token-file <path>           mcp --http: require `Authorization: Bearer <token>`, the token
-                                read from this file (or set FILMCRAFT_MCP_TOKEN)
+                                being this file's first line (or set FILMCRAFT_MCP_TOKEN)
   --allow-origin <origin>       mcp --http: let this browser origin call, with CORS headers:
                                 scheme://host:port with the port spelled out (repeatable; any
                                 other request with an Origin header is refused)
@@ -532,9 +533,15 @@ fn mcp_http_options(a: &Args) -> Option<(std::net::SocketAddr, filmcraft_automat
     let Some(addr) = a.opt("--http") else { usage("mcp: --http needs an address: PORT, 127.0.0.1:PORT, [::1]:PORT or localhost:PORT") };
     let addr = parse_listen_addr(addr).unwrap_or_else(|e| usage(format!("mcp --http: {e}")));
     let token = match a.opt("--token-file") {
-        Some(p) => Some(read_token_file(p).unwrap_or_else(|e| usage(format!("mcp --token-file {p}: {e}")))),
+        Some(p) => {
+            let (token, warning) = token::read_token_file(p).unwrap_or_else(|e| usage(format!("mcp --token-file {p}: {e}")));
+            if let Some(w) = warning {
+                diag(format_args!("filmcraft-cli: warning: the token file {w}"));
+            }
+            Some(token)
+        }
         None => match std::env::var(TOKEN_ENV) {
-            Ok(t) => Some(t.trim().to_string()).filter(|t| !t.is_empty()),
+            Ok(t) => token::token_from_env(&t),
             Err(std::env::VarError::NotPresent) => None,
             Err(std::env::VarError::NotUnicode(_)) => usage(format!("mcp: {TOKEN_ENV} is not valid text")),
         },
@@ -554,17 +561,6 @@ fn mcp_http_options(a: &Args) -> Option<(std::net::SocketAddr, filmcraft_automat
         a.opt_all("--allow-host").into_iter().map(|h| check_allowed_host(h).unwrap_or_else(|e| usage(format!("mcp --allow-host: {e}")))).collect();
     let opts = filmcraft_automation::HttpOptions { token, allowed_origins, allowed_hosts, ..Default::default() };
     Some((addr, opts))
-}
-
-/// The first line of a token file (at most 4 KiB), trimmed.
-fn read_token_file(path: &str) -> Result<String, String> {
-    use std::io::Read as _;
-    let mut s = String::new();
-    std::fs::File::open(path).and_then(|f| f.take(4097).read_to_string(&mut s)).map_err(|e| e.to_string())?;
-    if s.len() > 4096 {
-        return Err("larger than 4 KiB: not a token file".into());
-    }
-    Ok(s.lines().next().unwrap_or_default().trim().to_string())
 }
 
 /// Serve MCP over HTTP until Ctrl+C. The listener is bound here so the URL printed (stderr) has the

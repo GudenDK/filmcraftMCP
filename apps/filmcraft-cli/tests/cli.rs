@@ -77,34 +77,75 @@ fn mcp_http_usage_errors() {
 /// `mcp --demo --http 127.0.0.1:0` prints its URL on stderr and answers `initialize` there.
 #[test]
 fn mcp_http_serves_initialize() {
-    use std::io::{BufRead, BufReader, Read};
-    let mut child = Command::new(env!("CARGO_BIN_EXE_filmcraft-cli"))
-        .args(["mcp", "--demo", "--http", "127.0.0.1:0"])
-        .env_remove("FILMCRAFT_MCP_TOKEN")
-        .stdin(Stdio::null())
-        .stdout(Stdio::null())
-        .stderr(Stdio::piped())
-        .spawn()
-        .expect("spawn filmcraft-cli");
-    let mut line = String::new();
-    BufReader::new(child.stderr.take().unwrap()).read_line(&mut line).unwrap();
-    let addr = line.split("http://").nth(1).and_then(|r| r.split("/mcp").next()).unwrap_or_else(|| panic!("no URL in {line:?}")).to_string();
+    let p = Spawned::new(&["mcp", "--demo", "--http", "127.0.0.1:0"]);
+    let addr = url_addr(&Spawned::line(&p.err));
+    let reply = http_initialize(&addr, None);
+    assert!(reply.starts_with("HTTP/1.1 200"), "{reply}");
+    assert!(reply.to_ascii_lowercase().contains("mcp-session-id:"), "{reply}");
+    assert!(reply.contains(r#""name":"filmcraft""#), "{reply}");
+}
+
+/// The `host:port` of the `http://host:port/mcp` URL in a banner line.
+fn url_addr(banner: &str) -> String {
+    banner.split("http://").nth(1).and_then(|r| r.split("/mcp").next()).unwrap_or_else(|| panic!("no URL in {banner:?}")).to_string()
+}
+
+/// POST `initialize` to `http://addr/mcp` (with the bearer `token`), on a connection that gives up
+/// after a minute either way; the whole reply.
+fn http_initialize(addr: &str, token: Option<&str>) -> String {
     let body =
         r#"{"jsonrpc":"2.0","id":0,"method":"initialize","params":{"protocolVersion":"2025-06-18","capabilities":{},"clientInfo":{"name":"t","version":"1"}}}"#;
-    let mut s = std::net::TcpStream::connect(&addr).unwrap();
+    let auth = token.map(|t| format!("Authorization: Bearer {t}\r\n")).unwrap_or_default();
+    let mut s = std::net::TcpStream::connect(addr).unwrap();
+    s.set_read_timeout(Some(std::time::Duration::from_secs(60))).unwrap();
+    s.set_write_timeout(Some(std::time::Duration::from_secs(60))).unwrap();
     write!(
         s,
-        "POST /mcp HTTP/1.1\r\nHost: {addr}\r\nAccept: application/json, text/event-stream\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+        "POST /mcp HTTP/1.1\r\nHost: {addr}\r\n{auth}Accept: application/json, text/event-stream\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
         body.len()
     )
     .unwrap();
     let mut reply = String::new();
-    s.read_to_string(&mut reply).unwrap();
-    let _ = child.kill();
-    let _ = child.wait();
+    std::io::Read::read_to_string(&mut s, &mut reply).unwrap();
+    reply
+}
+
+/// `--token-file` reads what Windows PowerShell 5.1 writes (`'token' > token.txt`: UTF-16 with a
+/// byte-order mark and CRLF) as the token, and warns, without showing it, when other users can
+/// read the file.
+#[test]
+fn mcp_http_token_file_in_utf16_with_a_permission_warning() {
+    let token = "token-file-test-0123456789-abcdefghij";
+    let dir = std::env::temp_dir().join(format!("fc-cli-token-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let file = dir.join("token.txt");
+    let mut utf16 = vec![0xFF, 0xFE];
+    utf16.extend(format!("{token}\r\n").encode_utf16().flat_map(u16::to_le_bytes));
+    std::fs::write(&file, utf16).unwrap();
+    #[cfg(unix)]
+    std::fs::set_permissions(&file, std::os::unix::fs::PermissionsExt::from_mode(0o644)).unwrap();
+    let p = Spawned::new(&["mcp", "--demo", "--http", "127.0.0.1:0", "--token-file", file.to_str().unwrap()]);
+    let mut line = Spawned::line(&p.err);
+    if cfg!(unix) {
+        assert!(line.contains("warning: the token file") && line.contains("can be read by other users") && line.contains("chmod 600"), "{line}");
+        assert!(!line.contains(token), "{line}");
+        line = Spawned::line(&p.err);
+    }
+    assert!(line.contains("bearer token required") && !line.contains(token), "{line}");
+    let addr = url_addr(&line);
+    assert!(http_initialize(&addr, None).starts_with("HTTP/1.1 401"));
+    let reply = http_initialize(&addr, Some(token));
     assert!(reply.starts_with("HTTP/1.1 200"), "{reply}");
-    assert!(reply.to_ascii_lowercase().contains("mcp-session-id:"), "{reply}");
-    assert!(reply.contains(r#""name":"filmcraft""#), "{reply}");
+    drop(p);
+    // a file with no token in it is a usage error that says how to write one
+    for bytes in [&b""[..], b"\r\n", &[0x41, 0, 0x42, 0]] {
+        std::fs::write(&file, bytes).unwrap();
+        let o = cli(&["mcp", "--http", "127.0.0.1:0", "--token-file", file.to_str().unwrap()]);
+        let err = String::from_utf8_lossy(&o.stderr);
+        assert_eq!(o.status.code(), Some(2), "{err}");
+        assert!(err.contains("Set-Content -Encoding ascii"), "{err}");
+    }
+    let _ = std::fs::remove_dir_all(&dir);
 }
 
 /// A spawned `filmcraft-cli`, killed when the test ends (also when it fails), with its stdout
@@ -176,7 +217,7 @@ fn mcp_http_on_every_interface_prints_usable_addresses() {
     let token = "banner-test-token-0123456789-abcdefgh";
     let p = Spawned::with_env(&["mcp", "--demo", "--http", "0.0.0.0:0"], &[("FILMCRAFT_MCP_TOKEN", token)]);
     let banner = Spawned::line(&p.err);
-    let addr = banner.split("http://").nth(1).and_then(|r| r.split("/mcp").next()).unwrap_or_else(|| panic!("no URL in {banner:?}")).to_string();
+    let addr = url_addr(&banner);
     assert!(addr.starts_with("127.0.0.1:"), "{banner}");
     let hosts = Spawned::line(&p.err);
     assert!(hosts.contains("listening on every interface (0.0.0.0:") && hosts.contains(&format!("Host must be one of: {addr}")), "{hosts}");
@@ -184,18 +225,7 @@ fn mcp_http_on_every_interface_prints_usable_addresses() {
     assert!(lan.contains("LAN clients get 403 until you add --allow-host "), "{lan}");
     assert!(!banner.contains(token) && !hosts.contains(token) && !lan.contains(token));
     // the printed URL works
-    let body =
-        r#"{"jsonrpc":"2.0","id":0,"method":"initialize","params":{"protocolVersion":"2025-06-18","capabilities":{},"clientInfo":{"name":"t","version":"1"}}}"#;
-    let mut s = std::net::TcpStream::connect(&addr).unwrap();
-    s.set_read_timeout(Some(std::time::Duration::from_secs(60))).unwrap();
-    write!(
-        s,
-        "POST /mcp HTTP/1.1\r\nHost: {addr}\r\nAuthorization: Bearer {token}\r\nAccept: application/json, text/event-stream\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
-        body.len()
-    )
-    .unwrap();
-    let mut reply = String::new();
-    std::io::Read::read_to_string(&mut s, &mut reply).unwrap();
+    let reply = http_initialize(&addr, Some(token));
     assert!(reply.starts_with("HTTP/1.1 200"), "{reply}");
 }
 
