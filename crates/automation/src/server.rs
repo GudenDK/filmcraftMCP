@@ -39,6 +39,9 @@ pub struct FilmcraftMcp {
     /// Bridge `render_frame` at a time moves the live playhead and puts it back: one at a time,
     /// so concurrent clients (HTTP) don't see each other's frame or restore the wrong playhead.
     view: Arc<tokio::sync::Mutex<()>>,
+    /// Long calls (exports) running on this server, shared by its clones (HTTP serves each client
+    /// with a clone): shutdown waits for them.
+    pub(crate) long_calls: Arc<crate::long_job::LongCalls>,
 }
 
 #[derive(Debug, Default, Deserialize, JsonSchema)]
@@ -205,7 +208,7 @@ impl FilmcraftMcp {
         Ok(Self::with_backend(Backend::Bridge(Arc::new(BridgeClient::new(addr)?))))
     }
     fn with_backend(backend: Backend) -> Self {
-        Self { backend: Arc::new(backend), tool_router: Self::tool_router(), view: Arc::new(tokio::sync::Mutex::new(())) }
+        Self { backend: Arc::new(backend), tool_router: Self::tool_router(), view: Arc::new(tokio::sync::Mutex::new(())), long_calls: Arc::default() }
     }
 
     pub async fn serve_stdio(self) -> Result<(), AutomationError> {

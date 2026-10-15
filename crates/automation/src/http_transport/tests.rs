@@ -16,6 +16,8 @@ struct Server {
     addr: SocketAddr,
     stop: Option<tokio::sync::oneshot::Sender<()>>,
     done: tokio::task::JoinHandle<Result<(), AutomationError>>,
+    /// A clone of the server's handler (shares its backend and long-call count).
+    mcp: FilmcraftMcp,
 }
 
 impl Server {
@@ -23,10 +25,11 @@ impl Server {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
         let (stop, rx) = tokio::sync::oneshot::channel::<()>();
-        let done = tokio::spawn(FilmcraftMcp::headless(s).serve_http_listener(listener, opts, async move {
+        let mcp = FilmcraftMcp::headless(s);
+        let done = tokio::spawn(mcp.clone().serve_http_listener(listener, opts, async move {
             let _ = rx.await;
         }));
-        Self { addr, stop: Some(stop), done }
+        Self { addr, stop: Some(stop), done, mcp }
     }
     fn host(&self) -> String {
         format!("127.0.0.1:{}", self.addr.port())
@@ -446,6 +449,37 @@ async fn shutdown_returns() {
     let r = tokio::time::timeout(Duration::from_secs(20), &mut srv.done).await.expect("shut down in time").unwrap();
     assert!(r.is_ok(), "{r:?}");
     assert!(TcpStream::connect(srv.addr).await.is_err());
+}
+
+/// Shutdown cancels a session's export and deletes its partial file, and the port closes as soon
+/// as shutdown starts, while the server still waits for open connections.
+#[tokio::test(flavor = "multi_thread")]
+async fn shutdown_deletes_partial_exports_and_closes_the_port_at_once() {
+    let dir = std::env::temp_dir().join(format!("filmcraft-mcp-http-shutdown-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let out = dir.join("partial.mp4");
+    let mut srv = Server::start(demo(), HttpOptions::default()).await;
+    let (sid, _) = init(srv.addr, &[]).await;
+    let mut r = post(srv.addr, Some(&sid), &[], &export_call(1, &out.to_string_lossy(), 30.0, Some(json!("p")), None)).await;
+    loop {
+        let m = tokio::time::timeout(Duration::from_secs(30), r.next()).await.expect("progress in time").expect("progress");
+        assert_ne!(m["id"], 1, "finished before the shutdown: {m}");
+        if m["method"] == "notifications/progress" {
+            break;
+        }
+    }
+    assert_eq!(srv.mcp.long_calls.count(), 1);
+    // a connection that sends nothing keeps the server in its grace period for a while
+    let _idle = TcpStream::connect(srv.addr).await.unwrap();
+    let _ = srv.stop.take().unwrap().send(());
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    assert!(TcpStream::connect(srv.addr).await.is_err(), "the port closes when shutdown starts");
+    assert!(!srv.done.is_finished(), "still waiting for the open connection");
+    let r = tokio::time::timeout(Duration::from_secs(20), &mut srv.done).await.expect("shut down in time").unwrap();
+    assert!(r.is_ok(), "{r:?}");
+    assert!(!out.exists(), "the partial export is deleted");
+    assert_eq!(srv.mcp.long_calls.count(), 0);
+    let _ = std::fs::remove_dir_all(&dir);
 }
 
 fn export_call(id: u64, path: &str, seconds: f64, token: Option<Value>, meta: Option<&Value>) -> Value {

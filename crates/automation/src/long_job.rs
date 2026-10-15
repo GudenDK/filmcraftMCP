@@ -4,8 +4,10 @@
 //! `notifications/cancelled`, deleting the partial output. The session lock is only held for
 //! short polls, so other requests are answered while the export runs.
 
+use std::collections::HashMap;
 use std::path::Path;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use std::time::{Duration, SystemTime};
 
 use rmcp::RoleServer;
@@ -21,27 +23,69 @@ pub const LONG_COMMANDS: &[&str] = &["file.exportMedia"];
 /// How often the job is polled (and at most how often progress is reported).
 const POLL: Duration = Duration::from_millis(100);
 
-/// Long calls running now, cancelled ones still cleaning up included (HTTP shutdown waits for them).
-static IN_FLIGHT: AtomicUsize = AtomicUsize::new(0);
-
-/// How many long calls are running, in this process.
-pub fn calls_in_flight() -> usize {
-    IN_FLIGHT.load(Ordering::Relaxed)
+/// The long calls running on one server (every clone of a [`FilmcraftMcp`] shares it), cancelled
+/// ones still deleting their partial output included. Shutdown waits for them, and deletes what
+/// the ones still running at its deadline wrote.
+#[derive(Default)]
+pub(crate) struct LongCalls {
+    running: Mutex<HashMap<u64, Option<Output>>>,
+    next: AtomicU64,
 }
 
-/// Counts one long call for as long as it lives.
-struct InFlight;
+/// The file a running export writes, and since when.
+struct Output {
+    path: String,
+    since: SystemTime,
+}
 
-impl InFlight {
-    fn enter() -> Self {
-        IN_FLIGHT.fetch_add(1, Ordering::Relaxed);
-        Self
+impl LongCalls {
+    /// How many long calls are running.
+    pub(crate) fn count(&self) -> usize {
+        self.lock().len()
+    }
+
+    fn lock(&self) -> MutexGuard<'_, HashMap<u64, Option<Output>>> {
+        self.running.lock().unwrap_or_else(PoisonError::into_inner)
+    }
+
+    /// Counts one long call for as long as the returned guard lives.
+    fn enter(self: &Arc<Self>) -> LongCall {
+        let id = self.next.fetch_add(1, Ordering::Relaxed);
+        self.lock().insert(id, None);
+        LongCall { calls: self.clone(), id }
+    }
+
+    /// Wait until no long call runs or `deadline` passes, then delete the partial output of those
+    /// still running: the process is about to exit, and an export it stops leaves a truncated file.
+    pub(crate) async fn drain(&self, deadline: tokio::time::Instant) {
+        while self.count() > 0 && tokio::time::Instant::now() < deadline {
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        let left: Vec<Output> = self.lock().values_mut().filter_map(Option::take).collect();
+        for o in left {
+            remove_partial(&o.path, o.since);
+        }
     }
 }
 
-impl Drop for InFlight {
+/// One running long call; dropping it ends it.
+struct LongCall {
+    calls: Arc<LongCalls>,
+    id: u64,
+}
+
+impl LongCall {
+    /// The call's export writes `path`, from `since` on.
+    fn writes(&self, path: &str, since: SystemTime) {
+        if let Some(o) = self.calls.lock().get_mut(&self.id) {
+            *o = Some(Output { path: path.to_string(), since });
+        }
+    }
+}
+
+impl Drop for LongCall {
     fn drop(&mut self) {
-        IN_FLIGHT.fetch_sub(1, Ordering::Relaxed);
+        self.calls.lock().remove(&self.id);
     }
 }
 
@@ -76,7 +120,7 @@ impl FilmcraftMcp {
     /// Run `id` (a [`LONG_COMMANDS`] entry, `wait: true`) as a job, reporting progress and
     /// honouring cancellation.
     pub(crate) async fn run_long(&self, id: &str, mut params: Value, context: &RequestContext<RoleServer>) -> CallToolResult {
-        let _in_flight = InFlight::enter();
+        let call = self.long_calls.enter();
         let started = SystemTime::now();
         if let Some(p) = params.as_object_mut() {
             p.insert("wait".into(), json!(false));
@@ -89,6 +133,7 @@ impl FilmcraftMcp {
             return CallToolResult::error(vec![Content::text(format!("{id} started no job: {start}"))]);
         };
         let path = start.get("path").and_then(Value::as_str).unwrap_or_default().to_string();
+        call.writes(&path, started);
         let mut rep = Reporter { peer: context.peer.clone(), token: context.meta.get_progress_token(), last: 0.0 };
         loop {
             let state = self.job_state(job).await;
@@ -252,6 +297,33 @@ mod tests {
         for f in theirs {
             assert!(dir.join(f).exists(), "{f} must not be removed");
         }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Shutdown deletes what an export still running at its deadline wrote (the process exits
+    /// before the export's own cancellation could), and each server counts only its own calls.
+    #[tokio::test]
+    async fn drain_deletes_the_output_of_calls_still_running() {
+        let dir = std::env::temp_dir().join(format!("fc-long-calls-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let (a, b) = (Arc::new(LongCalls::default()), Arc::new(LongCalls::default()));
+        let started = SystemTime::now();
+        let call = a.enter();
+        let path = dir.join("out.mp4");
+        std::fs::write(&path, b"partial").unwrap();
+        std::fs::write(dir.join("other.mp4"), b"x").unwrap();
+        call.writes(&path.to_string_lossy(), started);
+        assert_eq!((a.count(), b.count()), (1, 0));
+        let t0 = std::time::Instant::now();
+        b.drain(tokio::time::Instant::now() + Duration::from_secs(10)).await;
+        assert!(t0.elapsed() < Duration::from_secs(1), "nothing runs on b: no wait");
+        assert!(path.exists(), "b's drain leaves a's export alone");
+        a.drain(tokio::time::Instant::now() + Duration::from_millis(200)).await;
+        assert!(!path.exists(), "the partial file of a call still running is deleted");
+        assert!(dir.join("other.mp4").exists());
+        drop(call);
+        assert_eq!(a.count(), 0);
         let _ = std::fs::remove_dir_all(&dir);
     }
 

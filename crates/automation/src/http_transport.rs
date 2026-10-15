@@ -47,7 +47,7 @@ const MAX_BODY: usize = 4 << 20;
 const MAX_CONNECTIONS: u32 = 64;
 /// Live sessions (pre-2026-07-28 clients); a further `initialize` gets 503.
 const MAX_SESSIONS: usize = 256;
-/// How long shutdown waits for open connections and cancelled exports to finish.
+/// How long shutdown waits for cancelled exports to delete their partial files and connections to close.
 const SHUTDOWN_GRACE: Duration = Duration::from_secs(15);
 
 /// Options for [`FilmcraftMcp::serve_http`].
@@ -204,6 +204,7 @@ impl FilmcraftMcp {
             .with_max_request_body_bytes(MAX_BODY)
             .with_cancellation_token(ct.child_token());
         let gate = Arc::new(Gate { token, tools: self.clone(), sessions: sessions.clone(), legacy_session_mode: opts.legacy_session_mode });
+        let long_calls = self.long_calls.clone();
         // Called once per session (pre-2026-07-28 clients) or per request (2026-07-28): every
         // clone shares the one backend (`Arc<Backend>`), so all clients see the same project.
         let mcp: Mcp = StreamableHttpService::new(move || Ok(self.clone()), sessions.clone(), config);
@@ -244,6 +245,9 @@ impl FilmcraftMcp {
             });
         }
 
+        // Refuse new connections now rather than leave them hanging until the process exits.
+        drop(listener);
+        let deadline = tokio::time::Instant::now() + SHUTDOWN_GRACE;
         // The token ended every SSE stream and cancelled the stateless calls, but session workers
         // outlive it: close them, so their calls see `context.ct` cancelled (after rmcp's response
         // drain) and an export stops and deletes its partial output before the process exits.
@@ -251,11 +255,9 @@ impl FilmcraftMcp {
         for id in ids {
             let _ = sessions.close_session(&id).await;
         }
-        let deadline = tokio::time::Instant::now() + SHUTDOWN_GRACE;
+        // Exports first: whatever still runs at the deadline has its partial output deleted.
+        long_calls.drain(deadline).await;
         let _ = tokio::time::timeout_at(deadline, permits.acquire_many(MAX_CONNECTIONS)).await;
-        while crate::long_job::calls_in_flight() > 0 && tokio::time::Instant::now() < deadline {
-            tokio::time::sleep(Duration::from_millis(50)).await;
-        }
         Ok(())
     }
 }
