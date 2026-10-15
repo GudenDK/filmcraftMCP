@@ -28,13 +28,17 @@ impl Server {
     }
     async fn start_with(s: Session, opts: HttpOptions, stats: Arc<Stats>) -> Self {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        Self::start_on(listener, s, opts, stats)
+        Self::start_on(listener, s, opts, Limits::default(), stats)
     }
-    fn start_on(listener: tokio::net::TcpListener, s: Session, opts: HttpOptions, stats: Arc<Stats>) -> Self {
+    async fn start_limited(s: Session, opts: HttpOptions, limits: Limits) -> Self {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        Self::start_on(listener, s, opts, limits, Arc::default())
+    }
+    fn start_on(listener: tokio::net::TcpListener, s: Session, opts: HttpOptions, limits: Limits, stats: Arc<Stats>) -> Self {
         let addr = listener.local_addr().unwrap();
         let (stop, rx) = tokio::sync::oneshot::channel::<()>();
         let mcp = FilmcraftMcp::headless(s);
-        let done = tokio::spawn(mcp.clone().serve_with(listener, opts, stats, async move {
+        let done = tokio::spawn(mcp.clone().serve_with(listener, opts, limits, stats, async move {
             let _ = rx.await;
         }));
         Self { addr, stop: Some(stop), done, mcp }
@@ -72,7 +76,27 @@ async fn send(addr: SocketAddr, method: &str, headers: &[(&str, &str)], body: &s
 
 /// [`send`], declaring a `Content-Length` of `len` but sending only `body`: a client still uploading.
 async fn send_declaring(addr: SocketAddr, method: &str, headers: &[(&str, &str)], len: usize, body: &str) -> Reply {
-    let mut s = tokio::time::timeout(WAIT, TcpStream::connect(addr)).await.expect("connect in time").unwrap();
+    let s = tokio::time::timeout(WAIT, TcpStream::connect(addr)).await.expect("connect in time").unwrap();
+    exchange(s, addr, method, headers, len, body).await
+}
+
+/// A connection to `addr` from the loopback address `local` (`127.0.0.2`), where the system
+/// allows it.
+async fn connect_from(local: &str, addr: SocketAddr) -> Option<TcpStream> {
+    let sock = tokio::net::TcpSocket::new_v4().ok()?;
+    sock.bind(format!("{local}:0").parse().ok()?).ok()?;
+    tokio::time::timeout(WAIT, sock.connect(addr)).await.ok()?.ok()
+}
+
+/// Everything the server sends until it closes the connection.
+async fn read_all(mut s: TcpStream) -> String {
+    let mut out = Vec::new();
+    let _ = tokio::time::timeout(WAIT, s.read_to_end(&mut out)).await.expect("closed in time");
+    String::from_utf8_lossy(&out).into_owned()
+}
+
+/// [`send_declaring`] on an open connection.
+async fn exchange(mut s: TcpStream, addr: SocketAddr, method: &str, headers: &[(&str, &str)], len: usize, body: &str) -> Reply {
     let mut req = format!("{method} {MCP_PATH} HTTP/1.1\r\n");
     if !headers.iter().any(|(k, _)| k.eq_ignore_ascii_case("host")) {
         req += &format!("Host: 127.0.0.1:{}\r\n", addr.port());
@@ -453,7 +477,7 @@ async fn the_bound_address_is_an_accepted_host() {
         eprintln!("skipped: cannot bind 127.0.0.2 here");
         return;
     };
-    let srv = Server::start_on(listener, demo(), HttpOptions::default(), Arc::default());
+    let srv = Server::start_on(listener, demo(), HttpOptions::default(), Limits::default(), Arc::default());
     let host = format!("127.0.0.2:{}", srv.addr.port());
     let initialize = json!({"jsonrpc":"2.0","id":0,"method":"initialize","params":{"protocolVersion":"2025-06-18","capabilities":{},"clientInfo":{"name":"t","version":"1"}}});
     let r = post(srv.addr, None, &[("Host", host.as_str())], &initialize).await;
@@ -563,6 +587,78 @@ async fn refusals_are_logged_without_credentials() {
     assert_eq!(l.matches("401 Unauthorized").count(), 1, "rate limited: {l}");
     assert!(l.contains("refused POST from 127.0.0.1:") && l.contains("403 Forbidden: Host header is not allowed"), "{l}");
     assert!(!l.contains(token) && !l.contains("wrong-secret-guess"), "credentials leaked: {l}");
+}
+
+/// One address cannot take every connection, with or without credentials: past its share (or
+/// the total) a connection gets a 503 it can retry, while other addresses still get in. A client
+/// that sends nothing, an idle keep-alive connection and a body that never ends are dropped after
+/// a timeout.
+#[tokio::test(flavor = "multi_thread")]
+async fn connections_are_capped_per_peer_and_timed_out() {
+    let (log, lines) = log_capture();
+    let limits = Limits {
+        connections: 5,
+        connections_per_peer: 3,
+        header_timeout: Duration::from_millis(1500),
+        body_timeout: Duration::from_millis(500),
+        ..Limits::default()
+    };
+    let srv = Server::start_limited(demo(), HttpOptions { log, ..HttpOptions::default() }, limits).await;
+    let initialize = json!({"jsonrpc":"2.0","id":0,"method":"initialize","params":{"protocolVersion":"2025-06-18","capabilities":{},"clientInfo":{"name":"t","version":"1"}}}).to_string();
+    let t0 = std::time::Instant::now();
+    let mut silent = Vec::new();
+    for _ in 0..3 {
+        silent.push(TcpStream::connect(srv.addr).await.unwrap());
+    }
+    let refused = read_all(TcpStream::connect(srv.addr).await.unwrap()).await;
+    assert!(refused.starts_with("HTTP/1.1 503 ") && refused.contains("Retry-After: 1\r\n") && refused.contains("Connection: close\r\n"), "{refused}");
+    assert!(refused.ends_with("too many connections"), "{refused}");
+    match connect_from("127.0.0.2", srv.addr).await {
+        None => eprintln!("skipped the second-address checks: cannot bind 127.0.0.2 here"),
+        Some(s) => {
+            // another address is not locked out by the first one's idle connections
+            let r = exchange(s, srv.addr, "POST", &[ACCEPT, JSON], initialize.len(), &initialize).await;
+            assert_eq!(r.status, 200);
+            drop(r);
+            tokio::time::sleep(Duration::from_millis(100)).await;
+            // two more fill the total of 5: a third address is refused too
+            for _ in 0..2 {
+                silent.push(connect_from("127.0.0.2", srv.addr).await.unwrap());
+            }
+            let s = connect_from("127.0.0.3", srv.addr).await.unwrap();
+            let refused = read_all(s).await;
+            assert!(refused.starts_with("HTTP/1.1 503 "), "{refused}");
+            assert!(t0.elapsed() < Duration::from_millis(1400), "the checks ran before the header timeout: {:?}", t0.elapsed());
+        }
+    }
+    // the silent connections are dropped after the header timeout, which frees the share
+    for s in &mut silent {
+        let mut b = [0u8; 1];
+        let n = tokio::time::timeout(WAIT, s.read(&mut b)).await.expect("closed in time").unwrap_or(0);
+        assert_eq!(n, 0, "closed without a reply");
+    }
+    assert!(t0.elapsed() >= Duration::from_millis(1400), "{:?}", t0.elapsed());
+    assert_eq!(send(srv.addr, "POST", &[ACCEPT, JSON], &initialize).await.status, 200);
+    // a body that never ends: 408
+    let r = send_declaring(srv.addr, "POST", &[ACCEPT, JSON], 1000, "{\"jsonrpc\"").await;
+    assert_eq!(r.status, 408);
+    // an idle keep-alive connection is closed after the header timeout as well
+    let mut s = TcpStream::connect(srv.addr).await.unwrap();
+    s.write_all(format!("GET / HTTP/1.1\r\nHost: {}\r\n\r\n", srv.host()).as_bytes()).await.unwrap();
+    let mut got = Vec::new();
+    while !String::from_utf8_lossy(&got).contains("the MCP endpoint is /mcp") {
+        let mut b = [0u8; 512];
+        let n = tokio::time::timeout(WAIT, s.read(&mut b)).await.expect("a reply in time").unwrap();
+        assert!(n > 0, "closed before the reply");
+        got.extend_from_slice(b.get(..n).unwrap());
+    }
+    let idle = std::time::Instant::now();
+    let mut b = [0u8; 1];
+    assert_eq!(tokio::time::timeout(WAIT, s.read(&mut b)).await.expect("closed in time").unwrap_or(0), 0);
+    assert!(idle.elapsed() >= Duration::from_millis(1000), "kept alive for a while: {:?}", idle.elapsed());
+    let l = lines.lock().unwrap().join("\n");
+    assert!(l.contains("refused a connection from 127.0.0.1:") && l.contains("503: too many connections from this address"), "{l}");
+    assert!(l.contains("408 Request Timeout"), "{l}");
 }
 
 /// With a token, every request needs `Authorization: Bearer <token>`, checked first.

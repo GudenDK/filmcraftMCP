@@ -1,5 +1,6 @@
-//! Per-peer bookkeeping: log lines about refused requests, at most one per peer and kind every few
-//! seconds, so a flood of bad requests cannot flood the log.
+//! Per-peer bookkeeping: open connections (so one address cannot take every connection), and log
+//! lines about refused requests (at most one per peer and kind every few seconds, so a flood of bad
+//! requests cannot flood the log).
 
 use std::collections::HashMap;
 use std::fmt::Display;
@@ -7,6 +8,9 @@ use std::io::Write as _;
 use std::net::{IpAddr, Ipv6Addr};
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use std::time::{Duration, Instant};
+
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 
 /// Where the HTTP server reports refused requests and failures: one line each, never a credential.
 pub type LogSink = Arc<dyn Fn(&str) + Send + Sync>;
@@ -32,6 +36,81 @@ pub(super) fn peer_key(ip: IpAddr) -> IpAddr {
 
 fn lock<T>(m: &Mutex<T>) -> MutexGuard<'_, T> {
     m.lock().unwrap_or_else(PoisonError::into_inner)
+}
+
+/// Open connections, in all and per peer. A connection is counted from accept to close, before it
+/// has sent anything, so the per-peer share is what keeps one address (with or without the token)
+/// from holding every connection.
+pub(super) struct Conns {
+    total: Arc<Semaphore>,
+    max: u32,
+    per_peer: usize,
+    peers: Mutex<HashMap<IpAddr, usize>>,
+}
+
+/// One open connection; dropping it closes its slot.
+pub(super) struct ConnSlot {
+    conns: Arc<Conns>,
+    peer: IpAddr,
+    _total: OwnedSemaphorePermit,
+}
+
+impl Conns {
+    pub(super) fn new(max: u32, per_peer: usize) -> Arc<Self> {
+        Arc::new(Self { total: Arc::new(Semaphore::new(max as usize)), max, per_peer, peers: Mutex::new(HashMap::new()) })
+    }
+
+    /// A slot for a connection from `ip`, or why there is none.
+    pub(super) fn open(self: &Arc<Self>, ip: IpAddr) -> Result<ConnSlot, &'static str> {
+        let peer = peer_key(ip);
+        let mut peers = lock(&self.peers);
+        let n = peers.get(&peer).copied().unwrap_or(0);
+        if n >= self.per_peer {
+            return Err("too many connections from this address");
+        }
+        let Ok(total) = self.total.clone().try_acquire_owned() else { return Err("too many connections") };
+        peers.insert(peer, n.saturating_add(1));
+        Ok(ConnSlot { conns: self.clone(), peer, _total: total })
+    }
+
+    /// Wait until every connection has closed.
+    pub(super) async fn all_closed(&self) {
+        let _ = self.total.acquire_many(self.max).await;
+    }
+}
+
+impl Drop for ConnSlot {
+    fn drop(&mut self) {
+        let mut peers = lock(&self.conns.peers);
+        if let Some(n) = peers.get_mut(&self.peer) {
+            *n = n.saturating_sub(1);
+            if *n == 0 {
+                peers.remove(&self.peer);
+            }
+        }
+    }
+}
+
+/// Tell a client there is no room for its connection, instead of closing it unanswered: a 503 it
+/// can retry after a second. Bounded in time; what it sent is read and dropped, so closing the
+/// socket does not reset it before the reply is read.
+pub(super) async fn refuse_connection(mut stream: tokio::net::TcpStream) {
+    const REPLY: &[u8] = b"HTTP/1.1 503 Service Unavailable\r\nRetry-After: 1\r\nConnection: close\r\nContent-Type: text/plain; charset=utf-8\r\nContent-Length: 41\r\n\r\nService Unavailable: too many connections";
+    let reply = async {
+        stream.write_all(REPLY).await?;
+        stream.shutdown().await?;
+        let mut sink = [0u8; 4096];
+        let mut left: usize = 64 << 10;
+        while left > 0 {
+            let n = stream.read(&mut sink).await?;
+            if n == 0 {
+                break;
+            }
+            left = left.saturating_sub(n);
+        }
+        Ok::<_, std::io::Error>(())
+    };
+    let _ = tokio::time::timeout(Duration::from_secs(2), reply).await;
 }
 
 /// The server's log: stderr, or the [`LogSink`] in [`super::HttpOptions::log`].
@@ -107,6 +186,21 @@ mod tests {
         assert_eq!(k("::1"), "::1");
         assert_eq!(k("2001:db8:1:2:aaaa:bbbb:cccc:dddd"), "2001:db8:1:2::");
         assert_eq!(k("2001:db8:1:2::9"), k("2001:db8:1:2:ffff::1"));
+    }
+
+    #[test]
+    fn connections_are_counted_per_peer_and_in_all() {
+        let conns = Conns::new(4, 2);
+        let (a, b, c): (IpAddr, IpAddr, IpAddr) = ("10.0.0.1".parse().unwrap(), "10.0.0.2".parse().unwrap(), "10.0.0.3".parse().unwrap());
+        let a1 = conns.open(a).unwrap();
+        let _a2 = conns.open(a).unwrap();
+        assert_eq!(conns.open(a).err(), Some("too many connections from this address"));
+        let _b1 = conns.open(b).unwrap();
+        let _b2 = conns.open(b).unwrap();
+        assert_eq!(conns.open(c).err(), Some("too many connections"));
+        drop(a1);
+        assert!(conns.open(c).is_ok(), "a closed connection frees its slot");
+        assert_eq!(lock(&conns.peers).len(), 2, "c's slot was dropped at once");
     }
 
     #[test]

@@ -6,6 +6,7 @@
 
 use std::net::SocketAddr;
 use std::sync::Arc;
+use std::time::Duration;
 
 use bytes::Bytes;
 use http::header::{self, HeaderName};
@@ -36,6 +37,7 @@ pub(super) struct Gate {
     pub(super) mcp: Mcp,
     pub(super) sessions: Arc<LocalSessionManager>,
     pub(super) legacy_session_mode: bool,
+    pub(super) body_timeout: Duration,
     pub(super) log: Log,
 }
 
@@ -100,12 +102,13 @@ impl Gate {
     /// A POST that passed the header checks: read and parse its body, then hand it to rmcp.
     async fn post(&self, req: Request<Incoming>) -> Result<Response<HttpBody>, Refusal> {
         let (parts, body) = req.into_parts();
-        let bytes = match Limited::new(body, MAX_BODY).collect().await {
-            Ok(c) => c.to_bytes(),
-            Err(e) if e.downcast_ref::<http_body_util::LengthLimitError>().is_some() => {
+        let bytes = match tokio::time::timeout(self.body_timeout, Limited::new(body, MAX_BODY).collect()).await {
+            Ok(Ok(c)) => c.to_bytes(),
+            Ok(Err(e)) if e.downcast_ref::<http_body_util::LengthLimitError>().is_some() => {
                 return Err(refusal(StatusCode::PAYLOAD_TOO_LARGE, "Payload Too Large: the request body is over 4 MiB"));
             }
-            Err(_) => return Err(refusal(StatusCode::BAD_REQUEST, "Bad Request: could not read the request body")),
+            Ok(Err(_)) => return Err(refusal(StatusCode::BAD_REQUEST, "Bad Request: could not read the request body")),
+            Err(_) => return Err(refusal(StatusCode::REQUEST_TIMEOUT, "Request Timeout: the request body took too long")),
         };
         let msg: Value = match serde_json::from_slice(&bytes) {
             Ok(v) => v,

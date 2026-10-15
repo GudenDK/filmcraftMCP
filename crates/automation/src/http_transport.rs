@@ -48,14 +48,42 @@ pub const MCP_PATH: &str = "/mcp";
 pub const TOKEN_ENV: &str = "FILMCRAFT_MCP_TOKEN";
 /// Largest request body read (the control channel's line limit; rmcp's default too).
 const MAX_BODY: usize = 4 << 20;
-/// Connections served at once; further ones are closed on accept.
-const MAX_CONNECTIONS: u32 = 64;
 /// Live sessions (pre-2026-07-28 clients); a further `initialize` gets 503.
 const MAX_SESSIONS: usize = 256;
-/// How long shutdown waits for cancelled exports to delete their partial files and connections to close.
-const SHUTDOWN_GRACE: Duration = Duration::from_secs(15);
 /// At most one log line per peer and reason this often.
 const LOG_EVERY: Duration = Duration::from_secs(10);
+/// Connections refused with a 503 at once; past this, further ones are closed unanswered.
+const MAX_REFUSING: usize = 32;
+
+/// The server's limits and timeouts (tests shorten them).
+#[derive(Clone, Debug)]
+pub(crate) struct Limits {
+    /// Connections served at once; one more gets a 503 and is closed.
+    pub(crate) connections: u32,
+    /// Connections from one peer (an IPv4 address or an IPv6 /64) at once, so that one address
+    /// cannot hold them all, credentials or not. Local clients all come from 127.0.0.1.
+    pub(crate) connections_per_peer: usize,
+    /// How long a client may take to send a request's head; also how long a keep-alive
+    /// connection may sit idle between requests.
+    pub(crate) header_timeout: Duration,
+    /// How long a client may take to send a request's body (408 after).
+    pub(crate) body_timeout: Duration,
+    /// How long shutdown waits for cancelled exports to delete their partial files and for
+    /// connections to close.
+    pub(crate) grace: Duration,
+}
+
+impl Default for Limits {
+    fn default() -> Self {
+        Self {
+            connections: 256,
+            connections_per_peer: 32,
+            header_timeout: Duration::from_secs(10),
+            body_timeout: Duration::from_secs(30),
+            grace: Duration::from_secs(15),
+        }
+    }
+}
 
 /// Options for [`FilmcraftMcp::serve_http`].
 #[derive(Clone)]
@@ -251,14 +279,15 @@ impl FilmcraftMcp {
         opts: HttpOptions,
         shutdown: impl Future<Output = ()> + Send + 'static,
     ) -> Result<(), AutomationError> {
-        self.serve_with(listener, opts, Arc::default(), shutdown).await
+        self.serve_with(listener, opts, Limits::default(), Arc::default(), shutdown).await
     }
 
-    /// [`Self::serve_http_listener`], counting into `stats`.
+    /// [`Self::serve_http_listener`] with these limits, counting into `stats`.
     pub(crate) async fn serve_with(
         self,
         listener: tokio::net::TcpListener,
         opts: HttpOptions,
+        limits: Limits,
         stats: Arc<Stats>,
         shutdown: impl Future<Output = ()> + Send + 'static,
     ) -> Result<(), AutomationError> {
@@ -314,9 +343,11 @@ impl FilmcraftMcp {
             mcp,
             sessions: sessions.clone(),
             legacy_session_mode: opts.legacy_session_mode,
+            body_timeout: limits.body_timeout,
             log: limits::Log::new(opts.log, LOG_EVERY),
         });
-        let permits = Arc::new(tokio::sync::Semaphore::new(MAX_CONNECTIONS as usize));
+        let conns = limits::Conns::new(limits.connections, limits.connections_per_peer);
+        let refusing = Arc::new(tokio::sync::Semaphore::new(MAX_REFUSING));
 
         loop {
             let (stream, peer) = tokio::select! {
@@ -330,18 +361,30 @@ impl FilmcraftMcp {
                     }
                 },
             };
-            let Ok(permit) = permits.clone().try_acquire_owned() else { continue };
-            let (gate, ct) = (gate.clone(), ct.clone());
+            let slot = match conns.open(peer.ip()) {
+                Ok(slot) => slot,
+                Err(why) => {
+                    gate.log.event(peer.ip(), why, format_args!("refused a connection from {peer} with 503: {why}"));
+                    if let Ok(permit) = refusing.clone().try_acquire_owned() {
+                        tokio::spawn(async move {
+                            let _permit = permit;
+                            limits::refuse_connection(stream).await;
+                        });
+                    }
+                    continue;
+                }
+            };
+            let (gate, ct, header_timeout) = (gate.clone(), ct.clone(), limits.header_timeout);
             // A panic in a request is contained by its task: the server keeps serving.
             tokio::spawn(async move {
-                let _permit = permit;
+                let _slot = slot;
                 let svc = service_fn(move |req: Request<Incoming>| {
                     let gate = gate.clone();
                     async move { Ok::<_, Infallible>(gate.route(peer, req).await) }
                 });
-                // hyper panics on a timeout configured without a timer (hyper common/time.rs)
-                let conn =
-                    http1::Builder::new().timer(TokioTimer::new()).header_read_timeout(Duration::from_secs(30)).serve_connection(TokioIo::new(stream), svc);
+                // hyper panics on a timeout configured without a timer (hyper common/time.rs). Its
+                // header timer also runs while a keep-alive connection waits for its next request.
+                let conn = http1::Builder::new().timer(TokioTimer::new()).header_read_timeout(header_timeout).serve_connection(TokioIo::new(stream), svc);
                 tokio::pin!(conn);
                 tokio::select! {
                     _ = conn.as_mut() => {}
@@ -355,7 +398,7 @@ impl FilmcraftMcp {
 
         // Refuse new connections now rather than leave them hanging until the process exits.
         drop(listener);
-        let deadline = tokio::time::Instant::now() + SHUTDOWN_GRACE;
+        let deadline = deadline_after(limits.grace);
         // The token ended every SSE stream and cancelled the stateless calls, but session workers
         // outlive it: close them, so their calls see `context.ct` cancelled (after rmcp's response
         // drain) and an export stops and deletes its partial output before the process exits.
@@ -365,9 +408,15 @@ impl FilmcraftMcp {
         }
         // Exports first: whatever still runs at the deadline has its partial output deleted.
         long_calls.drain(deadline).await;
-        let _ = tokio::time::timeout_at(deadline, permits.acquire_many(MAX_CONNECTIONS)).await;
+        let _ = tokio::time::timeout_at(deadline, conns.all_closed()).await;
         Ok(())
     }
+}
+
+/// `d` from now (far in the future if that overflows).
+fn deadline_after(d: Duration) -> tokio::time::Instant {
+    let now = tokio::time::Instant::now();
+    now.checked_add(d).or_else(|| now.checked_add(Duration::from_secs(86_400 * 365))).unwrap_or(now)
 }
 
 #[cfg(test)]
