@@ -1768,6 +1768,7 @@ dependencies = [
  "bytes",
  "filmcraft-engine",
  "filmcraft-time",
+ "futures-util",
  "http",
  "http-body-util",
  "hyper",

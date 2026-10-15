@@ -835,6 +835,27 @@ fn rmcp_idle_timeout_is_off() {
     assert_eq!(session_manager().session_config.keep_alive, None);
 }
 
+/// A panic while answering a request is answered with 500 and logged with the method and path,
+/// instead of closing the connection unanswered.
+#[tokio::test]
+async fn a_panic_is_answered_with_500() {
+    let (sink, lines) = log_capture();
+    let log = limits::Log::new(sink, Duration::from_secs(10));
+    let peer: SocketAddr = "127.0.0.1:5555".parse().unwrap();
+    let ok = gate::or_500(&log, peer, &http::Method::GET, "/mcp", async { gate::text(http::StatusCode::OK, "fine") }).await;
+    assert_eq!(ok.status(), 200);
+    let boom = async {
+        if peer.port() == 5555 {
+            panic!("a bug");
+        }
+        gate::text(http::StatusCode::OK, "fine")
+    };
+    let r = gate::or_500(&log, peer, &http::Method::POST, "/mcp", boom).await;
+    assert_eq!(r.status(), 500);
+    let l = lines.lock().unwrap().join("\n");
+    assert!(l.contains("internal error (a panic) while serving POST /mcp from 127.0.0.1:5555; answered 500"), "{l}");
+}
+
 #[test]
 fn listen_addresses_and_bind_rules() {
     let a = |s: &str| parse_listen_addr(s).map(|a| a.to_string()).map_err(|e| e.to_string());

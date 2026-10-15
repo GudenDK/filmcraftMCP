@@ -23,11 +23,13 @@ mod sessions;
 use std::convert::Infallible;
 use std::future::Future;
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
+use std::panic::AssertUnwindSafe;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Duration;
 
 use bytes::Bytes;
+use futures_util::FutureExt as _;
 use http::Request;
 use http_body_util::combinators::BoxBody;
 use hyper::body::Incoming;
@@ -404,23 +406,36 @@ impl FilmcraftMcp {
                 }
             };
             let (gate, ct, header_timeout) = (gate.clone(), ct.clone(), limits.header_timeout);
-            // A panic in a request is contained by its task: the server keeps serving.
             tokio::spawn(async move {
                 let _slot = slot;
+                let reporter = gate.clone();
+                // a panic in a request is answered with 500 (Gate::serve)
                 let svc = service_fn(move |req: Request<Incoming>| {
                     let gate = gate.clone();
-                    async move { Ok::<_, Infallible>(gate.route(peer, req).await) }
+                    async move { Ok::<_, Infallible>(gate.serve(peer, req).await) }
                 });
                 // hyper panics on a timeout configured without a timer (hyper common/time.rs). Its
                 // header timer also runs while a keep-alive connection waits for its next request.
                 let conn = http1::Builder::new().timer(TokioTimer::new()).header_read_timeout(header_timeout).serve_connection(TokioIo::new(stream), svc);
-                tokio::pin!(conn);
-                tokio::select! {
-                    _ = conn.as_mut() => {}
-                    _ = ct.cancelled() => {
-                        conn.as_mut().graceful_shutdown();
-                        let _ = tokio::time::timeout(Duration::from_secs(5), conn).await;
+                let served = AssertUnwindSafe(async {
+                    tokio::pin!(conn);
+                    tokio::select! {
+                        _ = conn.as_mut() => {}
+                        _ = ct.cancelled() => {
+                            conn.as_mut().graceful_shutdown();
+                            let _ = tokio::time::timeout(Duration::from_secs(5), conn).await;
+                        }
                     }
+                })
+                .catch_unwind()
+                .await;
+                // a panic while streaming a response: the connection is closed, the server goes on
+                if served.is_err() {
+                    reporter.log.event(
+                        peer.ip(),
+                        "panic",
+                        format_args!("internal error (a panic) while streaming a response to {peer}; closed the connection"),
+                    );
                 }
             });
         }

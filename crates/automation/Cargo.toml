@@ -31,3 +31,5 @@ http = "1"
 http-body-util = "0.1"
 bytes = "1"
 tokio-util = "0.7"
+# catch_unwind for request futures (already built for rmcp)
+futures-util = { version = "0.3", default-features = false, features = ["std"] }

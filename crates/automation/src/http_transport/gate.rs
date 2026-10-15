@@ -4,11 +4,14 @@
 //! header checks with the same lists; running them here first means a refused request costs no body
 //! read and gets the same answer whatever its body holds (no oracle for a DNS-rebinding page).
 
+use std::future::Future;
 use std::net::SocketAddr;
+use std::panic::AssertUnwindSafe;
 use std::sync::Arc;
 use std::time::Duration;
 
 use bytes::Bytes;
+use futures_util::FutureExt as _;
 use http::header::{self, HeaderName};
 use http::{HeaderMap, HeaderValue, Method, Request, Response, StatusCode};
 use http_body_util::{BodyExt, Full, Limited};
@@ -72,6 +75,12 @@ impl Refusal {
 }
 
 impl Gate {
+    /// [`Self::route`], with a panic (here or in rmcp) answered with 500 and logged.
+    pub(super) async fn serve(&self, peer: SocketAddr, req: Request<Incoming>) -> Response<HttpBody> {
+        let (method, path) = (req.method().clone(), req.uri().path().to_string());
+        or_500(&self.log, peer, &method, &path, self.route(peer, req)).await
+    }
+
     /// Check `req`, then hand it to rmcp. Never fails: errors are responses.
     pub(super) async fn route(&self, peer: SocketAddr, req: Request<Incoming>) -> Response<HttpBody> {
         if req.uri().path() != MCP_PATH {
@@ -277,6 +286,19 @@ impl Gate {
 
     fn origin_listed(&self, v: &HeaderValue) -> bool {
         v.to_str().ok().and_then(normalize_origin).is_some_and(|o| self.origins.contains(&o))
+    }
+}
+
+/// `answer`, or if it panics a 500, logged with the request's method and path (never its headers),
+/// instead of a connection closed unanswered.
+pub(super) async fn or_500(log: &Log, peer: SocketAddr, method: &Method, path: &str, answer: impl Future<Output = Response<HttpBody>>) -> Response<HttpBody> {
+    match AssertUnwindSafe(answer).catch_unwind().await {
+        Ok(r) => r,
+        Err(_) => {
+            let path: String = path.chars().take(100).collect();
+            log.event(peer.ip(), "panic", format_args!("internal error (a panic) while serving {method} {path} from {peer}; answered 500"));
+            text(StatusCode::INTERNAL_SERVER_ERROR, "Internal Server Error")
+        }
     }
 }
 
