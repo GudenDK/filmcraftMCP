@@ -316,8 +316,10 @@ wherever the user can, so the endpoint is locked down by default:
 - **Sessions** (clients on revisions before 2026-07-28). A session with nothing in flight that has
   not been used for 10 minutes is closed: clients that exit without `DELETE` do not pile up. A
   call in flight keeps its session open however long it runs (a long export without a
-  `progressToken` included). At most 256 sessions: at the cap, the least recently used idle one is
-  closed to make room. Only when every one has a call in flight does `initialize` get 503 with
+  `progressToken` included), also after its client's connection dropped: the MCP spec says that is
+  no cancellation, so the call goes on until it ends or the client cancels it. Every session counts,
+  including one whose client went away during `initialize`. At most 256 sessions: at the cap, the
+  least recently used idle one is closed to make room. Only when every one has a call in flight does `initialize` get 503 with
   `Retry-After: 5`. A request to a closed session gets 404 (`Session not found`), and the client
   should `initialize` again, as the MCP spec says.
 - A request id that is still in flight in the same session gets HTTP 400 with JSON-RPC `-32600`.
