@@ -2,6 +2,8 @@
 
 use super::*;
 use filmcraft_engine::Session;
+use http::HeaderValue;
+use serde_json::{Value, json};
 use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
 use tokio::net::TcpStream;
 
@@ -26,6 +28,9 @@ impl Server {
     }
     async fn start_with(s: Session, opts: HttpOptions, stats: Arc<Stats>) -> Self {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        Self::start_on(listener, s, opts, stats)
+    }
+    fn start_on(listener: tokio::net::TcpListener, s: Session, opts: HttpOptions, stats: Arc<Stats>) -> Self {
         let addr = listener.local_addr().unwrap();
         let (stop, rx) = tokio::sync::oneshot::channel::<()>();
         let mcp = FilmcraftMcp::headless(s);
@@ -38,6 +43,16 @@ impl Server {
         format!("127.0.0.1:{}", self.addr.port())
     }
 }
+
+/// A log sink that keeps its lines.
+fn log_capture() -> (Option<LogSink>, Arc<std::sync::Mutex<Vec<String>>>) {
+    let lines = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let keep = lines.clone();
+    (Some(Arc::new(move |l: &str| keep.lock().unwrap().push(l.to_string()))), lines)
+}
+
+/// How long a test waits for any one network read.
+const WAIT: Duration = Duration::from_secs(60);
 
 /// One HTTP/1.1 exchange on its own connection (`Connection: close`), read incrementally so
 /// SSE events can be taken one at a time.
@@ -52,7 +67,12 @@ struct Reply {
 }
 
 async fn send(addr: SocketAddr, method: &str, headers: &[(&str, &str)], body: &str) -> Reply {
-    let mut s = TcpStream::connect(addr).await.unwrap();
+    send_declaring(addr, method, headers, body.len(), body).await
+}
+
+/// [`send`], declaring a `Content-Length` of `len` but sending only `body`: a client still uploading.
+async fn send_declaring(addr: SocketAddr, method: &str, headers: &[(&str, &str)], len: usize, body: &str) -> Reply {
+    let mut s = tokio::time::timeout(WAIT, TcpStream::connect(addr)).await.expect("connect in time").unwrap();
     let mut req = format!("{method} {MCP_PATH} HTTP/1.1\r\n");
     if !headers.iter().any(|(k, _)| k.eq_ignore_ascii_case("host")) {
         req += &format!("Host: 127.0.0.1:{}\r\n", addr.port());
@@ -60,16 +80,17 @@ async fn send(addr: SocketAddr, method: &str, headers: &[(&str, &str)], body: &s
     for (k, v) in headers {
         req += &format!("{k}: {v}\r\n");
     }
-    req += &format!("Content-Length: {}\r\nConnection: close\r\n\r\n{body}", body.len());
-    s.write_all(req.as_bytes()).await.unwrap();
+    req += &format!("Content-Length: {len}\r\nConnection: close\r\n\r\n{body}");
+    // the server may answer and close before reading it all
+    let _ = s.write_all(req.as_bytes()).await;
     let mut rd = BufReader::new(s);
     let mut line = String::new();
-    rd.read_line(&mut line).await.unwrap();
+    tokio::time::timeout(WAIT, rd.read_line(&mut line)).await.expect("an answer in time").unwrap();
     let status = line.split_whitespace().nth(1).and_then(|c| c.parse().ok()).unwrap_or(0);
     let mut headers = Vec::new();
     loop {
         line.clear();
-        rd.read_line(&mut line).await.unwrap();
+        tokio::time::timeout(WAIT, rd.read_line(&mut line)).await.expect("headers in time").unwrap();
         let l = line.trim_end();
         if l.is_empty() {
             break;
@@ -95,7 +116,7 @@ impl Reply {
         }
         if self.chunked {
             let mut size = String::new();
-            if self.rd.read_line(&mut size).await.unwrap_or(0) == 0 {
+            if tokio::time::timeout(WAIT, self.rd.read_line(&mut size)).await.expect("a chunk in time").unwrap_or(0) == 0 {
                 self.eof = true;
                 return false;
             }
@@ -105,7 +126,7 @@ impl Reply {
                 return false;
             }
             let mut chunk = vec![0; n + 2];
-            self.rd.read_exact(&mut chunk).await.unwrap();
+            tokio::time::timeout(WAIT, self.rd.read_exact(&mut chunk)).await.expect("a chunk in time").unwrap();
             chunk.truncate(n);
             self.buf.extend(chunk);
             return true;
@@ -119,7 +140,7 @@ impl Reply {
             None => 8192,
         };
         let mut chunk = vec![0; want];
-        let n = self.rd.read(&mut chunk).await.unwrap_or(0);
+        let n = tokio::time::timeout(WAIT, self.rd.read(&mut chunk)).await.expect("the body in time").unwrap_or(0);
         if n == 0 {
             self.eof = true;
             return false;
@@ -376,6 +397,174 @@ async fn rejects_hostile_requests() {
     assert_eq!(r["result"]["isError"], false, "{r}");
 }
 
+/// Host, Origin, Accept and Content-Type are checked before the body is read: a refused request
+/// is answered at once (not after its upload), the same whatever its body holds (a DNS-rebinding
+/// page cannot tell a parse error or a tool name from a refusal), and logged.
+#[tokio::test(flavor = "multi_thread")]
+async fn refusals_come_before_the_body_is_read() {
+    let (log, lines) = log_capture();
+    let srv = Server::start(demo(), HttpOptions { allowed_origins: vec!["http://localhost:6274".into()], log, ..HttpOptions::default() }).await;
+    let unknown_tool = json!({"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"probe_tool","arguments":{}}}).to_string();
+    let modern = ("MCP-Protocol-Version", "2026-07-28");
+    for body in ["{\"jsonrpc\": \"2.0\", \"id\": 5, BROKEN", unknown_tool.as_str()] {
+        let cases: [(&[(&str, &str)], u16); 4] = [
+            (&[ACCEPT, JSON, modern, ("Host", "evil.example:80")], 403),
+            (&[ACCEPT, JSON, modern, ("Origin", "http://evil.example")], 403),
+            (&[("Accept", "application/json"), JSON, modern], 406),
+            (&[ACCEPT, ("Content-Type", "text/plain"), modern], 415),
+        ];
+        for (headers, status) in cases {
+            // declares 4 MiB but sends a few bytes: an answer proves the body was not waited for
+            let r = send_declaring(srv.addr, "POST", headers, MAX_BODY, body).await;
+            assert_eq!(r.status, status, "{headers:?}");
+            assert!(r.header("content-type").is_some_and(|c| c.starts_with("text/plain")), "a plain refusal, not JSON-RPC: {headers:?}");
+        }
+    }
+    // the same bodies with acceptable headers: a parse error, and an in-band unknown tool
+    assert_eq!(send(srv.addr, "POST", &[ACCEPT, JSON], "{\"jsonrpc\": \"2.0\", \"id\": 5, BROKEN").await.status, 400);
+    let mut r = send(srv.addr, "POST", &[ACCEPT, JSON, modern, ("Mcp-Method", "tools/call"), ("Mcp-Name", "probe_tool")], &unknown_tool).await;
+    assert_eq!(r.next().await.unwrap()["error"]["message"], "tool not found");
+    let l = lines.lock().unwrap().join("\n");
+    for want in [
+        "refused POST from 127.0.0.1:",
+        "403 Forbidden: Host header is not allowed (Host \"evil.example:80\")",
+        "403 Forbidden: Origin header is not allowed (Origin \"http://evil.example\")",
+        "406 Not Acceptable",
+        "415 Unsupported Media Type",
+    ] {
+        assert!(l.contains(want), "log lacks {want:?}:\n{l}");
+    }
+    // one line per peer and reason: each case ran twice
+    assert_eq!(l.matches("406 Not Acceptable").count(), 1, "{l}");
+}
+
+/// The bound address is an accepted `Host` too, so any loopback address works (127.0.0.2), and
+/// the list has no duplicates.
+#[tokio::test(flavor = "multi_thread")]
+async fn the_bound_address_is_an_accepted_host() {
+    let h = |a: &str, extra: &[&str]| accepted_hosts(a.parse().unwrap(), &extra.iter().map(|e| e.to_string()).collect::<Vec<_>>());
+    assert!(h("127.0.0.2:9000", &[]).contains(&"127.0.0.2:9000".to_string()));
+    assert!(h("192.168.1.5:9000", &[]).contains(&"192.168.1.5:9000".to_string()));
+    assert!(!h("0.0.0.0:9000", &[]).iter().any(|x| x.starts_with("0.0.0.0")));
+    let v6 = h("[::1]:9000", &["LOCALHOST:9000", "lan.example"]);
+    assert_eq!(v6, ["127.0.0.1:9000", "localhost:9000", "[::1]:9000", "lan.example"], "{v6:?}");
+
+    let Ok(listener) = tokio::net::TcpListener::bind("127.0.0.2:0").await else {
+        eprintln!("skipped: cannot bind 127.0.0.2 here");
+        return;
+    };
+    let srv = Server::start_on(listener, demo(), HttpOptions::default(), Arc::default());
+    let host = format!("127.0.0.2:{}", srv.addr.port());
+    let initialize = json!({"jsonrpc":"2.0","id":0,"method":"initialize","params":{"protocolVersion":"2025-06-18","capabilities":{},"clientInfo":{"name":"t","version":"1"}}});
+    let r = post(srv.addr, None, &[("Host", host.as_str())], &initialize).await;
+    assert_eq!(r.status, 200);
+    assert_eq!(post(srv.addr, None, &[("Host", "127.0.0.3:1")], &initialize).await.status, 403);
+}
+
+#[test]
+fn allowed_origins_and_hosts_are_checked() {
+    for (given, want) in [
+        ("http://localhost:6274", "http://localhost:6274"),
+        (" HTTP://LocalHost:6274/ ", "http://localhost:6274"),
+        ("https://app.example.com:443", "https://app.example.com:443"),
+        ("http://[::1]:6274", "http://[::1]:6274"),
+        ("null", "null"),
+    ] {
+        assert_eq!(check_allowed_origin(given).map_err(|e| e.to_string()), Ok(want.to_string()), "{given}");
+    }
+    for bad in [
+        "",
+        "*",
+        "http://localhost:*",
+        "http://localhost",
+        "https://app.example.com",
+        "localhost:6274",
+        "ftp://files.example:21",
+        "http://user@localhost:6274",
+        "http://localhost:6274/app",
+        "http://localhost:6274/?x=1",
+        "not an origin",
+    ] {
+        assert!(check_allowed_origin(bad).is_err(), "{bad:?}");
+    }
+    let e = check_allowed_origin("http://localhost").unwrap_err().to_string();
+    assert!(e.contains("http://localhost:80"), "names the port to add: {e}");
+    for ok in ["example.com", "example.com:9000", "[::1]:9000", "host.docker.internal:9877", "192.168.1.5:9877"] {
+        assert_eq!(check_allowed_host(ok).map_err(|e| e.to_string()), Ok(ok.to_string()));
+    }
+    for bad in ["", "*", "*.example.com", "a b", "user@host:1", "host:port", "example.com:99999", "http://example.com"] {
+        assert!(check_allowed_host(bad).is_err(), "{bad:?}");
+    }
+}
+
+/// A listed origin (a browser page) gets CORS: its preflight is answered without credentials, and
+/// every answer to it carries the CORS headers, errors included. Any other origin gets none.
+#[tokio::test(flavor = "multi_thread")]
+async fn cors_for_listed_origins_only() {
+    let token = "cors-test-token-0123456789-abcdefgh";
+    let bearer = format!("Bearer {token}");
+    let page = "http://localhost:6274";
+    let opts = HttpOptions { token: Some(token.into()), allowed_origins: vec![page.into()], ..HttpOptions::default() };
+    let srv = Server::start(demo(), opts).await;
+    let no_cors = |r: &Reply| !r.headers.iter().any(|(k, _)| k.starts_with("access-control-"));
+    let preflight =
+        [("Origin", page), ("Access-Control-Request-Method", "POST"), ("Access-Control-Request-Headers", "content-type, authorization, mcp-param-region")];
+    let r = send(srv.addr, "OPTIONS", &preflight, "").await;
+    assert_eq!(r.status, 204);
+    assert_eq!(r.header("access-control-allow-origin"), Some(page));
+    assert_eq!(r.header("access-control-allow-methods"), Some("GET, POST, DELETE"));
+    let allowed = r.header("access-control-allow-headers").unwrap_or_default();
+    for h in
+        ["authorization", "content-type", "accept", "mcp-session-id", "mcp-protocol-version", "mcp-method", "mcp-name", "last-event-id", "mcp-param-region"]
+    {
+        assert!(allowed.split(", ").any(|a| a == h), "{h} not in {allowed}");
+    }
+    assert_eq!(r.header("vary"), Some("Origin"));
+    // a preflight still needs the right Host
+    let mut wrong_host = preflight.to_vec();
+    wrong_host.push(("Host", "evil.example"));
+    assert_eq!(send(srv.addr, "OPTIONS", &wrong_host, "").await.status, 403);
+    // another origin: the token check first, and never a CORS header
+    let evil = [("Origin", "http://evil.example"), ("Access-Control-Request-Method", "POST")];
+    let r = send(srv.addr, "OPTIONS", &evil, "").await;
+    assert!(r.status == 401 && no_cors(&r), "{} {:?}", r.status, r.headers);
+    let initialize = json!({"jsonrpc":"2.0","id":0,"method":"initialize","params":{"protocolVersion":"2025-06-18","capabilities":{},"clientInfo":{"name":"t","version":"1"}}});
+    let r = post(srv.addr, None, &[("Origin", "http://evil.example"), ("Authorization", &bearer)], &initialize).await;
+    assert!(r.status == 403 && no_cors(&r), "{} {:?}", r.status, r.headers);
+    let r = post(srv.addr, None, &[("Origin", "http://localhost:6275"), ("Authorization", &bearer)], &initialize).await;
+    assert!(r.status == 403 && no_cors(&r), "another port is another origin");
+    // the listed page: CORS headers on its answers, the session id readable, errors included
+    let r = post(srv.addr, None, &[("Origin", page), ("Authorization", &bearer)], &initialize).await;
+    assert_eq!(r.status, 200);
+    assert_eq!(r.header("access-control-allow-origin"), Some(page));
+    assert!(r.header("access-control-expose-headers").is_some_and(|e| e.contains("Mcp-Session-Id")));
+    assert!(r.header("mcp-session-id").is_some());
+    let r = post(srv.addr, None, &[("Origin", page)], &initialize).await;
+    assert_eq!((r.status, r.header("access-control-allow-origin")), (401, Some(page)));
+    // without an Origin it is no preflight: the token, then rmcp's 405
+    assert_eq!(send(srv.addr, "OPTIONS", &[], "").await.status, 401);
+    assert_eq!(send(srv.addr, "OPTIONS", &[("Authorization", &bearer)], "").await.status, 405);
+}
+
+/// Refused requests are logged with the peer's address, at most once per peer and reason every
+/// few seconds, and never with the token (right or wrong).
+#[tokio::test(flavor = "multi_thread")]
+async fn refusals_are_logged_without_credentials() {
+    let (log, lines) = log_capture();
+    let token = "log-test-token-0123456789-abcdefgh";
+    let srv = Server::start(demo(), HttpOptions { token: Some(token.into()), log, ..HttpOptions::default() }).await;
+    let initialize = json!({"jsonrpc":"2.0","id":0,"method":"initialize","params":{"protocolVersion":"2025-06-18","capabilities":{},"clientInfo":{"name":"t","version":"1"}}});
+    for _ in 0..3 {
+        assert_eq!(post(srv.addr, None, &[("Authorization", "Bearer wrong-secret-guess")], &initialize).await.status, 401);
+    }
+    let bearer = format!("Bearer {token}");
+    assert_eq!(post(srv.addr, None, &[("Authorization", &bearer), ("Host", "evil.example")], &initialize).await.status, 403);
+    let l = lines.lock().unwrap().join("\n");
+    assert_eq!(l.matches("401 Unauthorized").count(), 1, "rate limited: {l}");
+    assert!(l.contains("refused POST from 127.0.0.1:") && l.contains("403 Forbidden: Host header is not allowed"), "{l}");
+    assert!(!l.contains(token) && !l.contains("wrong-secret-guess"), "credentials leaked: {l}");
+}
+
 /// With a token, every request needs `Authorization: Bearer <token>`, checked first.
 #[tokio::test(flavor = "multi_thread")]
 async fn bearer_token_is_required() {
@@ -464,12 +653,12 @@ fn listen_addresses_and_bind_rules() {
 #[test]
 fn bearer_header_matching() {
     let h = |s: &str| HeaderValue::from_str(s).unwrap();
-    assert!(bearer_matches(Some(&h("Bearer abc")), b"abc"));
-    assert!(bearer_matches(Some(&h("BEARER  abc ")), b"abc"));
+    assert!(gate::bearer_matches(Some(&h("Bearer abc")), b"abc"));
+    assert!(gate::bearer_matches(Some(&h("BEARER  abc ")), b"abc"));
     for bad in ["Bearer abd", "Bearer ab", "Bearer abcd", "Bearerabc", "Basic abc", "abc", "Bearer", "Bearer "] {
-        assert!(!bearer_matches(Some(&h(bad)), b"abc"), "{bad}");
+        assert!(!gate::bearer_matches(Some(&h(bad)), b"abc"), "{bad}");
     }
-    assert!(!bearer_matches(None, b"abc"));
+    assert!(!gate::bearer_matches(None, b"abc"));
 }
 
 #[tokio::test(flavor = "multi_thread")]

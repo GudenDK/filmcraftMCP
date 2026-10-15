@@ -4,16 +4,20 @@
 //!
 //! Secure by default (MCP spec, transports § Security Warning):
 //! * loopback addresses only, unless a bearer token is set;
-//! * `Host` must name this server (`127.0.0.1:<port>`, `localhost:<port>`, `[::1]:<port>`, plus
-//!   any `allowed_hosts`): a DNS-rebinding page gets 403;
-//! * a request with an `Origin` header (a browser) gets 403 unless that origin is listed in
-//!   `allowed_origins`; MCP clients send none;
 //! * with a token, every request needs `Authorization: Bearer <token>` (constant-time compare),
-//!   checked before anything else, else 401.
+//!   checked before anything else but a listed origin's CORS preflight, else 401;
+//! * `Host` must name this server (`127.0.0.1:<port>`, `localhost:<port>`, `[::1]:<port>`, the
+//!   bound address, plus any `allowed_hosts`): a DNS-rebinding page gets 403;
+//! * a request with an `Origin` header (a browser) gets 403 unless that origin is listed in
+//!   `allowed_origins` (which then also get CORS headers); MCP clients send none.
 //!
-//! In front of rmcp this module also routes the path, maps a non-JSON body to a JSON-RPC parse
-//! error (`-32700`, as `serve_io` does on stdio), caps sessions and connections, and keeps rmcp's
-//! per-tool-name schema cache bounded by answering unknown tool names itself.
+//! [`gate`] runs these checks before reading a body, maps a non-JSON body to a JSON-RPC parse error
+//! (`-32700`, as `serve_io` does on stdio), caps sessions, and keeps rmcp's per-tool-name schema
+//! cache bounded by answering unknown tool names itself. Refused requests are logged (stderr, or
+//! [`HttpOptions::log`]), rate limited per peer.
+
+mod gate;
+mod limits;
 
 use std::convert::Infallible;
 use std::future::Future;
@@ -23,19 +27,18 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Duration;
 
 use bytes::Bytes;
-use http::{HeaderValue, Method, Request, Response, StatusCode, header};
-use http_body_util::{BodyExt, Full, Limited, combinators::BoxBody};
+use http::Request;
+use http_body_util::combinators::BoxBody;
 use hyper::body::Incoming;
 use hyper::server::conn::http1;
 use hyper::service::service_fn;
 use hyper_util::rt::{TokioIo, TokioTimer};
-use rmcp::ServerHandler as _;
-use rmcp::model::ProtocolVersion;
 use rmcp::transport::streamable_http_server::SessionManager as _;
 use rmcp::transport::streamable_http_server::session::local::LocalSessionManager;
 use rmcp::transport::streamable_http_server::{StreamableHttpServerConfig, StreamableHttpService};
-use serde_json::{Value, json};
 use tokio_util::sync::CancellationToken;
+
+pub use limits::LogSink;
 
 use crate::{AutomationError, FilmcraftMcp};
 
@@ -51,6 +54,8 @@ const MAX_CONNECTIONS: u32 = 64;
 const MAX_SESSIONS: usize = 256;
 /// How long shutdown waits for cancelled exports to delete their partial files and connections to close.
 const SHUTDOWN_GRACE: Duration = Duration::from_secs(15);
+/// At most one log line per peer and reason this often.
+const LOG_EVERY: Duration = Duration::from_secs(10);
 
 /// Options for [`FilmcraftMcp::serve_http`].
 #[derive(Clone)]
@@ -58,11 +63,13 @@ pub struct HttpOptions {
     /// Require `Authorization: Bearer <token>` on every request. Mandatory for a non-loopback
     /// address. Never logged.
     pub token: Option<String>,
-    /// More `Host` values to accept besides this server's loopback forms, as `name` (any port) or
-    /// `name:port`: a LAN name, `host.docker.internal:<port>`, a tunnel or reverse proxy.
+    /// More `Host` values to accept besides this server's own, as `name` (any port) or
+    /// `name:port`: a LAN name, `host.docker.internal:<port>`, a tunnel or reverse proxy. See
+    /// [`check_allowed_host`].
     pub allowed_hosts: Vec<String>,
-    /// Browser origins allowed to call (e.g. `http://localhost:6274` for MCP Inspector); a request
-    /// with any other `Origin` header gets 403.
+    /// Browser origins allowed to call, as `scheme://host:port` (e.g. `http://localhost:6274`), or
+    /// `null`; see [`check_allowed_origin`]. They get CORS headers; a request with any other
+    /// `Origin` header gets 403.
     pub allowed_origins: Vec<String>,
     /// Serve pre-2026-07-28 clients with `Mcp-Session-Id` sessions. 2026-07-28 requests are
     /// stateless either way.
@@ -72,6 +79,8 @@ pub struct HttpOptions {
     /// A session with no traffic for this long is dropped. An export without a `progressToken`
     /// sends nothing while it runs, so keep this longer than the longest one.
     pub session_idle: Option<Duration>,
+    /// Where refused requests and failures are reported, one line each (default: stderr).
+    pub log: Option<LogSink>,
 }
 
 impl Default for HttpOptions {
@@ -83,6 +92,7 @@ impl Default for HttpOptions {
             legacy_session_mode: true,
             json_response: false,
             session_idle: Some(Duration::from_secs(3600)),
+            log: None,
         }
     }
 }
@@ -97,6 +107,7 @@ impl std::fmt::Debug for HttpOptions {
             .field("legacy_session_mode", &self.legacy_session_mode)
             .field("json_response", &self.json_response)
             .field("session_idle", &self.session_idle)
+            .field("log", &self.log.as_ref().map_or("stderr", |_| "<sink>"))
             .finish()
     }
 }
@@ -133,19 +144,83 @@ pub fn check_token(token: &str) -> Result<(), AutomationError> {
     Ok(())
 }
 
-/// The `Host` values this server answers to on `bound`, plus `extra`.
-fn allowed_hosts(bound: SocketAddr, extra: &[String]) -> Vec<String> {
+/// An `allowed_origins` entry: `scheme://host:port` with an `http` or `https` scheme and the port
+/// spelled out (`http://localhost:6274`), or `null`. Returns it normalized. Wildcards (`*`, `:*`),
+/// a missing port (which rmcp would match against every port) and anything else are refused.
+/// `null` is accepted, but every web page can send it (from a sandboxed frame or a `file:` page),
+/// so the caller should warn about it.
+pub fn check_allowed_origin(origin: &str) -> Result<String, AutomationError> {
+    let o = origin.trim();
+    let bad = |why: String| Err(AutomationError::BadRequest(format!("allowed origin `{o}`: {why}")));
+    if o.eq_ignore_ascii_case("null") {
+        return Ok("null".into());
+    }
+    if o == "*" || o.ends_with(":*") {
+        return bad("wildcards would let any web page (or any port) call; list each origin as scheme://host:port".into());
+    }
+    let Ok(uri) = o.parse::<http::Uri>() else { return bad("not an origin; write it as scheme://host:port, e.g. http://localhost:6274".into()) };
+    let scheme = match uri.scheme_str() {
+        Some(s) if s.eq_ignore_ascii_case("http") || s.eq_ignore_ascii_case("https") => s.to_ascii_lowercase(),
+        _ => return bad("an origin starts with http:// or https://".into()),
+    };
+    let Some(authority) = uri.authority() else { return bad("no host; write it as scheme://host:port".into()) };
+    if authority.as_str().contains('@') {
+        return bad("an origin has no user name".into());
+    }
+    if authority.port_u16().is_none() {
+        let port = if scheme == "https" { 443 } else { 80 };
+        return bad(format!("add the port (every other port would match too), e.g. {scheme}://{}:{port}", authority.host()));
+    }
+    if !matches!(uri.path(), "" | "/") || uri.query().is_some() {
+        return bad("an origin has no path or query".into());
+    }
+    gate::normalize_origin(o).map_or_else(|| bad("not an origin".into()), Ok)
+}
+
+/// An `allowed_hosts` entry: `name` (any port) or `name:port`, as a `Host` header carries it: a
+/// DNS name or IPv4 address, or an IPv6 address in brackets. Returns it trimmed.
+pub fn check_allowed_host(host: &str) -> Result<String, AutomationError> {
+    let h = host.trim();
+    let bad = || Err(AutomationError::BadRequest(format!("allowed host `{h}`: write it as name or name:port, as clients put it in the URL")));
+    let (name_ok, port) = match h.strip_prefix('[') {
+        Some(rest) => {
+            let Some((ip, after)) = rest.split_once(']') else { return bad() };
+            let port = match after {
+                "" => None,
+                a => match a.strip_prefix(':') {
+                    Some(p) => Some(p),
+                    None => return bad(),
+                },
+            };
+            (ip.parse::<std::net::Ipv6Addr>().is_ok(), port)
+        }
+        None => {
+            let (name, port) = match h.split_once(':') {
+                Some((n, p)) => (n, Some(p)),
+                None => (h, None),
+            };
+            (!name.is_empty() && name.chars().all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '.' | '_')), port)
+        }
+    };
+    let port_ok = port.is_none_or(|p| p.bytes().all(|b| b.is_ascii_digit()) && p.parse::<u16>().is_ok());
+    if name_ok && port_ok { Ok(h.to_string()) } else { bad() }
+}
+
+/// The `Host` values this server answers to on `bound`, plus `extra`: its loopback names on its
+/// port, and its own address unless it listens on every address (`0.0.0.0`, `[::]`).
+pub fn accepted_hosts(bound: SocketAddr, extra: &[String]) -> Vec<String> {
     let p = bound.port();
     let mut hosts = vec![format!("127.0.0.1:{p}"), format!("localhost:{p}"), format!("[::1]:{p}")];
     if p == 80 {
         // clients leave the default port out of `Host`
         hosts.extend(["127.0.0.1", "localhost", "[::1]"].map(String::from));
     }
-    let ip = bound.ip();
-    if !ip.is_loopback() && !ip.is_unspecified() {
-        hosts.push(SocketAddr::new(ip, p).to_string());
+    if !bound.ip().is_unspecified() {
+        hosts.push(bound.to_string());
     }
     hosts.extend(extra.iter().map(|h| h.trim()).filter(|h| !h.is_empty()).map(String::from));
+    let mut seen = std::collections::HashSet::new();
+    hosts.retain(|h| seen.insert(h.to_ascii_lowercase()));
     hosts
 }
 
@@ -158,15 +233,6 @@ pub(crate) struct Stats {
     /// Handlers rmcp asked for: one per session or stateless request, and one per tool name it
     /// looks up a schema for.
     pub(crate) services: AtomicUsize,
-}
-
-/// What every request is checked against before rmcp sees it.
-struct Gate {
-    token: Option<Box<[u8]>>,
-    /// For `get_tool` (the tool router), to answer unknown `tools/call` names.
-    tools: FilmcraftMcp,
-    sessions: Arc<LocalSessionManager>,
-    legacy_session_mode: bool,
 }
 
 impl FilmcraftMcp {
@@ -203,6 +269,9 @@ impl FilmcraftMcp {
         }
         check_bind(bound, token.as_deref())?;
         let token = token.map(|t| t.into_bytes().into_boxed_slice());
+        let origins = opts.allowed_origins.iter().map(|o| check_allowed_origin(o)).collect::<Result<Vec<_>, _>>()?;
+        let extra_hosts = opts.allowed_hosts.iter().map(|h| check_allowed_host(h)).collect::<Result<Vec<_>, _>>()?;
+        let hosts = accepted_hosts(bound, &extra_hosts);
 
         let ct = CancellationToken::new();
         let stop = ct.clone();
@@ -214,9 +283,10 @@ impl FilmcraftMcp {
         let mut sessions = LocalSessionManager::default();
         sessions.session_config.keep_alive = opts.session_idle;
         let sessions = Arc::new(sessions);
+        // rmcp repeats the gate's Host and Origin checks with the same lists
         let config = StreamableHttpServerConfig::default()
-            .with_allowed_hosts(allowed_hosts(bound, &opts.allowed_hosts))
-            .with_allowed_origins(opts.allowed_origins)
+            .with_allowed_hosts(hosts.clone())
+            .with_allowed_origins(origins.clone())
             // validate Origin even when no origin is allowed: then every browser request is refused
             .enforce_origin_validation()
             .with_legacy_session_mode(opts.legacy_session_mode)
@@ -224,7 +294,7 @@ impl FilmcraftMcp {
             .with_sse_keep_alive(Some(Duration::from_secs(15)))
             .with_max_request_body_bytes(MAX_BODY)
             .with_cancellation_token(ct.child_token());
-        let gate = Arc::new(Gate { token, tools: self.clone(), sessions: sessions.clone(), legacy_session_mode: opts.legacy_session_mode });
+        let tools = self.clone();
         let long_calls = self.long_calls.clone();
         // Called once per session (pre-2026-07-28 clients) or per request (2026-07-28): every
         // clone shares the one backend (`Arc<Backend>`), so all clients see the same project.
@@ -236,13 +306,23 @@ impl FilmcraftMcp {
             sessions.clone(),
             config,
         );
+        let gate = Arc::new(gate::Gate {
+            token,
+            hosts: hosts.iter().filter_map(|h| gate::parse_allowed_host(h)).collect(),
+            origins,
+            tools,
+            mcp,
+            sessions: sessions.clone(),
+            legacy_session_mode: opts.legacy_session_mode,
+            log: limits::Log::new(opts.log, LOG_EVERY),
+        });
         let permits = Arc::new(tokio::sync::Semaphore::new(MAX_CONNECTIONS as usize));
 
         loop {
-            let stream = tokio::select! {
+            let (stream, peer) = tokio::select! {
                 _ = ct.cancelled() => break,
                 accepted = listener.accept() => match accepted {
-                    Ok((stream, _)) => stream,
+                    Ok(accepted) => accepted,
                     Err(_) => {
                         // out of file descriptors and the like: back off instead of spinning
                         tokio::time::sleep(Duration::from_millis(100)).await;
@@ -251,13 +331,13 @@ impl FilmcraftMcp {
                 },
             };
             let Ok(permit) = permits.clone().try_acquire_owned() else { continue };
-            let (mcp, gate, ct) = (mcp.clone(), gate.clone(), ct.clone());
+            let (gate, ct) = (gate.clone(), ct.clone());
             // A panic in a request is contained by its task: the server keeps serving.
             tokio::spawn(async move {
                 let _permit = permit;
                 let svc = service_fn(move |req: Request<Incoming>| {
-                    let (mcp, gate) = (mcp.clone(), gate.clone());
-                    async move { Ok::<_, Infallible>(route(&mcp, &gate, req).await) }
+                    let gate = gate.clone();
+                    async move { Ok::<_, Infallible>(gate.route(peer, req).await) }
                 });
                 // hyper panics on a timeout configured without a timer (hyper common/time.rs)
                 let conn =
@@ -288,100 +368,6 @@ impl FilmcraftMcp {
         let _ = tokio::time::timeout_at(deadline, permits.acquire_many(MAX_CONNECTIONS)).await;
         Ok(())
     }
-}
-
-/// Checks in front of rmcp; rmcp does the rest (`handle` never fails: errors are responses).
-async fn route(mcp: &Mcp, gate: &Gate, req: Request<Incoming>) -> Response<HttpBody> {
-    if req.uri().path() != MCP_PATH {
-        return text(StatusCode::NOT_FOUND, "Not Found: the MCP endpoint is /mcp");
-    }
-    if let Some(expected) = gate.token.as_deref()
-        && !bearer_matches(req.headers().get(header::AUTHORIZATION), expected)
-    {
-        let mut r = text(StatusCode::UNAUTHORIZED, "Unauthorized: missing or wrong bearer token");
-        r.headers_mut().insert(header::WWW_AUTHENTICATE, HeaderValue::from_static("Bearer realm=\"filmcraft\""));
-        return r;
-    }
-    if req.method() != Method::POST {
-        return mcp.handle(req).await; // GET = SSE stream, DELETE = end the session, others 405
-    }
-    let (parts, body) = req.into_parts();
-    let bytes = match Limited::new(body, MAX_BODY).collect().await {
-        Ok(c) => c.to_bytes(),
-        Err(e) if e.downcast_ref::<http_body_util::LengthLimitError>().is_some() => {
-            return text(StatusCode::PAYLOAD_TOO_LARGE, "Payload Too Large: the request body is over 4 MiB");
-        }
-        Err(_) => return text(StatusCode::BAD_REQUEST, "Bad Request: could not read the request body"),
-    };
-    let msg: Value = match serde_json::from_slice(&bytes) {
-        Ok(v) => v,
-        Err(e) => return jsonrpc_error(StatusCode::BAD_REQUEST, Value::Null, -32700, format!("parse error: {e}")),
-    };
-    let method = msg.get("method").and_then(Value::as_str);
-    if gate.legacy_session_mode
-        && method == Some("initialize")
-        && !parts.headers.contains_key("mcp-session-id")
-        && gate.sessions.sessions.read().await.len() >= MAX_SESSIONS
-    {
-        let id = msg.get("id").cloned().unwrap_or(Value::Null);
-        return jsonrpc_error(StatusCode::SERVICE_UNAVAILABLE, id, -32000, format!("too many MCP sessions ({MAX_SESSIONS}); end unused ones with DELETE"));
-    }
-    // rmcp caches one schema lookup per distinct tools/call name, without bound, for messages
-    // declaring MCP-Protocol-Version >= 2026-07-28 (SEP-2243 header checks; the same lexical
-    // comparison and header as rmcp): only known tool names may reach it. A request gets rmcp's
-    // own unknown-tool error; a notification is accepted and dropped, as it gets no reply.
-    let checks_headers =
-        parts.headers.get("mcp-protocol-version").and_then(|v| v.to_str().ok()).is_some_and(|v| v >= ProtocolVersion::STANDARD_HEADERS.as_str());
-    if checks_headers && method == Some("tools/call") {
-        let name = msg.pointer("/params/name").and_then(Value::as_str).unwrap_or_default();
-        if gate.tools.get_tool(name).is_none() {
-            return match msg.get("id").filter(|id| !id.is_null()) {
-                Some(id) => jsonrpc_error(StatusCode::OK, id.clone(), -32602, "tool not found".into()),
-                None => accepted(),
-            };
-        }
-    }
-    mcp.handle(Request::from_parts(parts, Full::new(bytes))).await
-}
-
-/// `Authorization: Bearer <token>` (scheme in any case), compared without an early exit.
-fn bearer_matches(value: Option<&HeaderValue>, expected: &[u8]) -> bool {
-    let Some(value) = value else { return false };
-    let mut parts = value.as_bytes().splitn(2, |b| *b == b' ');
-    let (Some(scheme), Some(given)) = (parts.next(), parts.next()) else { return false };
-    scheme.eq_ignore_ascii_case(b"bearer") && constant_time_eq(given.trim_ascii(), expected)
-}
-
-/// Equal bytes, taking the same time wherever the first difference is (the length is not secret).
-fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
-    if a.len() != b.len() {
-        return false;
-    }
-    let diff = a.iter().zip(b).fold(0u8, |acc, (x, y)| acc | (x ^ y));
-    std::hint::black_box(diff) == 0
-}
-
-/// A JSON-RPC error as an `application/json` reply.
-fn jsonrpc_error(status: StatusCode, id: Value, code: i64, message: String) -> Response<HttpBody> {
-    let body = json!({"jsonrpc": "2.0", "id": id, "error": {"code": code, "message": message}}).to_string();
-    let mut r = Response::new(Full::new(Bytes::from(body)).boxed());
-    *r.status_mut() = status;
-    r.headers_mut().insert(header::CONTENT_TYPE, HeaderValue::from_static("application/json"));
-    r
-}
-
-/// `202 Accepted` with no body, as rmcp answers a notification.
-fn accepted() -> Response<HttpBody> {
-    let mut r = Response::new(Full::new(Bytes::new()).boxed());
-    *r.status_mut() = StatusCode::ACCEPTED;
-    r
-}
-
-fn text(status: StatusCode, msg: &'static str) -> Response<HttpBody> {
-    let mut r = Response::new(Full::new(Bytes::from_static(msg.as_bytes())).boxed());
-    *r.status_mut() = status;
-    r.headers_mut().insert(header::CONTENT_TYPE, HeaderValue::from_static("text/plain; charset=utf-8"));
-    r
 }
 
 #[cfg(test)]

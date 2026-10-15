@@ -114,8 +114,9 @@ OPTIONS
                                 default: the app's data directory)
   --token-file <path>           mcp --http: require `Authorization: Bearer <token>`, the token
                                 read from this file (or set FILMCRAFT_MCP_TOKEN)
-  --allow-origin <origin>       mcp --http: let this browser origin call (repeatable; any other
-                                request with an Origin header is refused)
+  --allow-origin <origin>       mcp --http: let this browser origin call, with CORS headers:
+                                scheme://host:port with the port spelled out (repeatable; any
+                                other request with an Origin header is refused)
   --allow-host <host[:port]>    mcp --http: also answer to this Host (repeatable; a LAN name,
                                 host.docker.internal:PORT, a tunnel)
   --keep-going                  `run`: report failing lines and continue
@@ -516,7 +517,7 @@ async fn cli() {
 /// `mcp --http` settings: the listen address and the server options (usage error on bad ones), or
 /// `None` for stdio.
 fn mcp_http_options(a: &Args) -> Option<(std::net::SocketAddr, filmcraft_automation::HttpOptions)> {
-    use filmcraft_automation::http_transport::{TOKEN_ENV, check_bind, check_token, parse_listen_addr};
+    use filmcraft_automation::http_transport::{TOKEN_ENV, check_allowed_host, check_allowed_origin, check_bind, check_token, parse_listen_addr};
     if !a.flag("--http") {
         if let Some(o) = ["--token-file", "--allow-origin", "--allow-host"].into_iter().find(|o| a.flag(o)) {
             usage(format!("mcp: {o} needs --http"));
@@ -537,12 +538,16 @@ fn mcp_http_options(a: &Args) -> Option<(std::net::SocketAddr, filmcraft_automat
         check_token(t).unwrap_or_else(|e| usage(format!("mcp: {e}")));
     }
     check_bind(addr, token.as_deref()).unwrap_or_else(|e| usage(format!("mcp --http: {e}")));
-    let opts = filmcraft_automation::HttpOptions {
-        token,
-        allowed_origins: a.opt_all("--allow-origin").into_iter().map(String::from).collect(),
-        allowed_hosts: a.opt_all("--allow-host").into_iter().map(String::from).collect(),
-        ..Default::default()
-    };
+    let allowed_origins: Vec<String> =
+        a.opt_all("--allow-origin").into_iter().map(|o| check_allowed_origin(o).unwrap_or_else(|e| usage(format!("mcp --allow-origin: {e}")))).collect();
+    if allowed_origins.iter().any(|o| o == "null") {
+        diag(format_args!(
+            "filmcraft-cli: warning: --allow-origin null lets any web page call (a sandboxed frame or a file: page sends `Origin: null`); use it only with a token"
+        ));
+    }
+    let allowed_hosts =
+        a.opt_all("--allow-host").into_iter().map(|h| check_allowed_host(h).unwrap_or_else(|e| usage(format!("mcp --allow-host: {e}")))).collect();
+    let opts = filmcraft_automation::HttpOptions { token, allowed_origins, allowed_hosts, ..Default::default() };
     Some((addr, opts))
 }
 

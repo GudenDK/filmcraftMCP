@@ -42,6 +42,13 @@ fn mcp_http_usage_errors() {
         &["mcp", "--token-file", "t.txt"],
         &["mcp", "--allow-origin", "http://localhost:6274"],
         &["mcp", "--http", "127.0.0.1:0", "--token-file", "/nonexistent/token"],
+        // origins need scheme://host:port (no wildcard, no port-less entry matching every port)
+        &["mcp", "--http", "127.0.0.1:0", "--allow-origin", "*"],
+        &["mcp", "--http", "127.0.0.1:0", "--allow-origin", "http://localhost"],
+        &["mcp", "--http", "127.0.0.1:0", "--allow-origin", "http://localhost:*"],
+        &["mcp", "--http", "127.0.0.1:0", "--allow-origin", "localhost:6274"],
+        &["mcp", "--http", "127.0.0.1:0", "--allow-host", "a b"],
+        &["mcp", "--http", "127.0.0.1:0", "--allow-host", "lan.example:http"],
     ] {
         let o = cli_no_token(args);
         assert_eq!(o.status.code(), Some(2), "{args:?}: {}", String::from_utf8_lossy(&o.stderr));
