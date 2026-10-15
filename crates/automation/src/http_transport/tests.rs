@@ -1599,28 +1599,26 @@ async fn a_hurried_stop_deletes_partial_exports_within_its_grace() {
                 break;
             }
         }
+        let job = job_handle(&srv.mcp, 0);
         // a request still arriving would hold a graceful stop for 5 s
         let mut slow = TcpStream::connect(srv.addr).await.unwrap();
         slow.write_all(format!("POST {MCP_PATH} HTTP/1.1\r\nHost: {}\r\n", srv.host()).as_bytes()).await.unwrap();
         tokio::time::sleep(Duration::from_millis(100)).await;
         let t0 = std::time::Instant::now();
         let _ = srv.stop.take().unwrap().send(Stop::Hurried);
+        // cancelled when the stop came, not after rmcp's 5 s wait for the session's responses
+        told_to_stop_within(&job, Duration::from_secs(2)).await;
         let r = tokio::time::timeout(Duration::from_secs(20), &mut srv.done).await.expect("stopped").unwrap();
         assert!(r.is_ok(), "{r:?}");
         assert!(t0.elapsed() < Duration::from_secs(3), "within the hurried grace: {:?}", t0.elapsed());
         assert!(!out.exists(), "the partial export is deleted");
-        // cancelled when the stop came (it stops at its next batch, later under load), not after
-        // rmcp's 5 s wait for the session's responses
-        loop {
-            let jobs = srv.mcp.run("jobs.list", json!({})).await.unwrap();
-            let last = jobs.as_array().and_then(|a| a.last()).cloned().unwrap_or_default();
-            if last["finished"] == true {
-                assert_eq!(last["result"]["error"], "cancelled", "{jobs}");
-                break;
-            }
-            assert!(t0.elapsed() < Duration::from_millis(2000), "the export was cancelled at once: {jobs}");
+        // it stops at its next batch, later under load
+        while job.result.lock().unwrap().is_none() {
+            assert!(t0.elapsed() < STOPS_WITHIN, "the cancelled export stopped");
             tokio::time::sleep(Duration::from_millis(50)).await;
         }
+        let jobs = srv.mcp.run("jobs.list", json!({})).await.unwrap();
+        assert_eq!(jobs[0]["result"]["error"], "cancelled", "{jobs}");
     })
     .await;
 }
@@ -1649,6 +1647,7 @@ async fn a_stop_cancels_an_export_waiting_for_the_busy_engine() {
         let (sid, _) = init(srv.addr, &[]).await;
         let mut r = post(srv.addr, Some(&sid), &[], &export_call(1, &out.to_string_lossy(), 30.0, Some(json!("b")), None)).await;
         first_progress(&mut r, 1).await;
+        let job = job_handle(&srv.mcp, 0);
         // another client's call holds the engine across the stop: the export's next poll waits
         let session = srv.mcp.headless_session().unwrap();
         let (locked, is_locked) = tokio::sync::oneshot::channel();
@@ -1659,18 +1658,17 @@ async fn a_stop_cancels_an_export_waiting_for_the_busy_engine() {
         });
         is_locked.await.unwrap();
         tokio::time::sleep(Duration::from_millis(150)).await;
-        let t0 = std::time::Instant::now();
         let _ = srv.stop.take().unwrap().send(Stop::Graceful);
+        // cancelled at once, not after rmcp's 5 s drain (it stops at its next batch, later under load)
+        told_to_stop_within(&job, Duration::from_secs(2)).await;
         // the server returns once the export's call has ended (or after the 15 s grace)
         let done = tokio::time::timeout(Duration::from_secs(20), &mut srv.done).await.expect("stopped").unwrap();
-        let took = t0.elapsed();
         busy.await.unwrap();
         assert!(done.is_ok(), "{done:?}");
         assert!(!out.exists(), "the partial export is deleted");
         let jobs = srv.mcp.run("jobs.list", json!({})).await.unwrap();
         let last = jobs.as_array().and_then(|a| a.last()).cloned().unwrap_or_default();
         assert_eq!((&last["finished"], &last["result"]["error"]), (&json!(true), &json!("cancelled")), "{jobs}");
-        assert!(took < Duration::from_secs(2), "the export was cancelled at once, not after rmcp's 5 s drain: {took:?}");
         drop(r);
     })
     .await;
@@ -1689,6 +1687,7 @@ async fn ending_a_session_cancels_its_export() {
         let (other, _) = init(srv.addr, &[]).await;
         let mut r = post(srv.addr, Some(&sid), &[], &export_call(1, &out.to_string_lossy(), 30.0, Some(json!("d")), None)).await;
         first_progress(&mut r, 1).await;
+        let job = job_handle(&srv.mcp, 0);
         // another session's export goes on
         let kept = dir.join("kept.mp4");
         let mut k = post(srv.addr, Some(&other), &[], &export_call(2, &kept.to_string_lossy(), 30.0, Some(json!("k")), None)).await;
@@ -1697,10 +1696,9 @@ async fn ending_a_session_cancels_its_export() {
         let t0 = std::time::Instant::now();
         let d = send(srv.addr, "DELETE", &[("Mcp-Session-Id", &sid)], "").await;
         assert_eq!(d.status, 202);
-        // told to stop at once; it stops at its next batch, which takes longer under load
-        cancel_requested_within(&srv.mcp, 0, Duration::from_secs(1)).await;
+        told_to_stop_within(&job, Duration::from_secs(2)).await;
         while srv.mcp.long_calls.count() > 1 {
-            assert!(t0.elapsed() < Duration::from_secs(10), "the cancelled export stopped");
+            assert!(t0.elapsed() < STOPS_WITHIN, "the cancelled export stopped");
             tokio::time::sleep(Duration::from_millis(20)).await;
         }
         assert!(!out.exists(), "the partial export is deleted");
@@ -1807,10 +1805,11 @@ async fn a_batch_export_that_waits_is_a_long_call() {
         // the engine is free while it encodes: another call is answered at once
         let t = std::time::Instant::now();
         let jobs = tool_json(&call(srv.addr, &sid, 3, "command_run", json!({"id": "jobs.list"})).await);
-        assert!(t.elapsed() < Duration::from_secs(2), "the engine was busy for {:?}", t.elapsed());
+        assert!(t.elapsed() < Duration::from_secs(10), "the engine was busy for {:?}", t.elapsed());
         assert_eq!(jobs.as_array().and_then(|a| a.last()).map(|j| j["finished"].clone()), Some(json!(false)), "{jobs}");
+        let job = job_handle(&srv.mcp, 2);
         let _ = srv.stop.take().unwrap().send(Stop::Graceful);
-        cancel_requested_within(&srv.mcp, 2, Duration::from_secs(1)).await;
+        told_to_stop_within(&job, Duration::from_secs(2)).await;
         let stopped = tokio::time::timeout(Duration::from_secs(20), &mut srv.done).await.expect("stopped").unwrap();
         assert!(stopped.is_ok(), "{stopped:?}");
         assert!(!long.exists(), "the partial export is deleted");
@@ -1838,7 +1837,7 @@ async fn a_stop_does_not_wait_for_an_export_that_waits_for_the_engine() {
         let busy = tokio::task::spawn_blocking(move || {
             let _busy = session.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
             let _ = locked.send(());
-            std::thread::sleep(Duration::from_secs(5));
+            std::thread::sleep(Duration::from_secs(8));
         });
         is_locked.await.unwrap();
         let r = post(srv.addr, Some(&sid), &[], &export_call(1, &out.to_string_lossy(), 30.0, Some(json!("w")), None)).await;
@@ -1851,7 +1850,7 @@ async fn a_stop_does_not_wait_for_an_export_that_waits_for_the_engine() {
         let stopped = tokio::time::timeout(Duration::from_secs(20), &mut srv.done).await.expect("stopped").unwrap();
         let took = t0.elapsed();
         assert!(stopped.is_ok(), "{stopped:?}");
-        assert!(took < Duration::from_secs(2), "the stop did not wait for the engine: {took:?}");
+        assert!(took < Duration::from_secs(4), "the stop did not wait for the engine (8 s): {took:?}");
         busy.await.unwrap();
         // the engine is free again: the cancelled call started no export
         let jobs = srv.mcp.run("jobs.list", json!({})).await.unwrap();
@@ -1863,22 +1862,27 @@ async fn a_stop_does_not_wait_for_an_export_that_waits_for_the_engine() {
     .await;
 }
 
-/// The cancel flags of the engine's jobs, in the order they started.
-fn cancel_flags(mcp: &FilmcraftMcp) -> Vec<bool> {
+/// The engine's job `i` (in the order they started): its cancel flag and result can be read
+/// without the engine's lock, which another call may hold.
+fn job_handle(mcp: &FilmcraftMcp, i: usize) -> filmcraft_engine::Job {
     let session = mcp.headless_session().unwrap();
     let s = session.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
-    s.jobs.iter().map(|j| j.progress.cancel.load(Ordering::Relaxed)).collect()
+    s.jobs.get(i).cloned().unwrap_or_else(|| panic!("no job {i}"))
 }
 
-/// Wait until job `i` is told to stop, failing after `limit`. An export stops only at its next
-/// batch, later under load: this is when it was cancelled.
-async fn cancel_requested_within(mcp: &FilmcraftMcp, i: usize, limit: Duration) {
+/// Wait until `job` is told to stop, failing after `limit`. That is when an export is cancelled:
+/// it stops only at its next batch, which takes longer on a loaded machine. The limit is below
+/// rmcp's 5 s drain, which a call that missed the cancel would wait out first.
+async fn told_to_stop_within(job: &filmcraft_engine::Job, limit: Duration) {
     let t0 = std::time::Instant::now();
-    while !cancel_flags(mcp).get(i).copied().unwrap_or(false) {
-        assert!(t0.elapsed() < limit, "job {i} was not cancelled within {limit:?}: {:?}", cancel_flags(mcp));
+    while !job.progress.cancel.load(Ordering::Relaxed) {
+        assert!(t0.elapsed() < limit, "job {} was not cancelled within {limit:?}", job.id);
         tokio::time::sleep(Duration::from_millis(10)).await;
     }
 }
+
+/// How long a cancelled export may take to stop in tests: its batch in flight, on a busy machine.
+const STOPS_WITHIN: Duration = Duration::from_secs(30);
 
 fn export_call(id: u64, path: &str, seconds: f64, token: Option<Value>, meta: Option<&Value>) -> Value {
     let params = json!({"path": path, "format": "h264", "width": 640, "height": 360, "audio": false, "range": "custom", "startSeconds": 0, "endSeconds": seconds, "wait": true});

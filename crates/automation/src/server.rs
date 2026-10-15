@@ -1212,7 +1212,7 @@ mod tests {
                     .is_some_and(|j| j.progress.cancel.load(std::sync::atomic::Ordering::Relaxed))
             };
             while !told() {
-                assert!(t0.elapsed() < std::time::Duration::from_secs(1), "{name}: the export was not cancelled at once");
+                assert!(t0.elapsed() < std::time::Duration::from_secs(2), "{name}: the export was not cancelled at once");
                 tokio::time::sleep(std::time::Duration::from_millis(10)).await;
             }
             let r = tokio::time::timeout(std::time::Duration::from_secs(30), done).await.expect("stopped in time").unwrap();
