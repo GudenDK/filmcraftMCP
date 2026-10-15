@@ -167,8 +167,9 @@ the one backend (`claude mcp add --transport http --scope user filmcraft-http ht
 Unlike this control channel, that endpoint speaks HTTP, so a web page can address it: it checks
 `Host` and `Origin` (a browser's request gets 403 unless its origin is listed with
 `--allow-origin`, which also turns on CORS for it), listens on loopback only unless a bearer token
-of 32+ characters is set (`FILMCRAFT_MCP_TOKEN` or `--token-file`; also needed for an
-`--allow-host` name a tunnel or proxy relays), and with a token refuses every
+of 32+ characters is set (`FILMCRAFT_MCP_TOKEN` or `--token-file`; also needed behind a tunnel or
+proxy, for an `--allow-host` name that is not this machine and for `--allow-origin null`), and with
+a token refuses every
 request without it (401; 429 for wrong tokens for a while after 10 of them). It caps connections
 per address and in all (closing ones that never sent a valid request to make room), times out slow
 clients, closes idle sessions and logs what it refuses. Those checks guard

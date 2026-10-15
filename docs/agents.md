@@ -174,7 +174,10 @@ Security).
   Every container on the machine can then connect: without a token the server warns about it.
   Docker Engine on Linux has no such name by default. There, run the client with `--network host`
   and use `127.0.0.1`. Otherwise, listen on the bridge address (e.g. `--http 172.17.0.1:9877`,
-  which needs a token) and start the client with `--add-host=host.docker.internal:host-gateway`.
+  which needs a token) and give the client `http://172.17.0.1:9877/mcp`. To use
+  `http://host.docker.internal:9877/mcp` there instead, start the client with
+  `--add-host=host.docker.internal:host-gateway` and the server with
+  `--allow-host host.docker.internal:9877` too, else its `Host` gets 403.
 - The Flatpak sandbox has no network by default. The server can listen inside it, but host clients
   cannot reach it until you grant network access:
   `flatpak override --user --share=network ai.storyteller.filmcraft`.
@@ -256,11 +259,12 @@ wherever the user can, so the endpoint is locked down by default:
   it listens on. A web page that rebinds its DNS name to 127.0.0.1 gets 403.
   `--allow-host NAME[:PORT]` (repeatable) adds names: a LAN name or IP, `host.docker.internal:<port>`,
   a tunnel. A name without a port matches every port. A malformed entry exits 2. A name that is
-  not this machine (anything but `localhost`, 127.0.0.0/8, `[::1]` and `host.docker.internal`)
-  means requests relayed from the network by a tunnel or reverse proxy, so it needs a token of at
-  least 32 characters (else exit 2), as a non-loopback address does. Behind a proxy every request
-  comes from the proxy's address (on this machine: 127.0.0.1, like local clients), so the
-  per-address limits (connections, wrong tokens) count them all together; the first lines say so.
+  not this machine (anything but `localhost`, a name ending in `.localhost`, 127.0.0.0/8, `[::1]`
+  and `host.docker.internal`) means requests relayed from the network by a tunnel or reverse
+  proxy, so it needs a token of at least 32 characters (else exit 2), as a non-loopback address
+  does. Behind a proxy every request comes from the proxy's address (on this machine: 127.0.0.1,
+  like local clients), so the per-address limits (connections, wrong tokens) count them all
+  together; the first lines say so.
 - **Proxies and tunnels.** Anything that relays network traffic to the port (a reverse proxy,
   `cloudflared`, `ngrok`, `ssh -R`) lets whoever reaches it drive FilmCraft, also when it rewrites
   `Host` to `127.0.0.1:<port>` or `localhost:<port>` so that no `--allow-host` is needed: nginx's
@@ -288,7 +292,7 @@ wherever the user can, so the endpoint is locked down by default:
   `Access-Control-Expose-Headers: Mcp-Session-Id, Mcp-Protocol-Version, WWW-Authenticate`. Other
   origins never get CORS headers.
 - **Token.** Set `FILMCRAFT_MCP_TOKEN`, or pass `--token-file FILE` (its first line), and every
-  request (every method, checked right after `Host` and `Origin`) needs
+  request (every method, checked right after `Host`, `Origin` and the proxy headers) needs
   `Authorization: Bearer <token>`, else 401. The
   token is compared in constant time and never printed or logged. There is no `--token VALUE`:
   other users can read a command line. Without a token, any local process (any user, on a shared
@@ -333,7 +337,8 @@ wherever the user can, so the endpoint is locked down by default:
   call in flight keeps its session open however long it runs (a long export without a
   `progressToken` included), also after its client's connection dropped: the MCP spec says that is
   no cancellation, so the call goes on until it ends or the client cancels it. Every session counts,
-  including one whose client went away during `initialize`. At most 256 sessions: at the cap, the
+  including one whose client went away during `initialize`, and one whose `DELETE` was cut short
+  is closed all the same. At most 256 sessions: at the cap, the
   least recently used idle one is closed to make room. Only when every one has a call in flight does `initialize` get 503 with
   `Retry-After: 5`. A request to a closed session gets 404 (`Session not found`), and the client
   should `initialize` again, as the MCP spec says.
@@ -350,8 +355,8 @@ its body holds, and has its connection closed.
 | 503 | too many connections and none can make room (`Retry-After: 1`), answered before the request is read |
 | 404 | a path other than `/mcp` |
 | 400 | more than one `Host`, `Origin` or `Authorization` header |
-| 204 | a listed origin's CORS preflight |
 | 400 / 403 | a malformed / foreign `Host` |
+| 204 | a listed origin's CORS preflight |
 | 403 | an `Origin` that is not listed |
 | 403 | a request relayed by a proxy or tunnel (it has `X-Forwarded-For`, `Via` or another forwarding header), without a token of 32+ characters |
 | 429 | a wrong token from an address that sent 10 wrong ones in a minute (for a minute; `Retry-After`); with a token under 32 characters, the right one too |
