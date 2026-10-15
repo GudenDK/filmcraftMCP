@@ -1,6 +1,6 @@
-//! Per-peer bookkeeping: open connections (so one address cannot take every connection), and log
-//! lines about refused requests (at most one per peer and kind every few seconds, so a flood of bad
-//! requests cannot flood the log).
+//! Per-peer bookkeeping: open connections (so one address cannot take every connection), failed
+//! authentications (so a token cannot be guessed quickly), and log lines about refused requests (at
+//! most one per peer and kind every few seconds, so a flood of bad requests cannot flood the log).
 
 use std::collections::HashMap;
 use std::fmt::Display;
@@ -17,6 +17,8 @@ pub type LogSink = Arc<dyn Fn(&str) + Send + Sync>;
 
 /// Peers tracked at once for rate limiting; past this, lines about new peers are dropped.
 const MAX_PEERS: usize = 1024;
+/// Peers whose failed authentications are tracked at once; past this, new ones are not counted.
+const MAX_AUTH_PEERS: usize = 4096;
 
 /// The address a limit applies to: an IPv4 address, or an IPv6 /64 (one host's or one LAN's
 /// share; a client can pick any address in it). An IPv4-mapped IPv6 address counts as IPv4.
@@ -88,6 +90,57 @@ impl Drop for ConnSlot {
                 peers.remove(&self.peer);
             }
         }
+    }
+}
+
+/// Failed authentications per peer: `limit` of them within `window` get the peer refused for
+/// `block`, whatever token it sends then, so a token cannot be guessed at speed.
+pub(super) struct AuthFailures {
+    limit: u32,
+    window: Duration,
+    block: Duration,
+    peers: Mutex<HashMap<IpAddr, Failures>>,
+}
+
+struct Failures {
+    since: Instant,
+    count: u32,
+    blocked_until: Option<Instant>,
+}
+
+impl AuthFailures {
+    pub(super) fn new(limit: u32, window: Duration, block: Duration) -> Self {
+        Self { limit: limit.max(1), window, block, peers: Mutex::new(HashMap::new()) }
+    }
+
+    /// How much longer `ip` is refused, if it is.
+    pub(super) fn blocked(&self, ip: IpAddr) -> Option<Duration> {
+        let now = Instant::now();
+        let until = lock(&self.peers).get(&peer_key(ip))?.blocked_until?;
+        (until > now).then(|| until.duration_since(now))
+    }
+
+    /// Count a failed authentication from `ip`. True when it starts a block.
+    pub(super) fn failed(&self, ip: IpAddr) -> bool {
+        let now = Instant::now();
+        let key = peer_key(ip);
+        let mut peers = lock(&self.peers);
+        if !peers.contains_key(&key) && peers.len() >= MAX_AUTH_PEERS {
+            peers.retain(|_, f| f.blocked_until.is_some_and(|u| u > now) || now.duration_since(f.since) < self.window);
+            if peers.len() >= MAX_AUTH_PEERS {
+                return false;
+            }
+        }
+        let f = peers.entry(key).or_insert(Failures { since: now, count: 0, blocked_until: None });
+        if now.duration_since(f.since) >= self.window || f.blocked_until.is_some_and(|u| u <= now) {
+            *f = Failures { since: now, count: 0, blocked_until: None };
+        }
+        f.count = f.count.saturating_add(1);
+        if f.count < self.limit || f.blocked_until.is_some() {
+            return false;
+        }
+        f.blocked_until = now.checked_add(self.block).or_else(|| now.checked_add(Duration::from_secs(86_400)));
+        true
     }
 }
 
@@ -201,6 +254,20 @@ mod tests {
         drop(a1);
         assert!(conns.open(c).is_ok(), "a closed connection frees its slot");
         assert_eq!(lock(&conns.peers).len(), 2, "c's slot was dropped at once");
+    }
+
+    #[test]
+    fn failed_authentications_block_a_peer_for_a_while() {
+        let auth = AuthFailures::new(3, Duration::from_secs(60), Duration::from_millis(300));
+        let (a, b): (IpAddr, IpAddr) = ("10.0.0.1".parse().unwrap(), "10.0.0.2".parse().unwrap());
+        assert!(!auth.failed(a) && !auth.failed(a));
+        assert_eq!(auth.blocked(a), None);
+        assert!(auth.failed(a), "the third failure starts a block");
+        assert!(auth.blocked(a).is_some_and(|d| d <= Duration::from_millis(300)));
+        assert_eq!(auth.blocked(b), None, "other peers are not affected");
+        std::thread::sleep(Duration::from_millis(350));
+        assert_eq!(auth.blocked(a), None, "the block ends");
+        assert!(!auth.failed(a), "and the count starts over");
     }
 
     #[test]

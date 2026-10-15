@@ -59,6 +59,15 @@ fn mcp_http_usage_errors() {
         .output()
         .expect("spawn filmcraft-cli");
     assert_eq!(o.status.code(), Some(2), "{}", String::from_utf8_lossy(&o.stderr));
+    // reachable from the network: a token too short to resist guessing is refused
+    let o = Command::new(env!("CARGO_BIN_EXE_filmcraft-cli"))
+        .args(["mcp", "--http", "0.0.0.0:0"])
+        .env("FILMCRAFT_MCP_TOKEN", "x".repeat(31))
+        .output()
+        .expect("spawn filmcraft-cli");
+    let err = String::from_utf8_lossy(&o.stderr);
+    assert_eq!(o.status.code(), Some(2), "{err}");
+    assert!(err.contains("at least 32 characters") && !err.contains(&"x".repeat(31)), "{err}");
     let help = String::from_utf8_lossy(&cli(&["help"]).stdout).into_owned();
     for want in ["mcp --http <ADDR>", "--token-file", "--allow-origin", "--allow-host", "FILMCRAFT_MCP_TOKEN"] {
         assert!(help.contains(want), "help lacks {want}");

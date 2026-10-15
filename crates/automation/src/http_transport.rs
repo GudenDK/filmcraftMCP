@@ -46,6 +46,8 @@ use crate::{AutomationError, FilmcraftMcp};
 pub const MCP_PATH: &str = "/mcp";
 /// Environment variable the CLI reads the bearer token from.
 pub const TOKEN_ENV: &str = "FILMCRAFT_MCP_TOKEN";
+/// The shortest token a server reachable from the network accepts (`openssl rand -hex 32` makes 64).
+pub const MIN_REMOTE_TOKEN_LEN: usize = 32;
 /// Largest request body read (the control channel's line limit; rmcp's default too).
 const MAX_BODY: usize = 4 << 20;
 /// Live sessions (pre-2026-07-28 clients); a further `initialize` gets 503.
@@ -68,6 +70,11 @@ pub(crate) struct Limits {
     pub(crate) header_timeout: Duration,
     /// How long a client may take to send a request's body (408 after).
     pub(crate) body_timeout: Duration,
+    /// With a token: this many failed authentications from one peer within `auth_window` get
+    /// it refused (429), right token or not, for `auth_block`.
+    pub(crate) auth_failures: u32,
+    pub(crate) auth_window: Duration,
+    pub(crate) auth_block: Duration,
     /// How long shutdown waits for cancelled exports to delete their partial files and for
     /// connections to close.
     pub(crate) grace: Duration,
@@ -80,6 +87,9 @@ impl Default for Limits {
             connections_per_peer: 32,
             header_timeout: Duration::from_secs(10),
             body_timeout: Duration::from_secs(30),
+            auth_failures: 10,
+            auth_window: Duration::from_secs(60),
+            auth_block: Duration::from_secs(60),
             grace: Duration::from_secs(15),
         }
     }
@@ -156,12 +166,21 @@ pub fn parse_listen_addr(s: &str) -> Result<SocketAddr, AutomationError> {
 }
 
 /// Serving on `addr` without a token is allowed only on a loopback address: anything else can be
-/// reached from the network, and every tool writes files or drives the app.
+/// reached from the network, and every tool writes files or drives the app. There the token must
+/// have at least [`MIN_REMOTE_TOKEN_LEN`] characters, too long to guess.
 pub fn check_bind(addr: SocketAddr, token: Option<&str>) -> Result<(), AutomationError> {
-    if addr.ip().is_loopback() || token.is_some_and(|t| !t.is_empty()) {
+    if addr.ip().is_loopback() {
         return Ok(());
     }
-    Err(AutomationError::BadRequest(format!("serving MCP on non-loopback {addr} needs a bearer token (set {TOKEN_ENV}); use 127.0.0.1 for local clients")))
+    match token.map_or(0, str::len) {
+        0 => Err(AutomationError::BadRequest(format!(
+            "serving MCP on non-loopback {addr} needs a bearer token of {MIN_REMOTE_TOKEN_LEN}+ characters (set {TOKEN_ENV}); use 127.0.0.1 for local clients"
+        ))),
+        n if n < MIN_REMOTE_TOKEN_LEN => Err(AutomationError::BadRequest(format!(
+            "serving MCP on non-loopback {addr} needs a token of at least {MIN_REMOTE_TOKEN_LEN} characters, this one has {n}: make one with `openssl rand -hex 32`"
+        ))),
+        _ => Ok(()),
+    }
 }
 
 /// A usable bearer token: visible ASCII without spaces, as `Authorization: Bearer` carries it.
@@ -344,6 +363,7 @@ impl FilmcraftMcp {
             sessions: sessions.clone(),
             legacy_session_mode: opts.legacy_session_mode,
             body_timeout: limits.body_timeout,
+            auth: limits::AuthFailures::new(limits.auth_failures, limits.auth_window, limits.auth_block),
             log: limits::Log::new(opts.log, LOG_EVERY),
         });
         let conns = limits::Conns::new(limits.connections, limits.connections_per_peer);

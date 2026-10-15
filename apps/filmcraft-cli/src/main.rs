@@ -100,7 +100,8 @@ SUBCOMMANDS
                                 long-running server any number of clients connect to by URL;
                                 they all share one project (or the one live app with --bridge).
                                 ADDR is PORT, 127.0.0.1:PORT, [::1]:PORT or localhost:PORT
-                                (loopback); a non-loopback address needs a token. Ctrl+C stops it
+                                (loopback); a non-loopback address needs a token of 32+
+                                characters. Ctrl+C stops it
   help                          this text
   --version                     print the version
 
@@ -597,8 +598,8 @@ async fn serve_mcp_http(
         (Some(_), None) => format!("bearer token required (from {})", filmcraft_automation::http_transport::TOKEN_ENV),
     };
     diag(format_args!("filmcraft-cli: MCP (Streamable HTTP) on http://{bound}/mcp, driving {backend}; {auth}. Ctrl+C stops it."));
-    if opts.token.as_ref().is_some_and(|t| t.len() < 16) {
-        diag(format_args!("filmcraft-cli: warning: the MCP token is short; use 32+ random characters"));
+    if let Some(n) = opts.token.as_ref().map(String::len).filter(|n| *n < filmcraft_automation::http_transport::MIN_REMOTE_TOKEN_LEN) {
+        diag(format_args!("filmcraft-cli: warning: the MCP token is short ({n} characters); use 32+ random characters"));
     }
     if !bound.ip().is_loopback() {
         diag(format_args!(

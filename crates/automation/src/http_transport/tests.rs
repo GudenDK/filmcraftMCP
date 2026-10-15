@@ -691,6 +691,38 @@ async fn bearer_token_is_required() {
     }
 }
 
+/// A peer that fails authentication too often is refused for a while (429 with Retry-After),
+/// even with the right token, so the token cannot be guessed at speed; it is logged, other peers
+/// are not affected, and the block ends.
+#[tokio::test(flavor = "multi_thread")]
+async fn failed_authentications_get_a_peer_refused_for_a_while() {
+    let (log, lines) = log_capture();
+    let token = "backoff-test-token-0123456789-abcdef";
+    let bearer = format!("Bearer {token}");
+    let limits = Limits { auth_failures: 3, auth_block: Duration::from_millis(1500), ..Limits::default() };
+    let srv = Server::start_limited(demo(), HttpOptions { token: Some(token.into()), log, ..HttpOptions::default() }, limits).await;
+    let initialize = json!({"jsonrpc":"2.0","id":0,"method":"initialize","params":{"protocolVersion":"2025-06-18","capabilities":{},"clientInfo":{"name":"t","version":"1"}}});
+    assert_eq!(post(srv.addr, None, &[("Authorization", &bearer)], &initialize).await.status, 200);
+    for guess in ["Bearer a", "Bearer b", "Bearer c"] {
+        assert_eq!(post(srv.addr, None, &[("Authorization", guess)], &initialize).await.status, 401);
+    }
+    let r = post(srv.addr, None, &[("Authorization", &bearer)], &initialize).await;
+    assert_eq!(r.status, 429, "blocked, right token or not");
+    assert!(r.header("retry-after").and_then(|s| s.parse::<u64>().ok()).is_some_and(|s| (1..=2).contains(&s)), "{:?}", r.headers);
+    assert!(r.header("mcp-session-id").is_none());
+    if let Some(s) = connect_from("127.0.0.2", srv.addr).await {
+        let body = initialize.to_string();
+        let r = exchange(s, srv.addr, "POST", &[ACCEPT, JSON, ("Authorization", &bearer)], body.len(), &body).await;
+        assert_eq!(r.status, 200, "another address is not blocked");
+    }
+    tokio::time::sleep(Duration::from_millis(1600)).await;
+    assert_eq!(post(srv.addr, None, &[("Authorization", &bearer)], &initialize).await.status, 200, "the block ends");
+    let l = lines.lock().unwrap().join("\n");
+    assert!(l.contains("too many failed authentications from 127.0.0.1: refusing it for a while"), "{l}");
+    assert!(l.contains("429 Too Many Requests"), "{l}");
+    assert!(!l.contains(token), "{l}");
+}
+
 /// Sessions are capped: an `initialize` past the cap gets 503 until one ends.
 #[tokio::test(flavor = "multi_thread")]
 async fn sessions_are_capped() {
@@ -734,10 +766,16 @@ fn listen_addresses_and_bind_rules() {
     let addr = |s: &str| s.parse::<SocketAddr>().unwrap();
     assert!(check_bind(addr("127.0.0.1:9000"), None).is_ok());
     assert!(check_bind(addr("[::1]:9000"), None).is_ok());
+    assert!(check_bind(addr("127.0.0.1:9000"), Some("short")).is_ok(), "a short token is the user's choice on loopback");
+    let long = "x".repeat(MIN_REMOTE_TOKEN_LEN);
     for remote in ["0.0.0.0:9000", "[::]:9000", "192.168.1.5:9000"] {
         assert!(check_bind(addr(remote), None).is_err(), "{remote}");
         assert!(check_bind(addr(remote), Some("")).is_err(), "{remote}");
-        assert!(check_bind(addr(remote), Some("tok")).is_ok(), "{remote}");
+        // reachable from the network: a token too short to resist guessing is refused
+        let e = check_bind(addr(remote), Some(&long[1..])).unwrap_err().to_string();
+        assert!(e.contains("at least 32 characters") && e.contains("has 31"), "{e}");
+        assert!(check_bind(addr(remote), Some("tok")).is_err(), "{remote}");
+        assert!(check_bind(addr(remote), Some(&long)).is_ok(), "{remote}");
     }
     assert!(check_token("abc-DEF_123.~+/=").is_ok());
     for bad in ["", "has space", "tab\t", "ünïcode", "new\nline"] {
@@ -761,6 +799,9 @@ fn bearer_header_matching() {
 async fn a_non_loopback_bind_needs_a_token() {
     let m = FilmcraftMcp::headless(Session::default());
     let r = m.serve_http("0.0.0.0:0".parse().unwrap(), HttpOptions::default(), async {}).await;
+    assert!(matches!(r, Err(AutomationError::BadRequest(_))), "{r:?}");
+    let m = FilmcraftMcp::headless(Session::default());
+    let r = m.serve_http("0.0.0.0:0".parse().unwrap(), HttpOptions { token: Some("only-20-characters-x".into()), ..HttpOptions::default() }, async {}).await;
     assert!(matches!(r, Err(AutomationError::BadRequest(_))), "{r:?}");
     let m = FilmcraftMcp::headless(Session::default());
     let r = m.serve_http("127.0.0.1:0".parse().unwrap(), HttpOptions { token: Some("bad token".into()), ..HttpOptions::default() }, async {}).await;

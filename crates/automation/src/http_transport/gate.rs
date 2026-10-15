@@ -18,7 +18,7 @@ use rmcp::model::ProtocolVersion;
 use rmcp::transport::streamable_http_server::session::local::LocalSessionManager;
 use serde_json::{Value, json};
 
-use super::limits::Log;
+use super::limits::{AuthFailures, Log};
 use super::{HttpBody, MAX_BODY, MAX_SESSIONS, MCP_PATH, Mcp};
 use crate::FilmcraftMcp;
 
@@ -38,6 +38,7 @@ pub(super) struct Gate {
     pub(super) sessions: Arc<LocalSessionManager>,
     pub(super) legacy_session_mode: bool,
     pub(super) body_timeout: Duration,
+    pub(super) auth: AuthFailures,
     pub(super) log: Log,
 }
 
@@ -47,10 +48,12 @@ struct Refusal {
     status: StatusCode,
     body: &'static str,
     detail: Option<String>,
+    /// Seconds until the client may try again (`Retry-After`).
+    retry_after: Option<u64>,
 }
 
 fn refusal(status: StatusCode, body: &'static str) -> Refusal {
-    Refusal { status, body, detail: None }
+    Refusal { status, body, detail: None, retry_after: None }
 }
 
 impl Refusal {
@@ -72,7 +75,7 @@ impl Gate {
         // CORS headers go to a listed origin only (a page allowed with `--allow-origin`).
         let cors = req.headers().get(header::ORIGIN).filter(|o| self.origin_listed(o)).cloned();
         let method = req.method().clone();
-        let mut r = match self.checked(req, cors.is_some()).await {
+        let mut r = match self.checked(peer, req, cors.is_some()).await {
             Ok(r) => r,
             Err(no) => self.refuse(peer, &method, no),
         };
@@ -82,14 +85,14 @@ impl Gate {
         r
     }
 
-    async fn checked(&self, req: Request<Incoming>, listed_origin: bool) -> Result<Response<HttpBody>, Refusal> {
+    async fn checked(&self, peer: SocketAddr, req: Request<Incoming>, listed_origin: bool) -> Result<Response<HttpBody>, Refusal> {
         // A browser sends a CORS preflight without credentials: it is answered before the token
         // check, and only for a listed origin.
         if listed_origin && req.method() == Method::OPTIONS && req.headers().contains_key(header::ACCESS_CONTROL_REQUEST_METHOD) {
             self.check_host(&req)?;
             return Ok(preflight(req.headers()));
         }
-        self.check_token(req.headers())?;
+        self.check_token(peer, req.headers())?;
         self.check_host(&req)?;
         self.check_origin(req.headers())?;
         if req.method() != Method::POST {
@@ -156,19 +159,31 @@ impl Gate {
         if no.status == StatusCode::UNAUTHORIZED {
             h.insert(header::WWW_AUTHENTICATE, HeaderValue::from_static("Bearer realm=\"filmcraft\""));
         }
+        if let Some(secs) = no.retry_after {
+            h.insert(header::RETRY_AFTER, HeaderValue::from(secs));
+        }
         // The body (if any) was not read, so the connection cannot carry another request; and a
         // client refused once gets no idle connection to hold.
         h.insert(header::CONNECTION, HeaderValue::from_static("close"));
         r
     }
 
-    fn check_token(&self, headers: &HeaderMap) -> Result<(), Refusal> {
-        match self.token.as_deref() {
-            Some(expected) if !bearer_matches(headers.get(header::AUTHORIZATION), expected) => {
-                Err(refusal(StatusCode::UNAUTHORIZED, "Unauthorized: missing or wrong bearer token"))
-            }
-            _ => Ok(()),
+    /// The bearer token, unless this peer failed too often lately: then it is refused whatever it
+    /// sends, so that guessing gets nowhere.
+    fn check_token(&self, peer: SocketAddr, headers: &HeaderMap) -> Result<(), Refusal> {
+        let Some(expected) = self.token.as_deref() else { return Ok(()) };
+        if let Some(left) = self.auth.blocked(peer.ip()) {
+            let mut no = refusal(StatusCode::TOO_MANY_REQUESTS, "Too Many Requests: too many failed authentications from this address; try again later");
+            no.retry_after = Some(left.as_secs().saturating_add(1));
+            return Err(no);
         }
+        if bearer_matches(headers.get(header::AUTHORIZATION), expected) {
+            return Ok(());
+        }
+        if self.auth.failed(peer.ip()) {
+            self.log.line(format_args!("too many failed authentications from {}: refusing it for a while", peer.ip()));
+        }
+        Err(refusal(StatusCode::UNAUTHORIZED, "Unauthorized: missing or wrong bearer token"))
     }
 
     /// rmcp's DNS-rebinding check: `Host` (or, without one, the request's authority) must name this
