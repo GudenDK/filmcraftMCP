@@ -306,7 +306,8 @@ pub struct StoreError {
 /// The token stored at `path`, read as a `--token-file` is, but only from a regular file: never
 /// through a link (another user who can write to the folder could point it at any file of yours
 /// with a predictable first line), nor from a pipe or device (which would block, or feed it
-/// anything). When nothing is there, a new random one ([`generate_token`]) is stored first,
+/// anything), and on unix only from a file of this user's (another user would know the token, or
+/// could change it). When nothing is there, a new random one ([`generate_token`]) is stored first,
 /// without ever replacing or following what is at `path`: a file another process (another server,
 /// `mcp-token`) stored meanwhile is read instead. On unix the file is private (0600), and so is a
 /// folder made for it (0700).
@@ -320,7 +321,7 @@ pub fn load_or_create(path: &Path) -> Result<Stored, StoreError> {
     }
     let token = generate_token().map_err(fault)?;
     match create_token_file(path, &token) {
-        Ok(()) => Ok(Stored { token, created: true, warnings: location_warnings(path) }),
+        Ok(()) => Ok(Stored { token, created: true, warnings: location_warnings(path, my_uid(path)) }),
         // another process stored one first: that is the token
         Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => match std::fs::symlink_metadata(path) {
             Ok(m) => read_stored(path, &m),
@@ -331,7 +332,7 @@ pub fn load_or_create(path: &Path) -> Result<Stored, StoreError> {
 }
 
 /// Read the stored token at `path`, whose `symlink_metadata` is `meta`: a regular file only, and
-/// on unix the very file that was looked at.
+/// on unix the very file that was looked at, and one of this user's.
 fn read_stored(path: &Path, meta: &std::fs::Metadata) -> Result<Stored, StoreError> {
     let shown = path.display();
     let unusable = |why: String| StoreError { message: format!("the stored MCP token in {shown} is unusable: {why}"), unusable: true };
@@ -343,41 +344,106 @@ fn read_stored(path: &Path, meta: &std::fs::Metadata) -> Result<Stored, StoreErr
         let what = if kind.is_symlink() { "a link" } else { "no regular file (a pipe, socket or device)" };
         return Err(unusable(format!("it is {what}, which is never read as the token")));
     }
-    let file = std::fs::File::open(path).map_err(|e| unusable(e.to_string()))?;
+    let replaced = || unusable("it was replaced while it was being read".into());
+    let file = open_stored(path).map_err(|e| if is_link_refused(&e) { replaced() } else { unusable(e.to_string()) })?;
+    let me = my_uid(path);
     #[cfg(unix)]
     {
         use std::os::unix::fs::MetadataExt as _;
         let opened = file.metadata().map_err(|e| unusable(e.to_string()))?;
         if !opened.is_file() || (opened.dev(), opened.ino()) != (meta.dev(), meta.ino()) {
-            return Err(unusable("it was replaced while it was being read".into()));
+            return Err(replaced());
+        }
+        if let Some(me) = me
+            && opened.uid() != me
+        {
+            return Err(unusable(format!(
+                "it belongs to another user (uid {}), who knows the token in it or can change it; only a token file of your own is used",
+                opened.uid()
+            )));
         }
     }
     let (token, warning) = read_open_token_file(file, path).map_err(unusable)?;
     let mut warnings: Vec<String> = warning.map(|w| format!("the stored token file {w}")).into_iter().collect();
-    warnings.extend(location_warnings(path));
+    warnings.extend(location_warnings(path, me));
     Ok(Stored { token, created: false, warnings })
 }
 
+/// Open the stored token at `path` for reading. On unix never through a link, and without waiting:
+/// a pipe put in place of the file after it was looked at (by someone who can write to its folder)
+/// would block the open until something wrote to it. The caller checks what was opened.
+fn open_stored(path: &Path) -> std::io::Result<std::fs::File> {
+    let mut opts = std::fs::OpenOptions::new();
+    opts.read(true);
+    #[cfg(unix)]
+    std::os::unix::fs::OpenOptionsExt::custom_flags(&mut opts, libc::O_NONBLOCK | libc::O_NOFOLLOW);
+    opts.open(path)
+}
+
+/// Whether opening failed because a link is in the file's place ([`open_stored`]).
+#[cfg(unix)]
+fn is_link_refused(e: &std::io::Error) -> bool {
+    e.raw_os_error() == Some(libc::ELOOP)
+}
+
+#[cfg(not(unix))]
+fn is_link_refused(_e: &std::io::Error) -> bool {
+    false
+}
+
+/// The user id that owns the files this process makes next to the stored token at `path` (in the
+/// system's temporary folder when it may not write there): whose the token must be. `None` when
+/// that cannot be told.
+#[cfg(unix)]
+fn my_uid(path: &Path) -> Option<u32> {
+    use std::os::unix::fs::MetadataExt as _;
+    let probe = |dir: &Path| {
+        let tmp = write_temp(dir, "").ok()?;
+        let uid = std::fs::symlink_metadata(&tmp).map(|m| m.uid());
+        let _ = std::fs::remove_file(&tmp);
+        uid.ok()
+    };
+    path.parent().filter(|d| !d.as_os_str().is_empty()).and_then(probe).or_else(|| probe(&std::env::temp_dir()))
+}
+
+/// Windows has no user ids: the folder decides ([`windows_exposure`]).
+#[cfg(not(unix))]
+fn my_uid(_path: &Path) -> Option<u32> {
+    None
+}
+
 /// How other users could get at the stored token at `path` through its folder: on unix a folder
-/// they can write to (without the sticky bit) lets them replace the file with one holding a token
-/// they know; on Windows a folder outside the user's profile ([`windows_exposure`]).
-fn location_warnings(path: &Path) -> Vec<String> {
+/// they can write to (without the sticky bit), or one that belongs to another user (`me` is this
+/// user's id), lets them replace the file with one holding a token they know; on Windows a folder
+/// outside the user's profile ([`windows_exposure`]).
+fn location_warnings(path: &Path, me: Option<u32>) -> Vec<String> {
     let warnings = stored_location_warning(path).into_iter();
     #[cfg(unix)]
-    let warnings = warnings.chain(path.parent().and_then(folder_exposure));
+    let warnings = warnings.chain(path.parent().and_then(|d| folder_exposure(d, me)));
+    #[cfg(not(unix))]
+    let _ = me;
     warnings.collect()
 }
 
-/// Why other users could replace a file in `dir`: they may write to it, and it has no sticky bit.
+/// Why other users could replace a file in `dir`: they may write to it, and it has no sticky bit;
+/// or it belongs to someone other than this user (`me`) and root.
 #[cfg(unix)]
-fn folder_exposure(dir: &Path) -> Option<String> {
-    use std::os::unix::fs::PermissionsExt as _;
-    let mode = std::fs::metadata(dir).ok()?.permissions().mode();
-    (mode & 0o022 != 0 && mode & 0o1000 == 0).then(|| {
-        format!(
+fn folder_exposure(dir: &Path, me: Option<u32>) -> Option<String> {
+    use std::os::unix::fs::{MetadataExt as _, PermissionsExt as _};
+    let meta = std::fs::metadata(dir).ok()?;
+    let mode = meta.permissions().mode();
+    if mode & 0o022 != 0 && mode & 0o1000 == 0 {
+        return Some(format!(
             "the folder {} can be changed by other users (mode {:03o}), so they could replace the stored token with one they know; make it private with `chmod 700`",
             dir.display(),
             mode & 0o777
+        ));
+    }
+    let owner = meta.uid();
+    (me.is_some_and(|me| owner != me) && owner != 0).then(|| {
+        format!(
+            "the folder {} belongs to another user (uid {owner}), who could replace the stored token with one they know; keep it in a folder of your own with --data-dir DIR",
+            dir.display()
         )
     })
 }
@@ -838,6 +904,87 @@ mod tests {
         // `mcp-token --new` puts a token file in its place
         let t = replace_stored(&path).unwrap();
         assert_eq!(load_or_create(&path).unwrap().token, t);
+    }
+
+    /// `mkfifo path`, where there is a `mkfifo`.
+    #[cfg(unix)]
+    fn mkfifo(path: &Path) -> bool {
+        std::process::Command::new("mkfifo").arg(path).status().is_ok_and(|s| s.success())
+    }
+
+    /// A pipe put in the stored token's place after it was looked at and before it is opened (by
+    /// someone who can write to its folder) is refused at once: opening it used to block the
+    /// server and `mcp-token` until something wrote to it, with no word said. A link put there is
+    /// refused without being followed, here to a pipe, which blocked the same way.
+    #[cfg(unix)]
+    #[test]
+    fn a_pipe_or_link_swapped_in_after_the_check_is_refused_at_once() {
+        let tmp = TempDir::new("swap");
+        let path = tmp.0.join(STORED_FILE);
+        std::fs::write(&path, TOKEN).unwrap();
+        let looked_at = std::fs::symlink_metadata(&path).unwrap();
+        std::fs::remove_file(&path).unwrap();
+        if !mkfifo(&path) {
+            return; // no mkfifo here
+        }
+        let fifo = tmp.0.join("fifo");
+        assert!(mkfifo(&fifo));
+        let read = |p: PathBuf, m: std::fs::Metadata| {
+            let (tx, rx) = std::sync::mpsc::channel();
+            std::thread::spawn(move || {
+                let _ = tx.send(read_stored(&p, &m).map(|s| s.token));
+            });
+            rx.recv_timeout(std::time::Duration::from_secs(10)).expect("refused at once, without waiting for a writer")
+        };
+        let e = read(path.clone(), looked_at.clone()).unwrap_err();
+        assert!(e.unusable && e.message.contains("replaced while it was being read"), "{e:?}");
+        std::fs::remove_file(&path).unwrap();
+        std::os::unix::fs::symlink(&fifo, &path).unwrap();
+        let e = read(path.clone(), looked_at).unwrap_err();
+        assert!(e.unusable && e.message.contains("replaced while it was being read"), "{e:?}");
+    }
+
+    /// On unix only a token file of one's own is used: another user who put a file there (in a
+    /// shared data folder, or one of theirs) knows the token, or can change it, and could drive
+    /// FilmCraft as you. As root such a file was used without a word. A folder of another user's
+    /// (not root's) is warned about: they can swap the file at any time. Needs root (to give
+    /// files away); skipped otherwise.
+    #[cfg(unix)]
+    #[test]
+    fn a_token_file_of_another_user_is_refused() {
+        use std::os::unix::fs::MetadataExt as _;
+        let tmp = TempDir::new("owner");
+        let dir = tmp.0.join("data");
+        std::fs::create_dir(&dir).unwrap();
+        std::fs::set_permissions(&dir, std::os::unix::fs::PermissionsExt::from_mode(0o755)).unwrap();
+        let path = dir.join(STORED_FILE);
+        std::fs::write(&path, TOKEN).unwrap();
+        std::fs::set_permissions(&path, std::os::unix::fs::PermissionsExt::from_mode(0o600)).unwrap();
+        let me = std::fs::metadata(&path).unwrap().uid();
+        let other = if me == 1000 { 1001 } else { 1000 };
+        if std::os::unix::fs::chown(&path, Some(other), None).is_err() {
+            return; // only root can give a file away
+        }
+        let e = load_or_create(&path).unwrap_err();
+        assert!(e.unusable && e.message.contains("belongs to another user") && e.message.contains(&format!("uid {other}")), "{e:?}");
+        assert!(!e.message.contains(TOKEN));
+        // `mcp-token --new` puts a file of one's own in its place
+        let t = replace_stored(&path).unwrap();
+        let s = load_or_create(&path).unwrap();
+        assert_eq!((s.token.as_str(), s.warnings.len()), (t.as_str(), 0), "{s:?}");
+        // a folder of another user's: they could swap the file at any time
+        std::os::unix::fs::chown(&dir, Some(other), None).unwrap();
+        let s = load_or_create(&path).unwrap();
+        assert!(s.warnings.iter().any(|w| w.contains("belongs to another user") && w.contains(&format!("uid {other}")) && w.contains("--data-dir")), "{s:?}");
+        let fresh = dir.join("fresh");
+        std::fs::create_dir(&fresh).unwrap();
+        std::os::unix::fs::chown(&fresh, Some(other), None).unwrap();
+        let made = load_or_create(&fresh.join(STORED_FILE)).unwrap();
+        assert!(made.created && made.warnings.iter().any(|w| w.contains("belongs to another user")), "{made:?}");
+        // root's folders are not: root can do anything anyway
+        std::os::unix::fs::chown(&dir, Some(0), None).unwrap();
+        assert!(load_or_create(&path).unwrap().warnings.iter().all(|w| !w.contains("belongs to")));
+        assert_eq!(std::fs::read_dir(&dir).unwrap().filter_map(Result::ok).filter(|e| e.file_name().to_string_lossy().ends_with(".tmp")).count(), 0);
     }
 
     /// A data folder that cannot be made because something that is no folder is in its place

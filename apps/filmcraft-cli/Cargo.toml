@@ -36,5 +36,10 @@ serde_json = { workspace = true }
 getrandom = "0.4"
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "signal"] }
 
+[target.'cfg(unix)'.dependencies]
+# O_NONBLOCK / O_NOFOLLOW / ELOOP for opening the stored MCP token (constants only, no `unsafe`):
+# already in the tree through getrandom and tokio
+libc = "0.2"
+
 [dev-dependencies]
 filmcraft-testkit = { workspace = true }

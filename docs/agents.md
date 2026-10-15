@@ -158,14 +158,16 @@ per-user folder). It is the app's data directory (autosaves, presets; see
   bytes from the operating system's random number generator as 64 hex digits, without a line
   break. It is written in one step and never over or through anything already at that path. A
   file there is read the way a `--token-file` is, but only a regular file: a link, a pipe or a
-  device in its place is refused (`mcp-token --new` replaces it). When the folder cannot be made
+  device in its place is refused (`mcp-token --new` replaces it), also one put there while the
+  file is being read. On Linux and macOS it must be your own file, too: one that belongs to another
+  user is refused, since they know the token in it or can change it (as root as well). When the folder cannot be made
   or the file cannot be read, the server exits 1 and says what to do: `--data-dir`,
   `--token-file`, `FILMCRAFT_MCP_TOKEN`, or `mcp-token --new` (with the same `--data-dir`) to
   replace a file that holds no usable token.
 - **Who can read it.** On Linux and macOS the file is readable only by you (mode 600), and a
   folder made for it too (700). A warning says when other users can read or change the file, or
-  write to its folder (they could put a token they know in its place): `chmod 600` the file,
-  `chmod 700` the folder. On Windows nothing restricts the file but its folder's permissions. In
+  write to its folder, or own the folder (they could put a token they know in its place):
+  `chmod 600` the file, `chmod 700` the folder, or keep it in a folder of your own. On Windows nothing restricts the file but its folder's permissions. In
   your profile (`%APPDATA%`, the default) only you and administrators can read it. A folder
   outside the profile usually lets every user of the PC read and change what is in it: a portable
   FilmCraft folder made directly under `C:\`, or a `--data-dir` there or on another drive. The
