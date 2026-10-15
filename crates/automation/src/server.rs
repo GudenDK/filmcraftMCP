@@ -312,7 +312,11 @@ impl FilmcraftMcp {
         // ended): a hurried stop must be over before the process is killed, however long rmcp
         // waits for handlers that do not finish.
         let (r, deadline) = match stopped {
-            Err(r) => (Some(r), crate::http_transport::deadline_after(Stop::Graceful.grace())),
+            Err(r) => {
+                // the calls are over; exports started without `wait` would be cut off at exit
+                long_calls.stop();
+                (Some(r), crate::http_transport::deadline_after(Stop::Graceful.grace()))
+            }
             Ok(how) => {
                 let deadline = crate::http_transport::deadline_after(how.grace());
                 long_calls.stop();
@@ -332,6 +336,23 @@ impl FilmcraftMcp {
     /// Run an engine command on whichever backend.
     pub async fn run(&self, id: &str, params: Value) -> Result<Value, AutomationError> {
         self.run_unless(id, params, || false).await
+    }
+
+    /// [`Self::run`] for a client's command (`command_run`, a `command_batch` step). An export it
+    /// starts in a headless engine without `wait` goes on as a job after the call returns: it is
+    /// registered, so that a stop cancels it and deletes its partial output instead of leaving a
+    /// truncated file when the process exits. (The app's own jobs, in bridge mode, outlive this
+    /// server.)
+    async fn run_command(&self, id: &str, params: Value) -> Result<Value, AutomationError> {
+        if !crate::long_job::LONG_COMMANDS.contains(&id) {
+            return self.run(id, params).await;
+        }
+        let since = std::time::SystemTime::now();
+        let (v, job) = self.start_job_unless(id, params, || false).await?;
+        if let (Some(job), Some(path)) = (job, v.get("path").and_then(Value::as_str)) {
+            self.long_calls.background(job, path, since);
+        }
+        Ok(v)
     }
 
     /// [`Self::run`], unless `cancelled()` says so once the engine is free to run it (a headless
@@ -452,7 +473,7 @@ impl FilmcraftMcp {
         annotations(read_only_hint = false, destructive_hint = true, idempotent_hint = false, open_world_hint = false)
     )]
     async fn command_run(&self, Parameters(p): Parameters<RunParams>) -> Result<CallToolResult, McpError> {
-        wrap(self.run(&p.id, p.params.unwrap_or(json!({}))).await)
+        wrap(self.run_command(&p.id, p.params.unwrap_or(json!({}))).await)
     }
 
     #[tool(
@@ -464,7 +485,7 @@ impl FilmcraftMcp {
         let stop = p.stop_on_error.unwrap_or(true);
         let (mut completed, mut failed, mut results) = (0u32, 0u32, Vec::new());
         for st in p.steps {
-            match self.run(&st.id, st.params.unwrap_or(json!({}))).await {
+            match self.run_command(&st.id, st.params.unwrap_or(json!({}))).await {
                 Ok(v) => {
                     completed += 1;
                     results.push(json!({"ok": true, "result": v}));

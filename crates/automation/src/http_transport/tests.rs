@@ -1726,6 +1726,55 @@ async fn ending_a_session_cancels_its_export() {
     .await;
 }
 
+/// Exports a client started without `wait` (`command_run` or a `command_batch` step return
+/// `{job, path}` at once) run on as jobs of the engine. A stop cancels those still running and
+/// deletes their partial output, as it does a waiting export's; one that finished before is kept.
+/// They used to go on encoding until the process exited, leaving a truncated file under the name
+/// the client asked for.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_stop_cancels_exports_started_without_wait() {
+    within(async {
+        let dir = std::env::temp_dir().join(format!("filmcraft-mcp-http-nowait-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let mut srv = Server::start(demo(), HttpOptions::default()).await;
+        let (sid, _) = init(srv.addr, &[]).await;
+        let params = |path: &std::path::Path, seconds: f64| {
+            json!({"path": path.to_string_lossy(), "format": "h264", "width": 640, "height": 360, "audio": false, "range": "custom", "startSeconds": 0, "endSeconds": seconds})
+        };
+        let finished = |jobs: &Value, id: u64| jobs.as_array().and_then(|a| a.iter().find(|j| j["id"] == id)).is_some_and(|j| j["finished"] == true);
+        // one that finishes before the stop
+        let whole = dir.join("whole.mp4");
+        let r = tool_json(&call(srv.addr, &sid, 1, "command_run", json!({"id": "file.exportMedia", "params": params(&whole, 0.5)})).await);
+        let first = r["job"].as_u64().expect("a job");
+        let t0 = std::time::Instant::now();
+        while !finished(&srv.mcp.run("jobs.list", json!({})).await.unwrap(), first) {
+            assert!(t0.elapsed() < Duration::from_secs(30), "the short export finished");
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        // two still running at the stop: one from command_run, one from a command_batch step
+        let (a, b) = (dir.join("a.mp4"), dir.join("b.mp4"));
+        let r = tool_json(&call(srv.addr, &sid, 2, "command_run", json!({"id": "file.exportMedia", "params": params(&a, 30.0)})).await);
+        assert!(r["job"].as_u64().is_some(), "{r}");
+        let steps = json!({"steps": [{"id": "file.exportMedia", "params": params(&b, 30.0)}]});
+        let r = tool_json(&call(srv.addr, &sid, 3, "command_batch", steps).await);
+        assert_eq!(r["completed"], 1, "{r}");
+        while !(a.exists() && b.exists()) {
+            assert!(t0.elapsed() < Duration::from_secs(30), "both exports wrote");
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        let _ = srv.stop.take().unwrap().send(Stop::Graceful);
+        let done = tokio::time::timeout(Duration::from_secs(20), &mut srv.done).await.expect("stopped").unwrap();
+        assert!(done.is_ok(), "{done:?}");
+        assert!(!a.exists() && !b.exists(), "the partial exports are deleted");
+        assert!(whole.exists(), "a finished export is kept");
+        let jobs = srv.mcp.run("jobs.list", json!({})).await.unwrap();
+        let errors: Vec<Value> = jobs.as_array().unwrap().iter().map(|j| j["result"]["error"].clone()).collect();
+        assert_eq!(errors, [Value::Null, json!("cancelled"), json!("cancelled")], "{jobs}");
+        let _ = std::fs::remove_dir_all(&dir);
+    })
+    .await;
+}
+
 fn export_call(id: u64, path: &str, seconds: f64, token: Option<Value>, meta: Option<&Value>) -> Value {
     let params = json!({"path": path, "format": "h264", "width": 640, "height": 360, "audio": false, "range": "custom", "startSeconds": 0, "endSeconds": seconds, "wait": true});
     let mut call = json!({"jsonrpc":"2.0","id":id,"method":"tools/call","params":{"name":"command_run","arguments":{"id":"file.exportMedia","params":params}}});

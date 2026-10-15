@@ -106,7 +106,11 @@ taken exits 1 with a hint (on Windows, reserved port ranges show in
 off and shutting down. The server says which one it got. The port closes at once, calls in flight
 are cancelled and sessions closed, and exports get time to delete their partial files: 15 s, or
 3 s when Windows is closing the console, logging off or shutting down (it ends the process about
-5 s after telling it). The output of an export still running at the end is deleted. A second
+5 s after telling it). That covers the exports clients started without `wait` (a headless
+`file.exportMedia` that returned `{job, path}`) as well: still running at the stop, they are
+cancelled and their output deleted; finished ones are kept. The output of an export still running
+at the end is deleted. Other engine jobs (the export queue, proxies, …) are not cancelled; they end
+with the process, so cancel a queue export with `jobs.cancel` first if you want its file gone. A second
 signal quits at once. Stdio mode (`mcp` without `--http`) stops on the same signals. Signals are
 watched from before the first line is printed, so one sent right after it still stops the server
 cleanly. On Linux a server started with `nohup` (SIGHUP ignored) keeps running when its terminal
@@ -564,7 +568,8 @@ progress and stop it:
   the call's SSE stream, and a 2026-07-28 client cancels by closing that stream instead (see
   [HTTP transport](#http-transport)).
 - Without `wait` the command returns `{job, path}` at once, as before: poll `jobs.list` and stop it
-  with `jobs.cancel`. Other exports (`file.exportFrame`, interchange formats, …) finish quickly and
+  with `jobs.cancel` (which leaves the partial file). When the MCP server stops (or a stdio client
+  closes its input) while such an export runs, it is cancelled and its partial output deleted. Other exports (`file.exportFrame`, interchange formats, …) finish quickly and
   ignore the token.
 - Bridge mode works the same way: the export runs as an app job (the app stays responsive and shows
   "Exporting… NN%" in its status bar) and the call returns when it is written, however long it
