@@ -175,7 +175,8 @@ impl Gate {
                     Some((r, evict)) => {
                         if let Some(old) = evict {
                             let _ = self.rmcp_sessions.close_session(&old.as_str().into()).await;
-                            self.log.line(format_args!("closed the least recently used idle MCP session to make room for a new one"));
+                            let why = "closed the least recently used idle MCP session to make room for a new one";
+                            self.log.event(peer.ip(), why, format_args!("{why} (from {peer})"));
                         }
                         reservation = Some(r);
                     }
