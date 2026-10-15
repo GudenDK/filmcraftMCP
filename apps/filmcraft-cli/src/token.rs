@@ -258,23 +258,79 @@ fn stored_token_path_in(data_dir: Option<&str>, default: impl FnOnce() -> Option
     Ok(dir.join(STORED_FILE))
 }
 
-/// The `filmcraft-cli mcp-token` command for the token stored at `path`, quoted for PowerShell
-/// (`powershell`) or a POSIX shell: with `--data-dir` unless `path` is in the per-user data
-/// directory, the one `mcp-token` finds from any shell (`FILMCRAFT_DATA_DIR` may be set for the
-/// server only, and a portable install's folder is only found by its own `filmcraft-cli`).
+/// The `mcp-token` command for the token stored at `path`, run by this very program, quoted for
+/// PowerShell (`powershell`) or a POSIX shell: see [`Program`].
 pub fn mcp_token_command(path: &Path, powershell: bool) -> String {
-    let per_user = filmcraft_engine::autosave::per_user_data_dir().filter(|d| d.is_absolute());
-    mcp_token_command_for(path, per_user.as_deref(), powershell)
+    mcp_token_command_for(path, &Program::current(), powershell)
 }
 
-fn mcp_token_command_for(path: &Path, per_user: Option<&Path>, powershell: bool) -> String {
+/// This program, as the commands it prints for the user to paste run it.
+pub struct Program {
+    /// Where it is (`None`: unknown, then it is named `filmcraft-cli`).
+    exe: Option<PathBuf>,
+    /// The shell finds it by its name: it is the first `filmcraft-cli` on `PATH`.
+    on_path: bool,
+    /// The data directory its `mcp-token` uses without `--data-dir` from any shell of this user:
+    /// a portable install's own `data` folder, else the per-user one. `None` when that cannot be
+    /// told: `FILMCRAFT_DATA_DIR` names another folder here, and may be set in those shells too.
+    data_dir: Option<PathBuf>,
+}
+
+impl Program {
+    /// The running program.
+    pub fn current() -> Self {
+        let exe = std::env::current_exe().ok().filter(|e| e.is_absolute());
+        let on_path = exe.as_deref().is_some_and(|e| first_on_path(e, std::env::var_os("PATH").as_deref()));
+        let own = exe.as_deref().and_then(Path::parent).and_then(filmcraft_engine::autosave::portable_data_dir);
+        let data_dir = own.or_else(filmcraft_engine::autosave::per_user_data_dir).filter(|d| d.is_absolute()).and_then(|d| std::path::absolute(d).ok());
+        let env = std::env::var_os("FILMCRAFT_DATA_DIR").filter(|v| !v.is_empty()).and_then(|d| std::path::absolute(d).ok());
+        let data_dir = match env {
+            Some(env) if Some(&env) != data_dir.as_ref() => None,
+            _ => data_dir,
+        };
+        Self { exe, on_path, data_dir }
+    }
+
+    /// The command that runs it: `filmcraft-cli` when the shell finds this program by that name,
+    /// else its full path, quoted (in PowerShell after `&`, which runs a quoted path). Windows puts
+    /// no `filmcraft-cli` on `PATH` (the installer, the portable zip and a build from source alike),
+    /// and neither does a build on Linux or macOS.
+    fn command(&self, powershell: bool) -> String {
+        match &self.exe {
+            Some(exe) if !self.on_path => {
+                let exe = exe.to_string_lossy();
+                // Windows: `\\?\C:\...` is `C:\...`
+                let exe = exe.strip_prefix(r"\\?\").filter(|e| e.get(1..2) == Some(":")).unwrap_or(&exe);
+                if powershell { format!("& {}", powershell_quote(exe)) } else { sh_quote(exe) }
+            }
+            _ => "filmcraft-cli".into(),
+        }
+    }
+}
+
+/// Whether `exe` is the program a shell runs for its name: the first file of that name in an
+/// absolute folder on `path` (`PATH`'s value) is that very file.
+fn first_on_path(exe: &Path, path: Option<&std::ffi::OsStr>) -> bool {
+    let (Some(name), Some(path)) = (exe.file_name(), path) else { return false };
+    let Some(found) = std::env::split_paths(path).filter(|d| d.is_absolute()).map(|d| d.join(name)).find(|c| c.is_file()) else { return false };
+    match (std::fs::canonicalize(found), std::fs::canonicalize(exe)) {
+        (Ok(a), Ok(b)) => a == b,
+        _ => false,
+    }
+}
+
+/// [`mcp_token_command`] as `program` runs it: with `--data-dir` unless `path` is in the data
+/// directory that program finds without it (`FILMCRAFT_DATA_DIR` may be set for the server only,
+/// and a portable install's `data` folder is found only by its own program, which finds no other).
+fn mcp_token_command_for(path: &Path, program: &Program, powershell: bool) -> String {
+    let run = program.command(powershell);
     let dir = path.parent().unwrap_or(path);
-    if per_user.is_some_and(|d| d == dir) {
-        return "filmcraft-cli mcp-token".into();
+    if program.data_dir.as_deref() == Some(dir) {
+        return format!("{run} mcp-token");
     }
     let dir = dir.to_string_lossy();
     let dir = if powershell { powershell_quote(&dir) } else { sh_quote(&dir) };
-    format!("filmcraft-cli mcp-token --data-dir {dir}")
+    format!("{run} mcp-token --data-dir {dir}")
 }
 
 /// The stored token at a path.
@@ -1172,21 +1228,63 @@ mod tests {
         assert_eq!(given, std::env::current_dir().unwrap().join("given").join(STORED_FILE));
     }
 
-    /// The `mcp-token` command the server and the error messages print names the data directory
-    /// unless it is the per-user one, which `mcp-token` finds from any shell.
+    /// The `mcp-token` command the server and the error messages print runs this very program:
+    /// by its name when the shell finds it on `PATH`, else by its full path (Windows puts no
+    /// `filmcraft-cli` on `PATH`, so the bare name failed there). It names the data directory
+    /// unless that program finds it without `--data-dir`: a portable install's program finds its
+    /// own `data` folder and no other, so the per-user folder needs `--data-dir` there (the hint
+    /// left it out and printed another token, which the server refused).
     #[test]
-    fn the_mcp_token_command_names_the_data_directory_when_needed() {
-        let per_user = Path::new("/home/ann/.local/share/filmcraft");
-        assert_eq!(mcp_token_command_for(&per_user.join(STORED_FILE), Some(per_user), false), "filmcraft-cli mcp-token");
-        assert_eq!(mcp_token_command_for(Path::new("/srv/it's/mcp-token"), Some(per_user), false), r"filmcraft-cli mcp-token --data-dir '/srv/it'\''s'");
-        assert_eq!(mcp_token_command_for(Path::new("/srv/fc/mcp-token"), None, false), "filmcraft-cli mcp-token --data-dir '/srv/fc'");
-        // PowerShell quoting (a Windows path has folders only on Windows)
-        assert_eq!(mcp_token_command_for(Path::new("/srv/it's/mcp-token"), Some(per_user), true), "filmcraft-cli mcp-token --data-dir '/srv/it''s'");
-        #[cfg(windows)]
+    fn the_mcp_token_command_runs_this_program_on_this_data_directory() {
+        let per_user = PathBuf::from("/home/ann/.local/share/filmcraft");
+        let installed = Program { exe: Some("/usr/bin/filmcraft-cli".into()), on_path: true, data_dir: Some(per_user.clone()) };
+        assert_eq!(mcp_token_command_for(&per_user.join(STORED_FILE), &installed, false), "filmcraft-cli mcp-token");
+        assert_eq!(mcp_token_command_for(Path::new("/srv/it's/mcp-token"), &installed, false), r"filmcraft-cli mcp-token --data-dir '/srv/it'\''s'");
+        assert_eq!(mcp_token_command_for(Path::new("/srv/it's/mcp-token"), &installed, true), "filmcraft-cli mcp-token --data-dir '/srv/it''s'");
+        // not on PATH: the full path, quoted (PowerShell runs a quoted path after `&`)
+        let built = Program { exe: Some("/home/ann/src/it's/target/release/filmcraft-cli".into()), on_path: false, data_dir: Some(per_user.clone()) };
+        assert_eq!(mcp_token_command_for(&per_user.join(STORED_FILE), &built, false), r"'/home/ann/src/it'\''s/target/release/filmcraft-cli' mcp-token");
+        assert_eq!(mcp_token_command_for(&per_user.join(STORED_FILE), &built, true), "& '/home/ann/src/it''s/target/release/filmcraft-cli' mcp-token");
+        let windows = Program { exe: Some(r"\\?\C:\claude\FilmCraft\filmcraft-cli.exe".into()), on_path: false, data_dir: None };
         assert_eq!(
-            mcp_token_command_for(Path::new(r"C:\claude\FilmCraft\data\mcp-token"), Some(per_user), true),
-            r"filmcraft-cli mcp-token --data-dir 'C:\claude\FilmCraft\data'"
+            mcp_token_command_for(Path::new("/x/mcp-token"), &windows, true),
+            r"& 'C:\claude\FilmCraft\filmcraft-cli.exe' mcp-token --data-dir '/x'",
+            "without the verbatim prefix"
         );
+        // a portable install: its program finds `<exe dir>/data`, not the per-user folder
+        let portable = Program { exe: Some("/opt/fc/filmcraft-cli".into()), on_path: false, data_dir: Some("/opt/fc/data".into()) };
+        assert_eq!(mcp_token_command_for(Path::new("/opt/fc/data/mcp-token"), &portable, false), "'/opt/fc/filmcraft-cli' mcp-token");
+        assert_eq!(
+            mcp_token_command_for(&per_user.join(STORED_FILE), &portable, false),
+            "'/opt/fc/filmcraft-cli' mcp-token --data-dir '/home/ann/.local/share/filmcraft'"
+        );
+        // FILMCRAFT_DATA_DIR names another folder: always --data-dir
+        let unknown = Program { exe: None, on_path: false, data_dir: None };
+        assert_eq!(
+            mcp_token_command_for(&per_user.join(STORED_FILE), &unknown, false),
+            "filmcraft-cli mcp-token --data-dir '/home/ann/.local/share/filmcraft'"
+        );
+        // the running test program is no `filmcraft-cli` on PATH
+        let me = Program::current();
+        assert!(me.exe.is_some() && !me.on_path, "{:?}", me.exe);
+        assert!(!first_on_path(Path::new("/no/such/filmcraft-cli"), std::env::var_os("PATH").as_deref()));
+    }
+
+    /// The program found first on `PATH` is the one a shell runs by its name; relative entries
+    /// (which depend on the folder the command runs in) do not count.
+    #[test]
+    fn a_program_is_on_path_when_the_shell_would_run_it() {
+        let tmp = TempDir::new("on-path");
+        let (a, b) = (tmp.0.join("a"), tmp.0.join("b"));
+        for d in [&a, &b] {
+            std::fs::create_dir(d).unwrap();
+            std::fs::write(d.join("prog"), "x").unwrap();
+        }
+        let path = std::env::join_paths([PathBuf::from("relative"), a.clone(), b.clone()]).unwrap();
+        assert!(first_on_path(&a.join("prog"), Some(&path)));
+        assert!(!first_on_path(&b.join("prog"), Some(&path)), "a's comes first");
+        assert!(!first_on_path(&a.join("prog"), Some(b.as_os_str())));
+        assert!(!first_on_path(&a.join("prog"), None));
     }
 
     /// On Windows the stored token is only as private as its folder: inside the user's profile it

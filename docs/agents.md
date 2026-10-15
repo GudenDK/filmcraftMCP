@@ -88,6 +88,12 @@ filmcraft-cli: made a new random MCP token and stored it in /home/me/.local/shar
 filmcraft-cli: connect Claude Code with: claude mcp add --transport http --scope user filmcraft-http http://127.0.0.1:9877/mcp --header "Authorization: Bearer $(cat '/home/me/.local/share/filmcraft/mcp-token')"
 ```
 
+The commands it prints run this same program, so they work as pasted: as `filmcraft-cli` when that
+is the one your shell finds on `PATH` (as above), else by its full path, such as
+`'/home/me/src/filmcraft/target/release/filmcraft-cli' mcp-token`, or in PowerShell
+`& 'C:\FilmCraft\filmcraft-cli.exe' mcp-token` (Windows installs put no `filmcraft-cli` on `PATH`).
+They name the data directory with `--data-dir` unless that program finds it without one.
+
 `--http` is newer than the 0.8.0 release, whose `filmcraft-cli` stops with "unknown mcp option"
 (exit 2). `filmcraft-cli help` lists `mcp --http <ADDR>` in builds that have it. Until a release
 has it, build from source (see [Windows quick start](#windows-quick-start)).

@@ -149,6 +149,37 @@ fn mcp_http_usage_errors() {
     }
 }
 
+/// `PATH` without the folder of the program under test: as for a user, who has no build folder
+/// on it (cargo adds it on Windows for tests).
+fn path_without_the_program() -> std::ffi::OsString {
+    let dir = std::path::Path::new(env!("CARGO_BIN_EXE_filmcraft-cli")).parent().and_then(|d| std::fs::canonicalize(d).ok());
+    let path = std::env::var_os("PATH").unwrap_or_default();
+    let kept: Vec<std::path::PathBuf> = std::env::split_paths(&path).filter(|p| std::fs::canonicalize(p).ok() != dir).collect();
+    std::env::join_paths(kept).unwrap_or(path)
+}
+
+/// The command in backticks that `line` says `prints it`.
+fn print_command(line: &str) -> String {
+    let before = line.split("` prints it").next().filter(|b| b.len() < line.len()).unwrap_or_else(|| panic!("no `… prints it` in {line}"));
+    before.rsplit_once('`').map(|(_, c)| c.to_string()).unwrap_or_else(|| panic!("no command in {line}"))
+}
+
+/// Whether `print`, a command the server printed, is `exe` by its full path, quoted for the shell
+/// it is printed for (PowerShell runs a quoted path after `&`), then `rest`. The path may be
+/// spelled as the system reports the running program (Linux resolves links): the same file.
+fn runs_program(print: &str, exe: &std::path::Path, rest: &str) -> bool {
+    let Some(quoted) = print.strip_suffix(rest) else { return false };
+    let quoted = if cfg!(windows) { quoted.strip_prefix("& ") } else { Some(quoted) };
+    let Some(path) = quoted.and_then(|q| q.strip_prefix('\'')).and_then(|q| q.strip_suffix('\'')) else { return false };
+    let path = if cfg!(windows) { path.replace("''", "'") } else { path.replace(r"'\''", "'") };
+    std::fs::canonicalize(path).ok() == std::fs::canonicalize(exe).ok()
+}
+
+/// The program under test.
+fn this_program() -> &'static std::path::Path {
+    std::path::Path::new(env!("CARGO_BIN_EXE_filmcraft-cli"))
+}
+
 /// The stderr lines a server prints before it serves: up to and including the `claude mcp add`
 /// line.
 fn banner(p: &Spawned) -> Vec<String> {
@@ -182,9 +213,12 @@ fn mcp_http_requires_the_stored_token_by_default() {
     #[cfg(unix)]
     assert_eq!((mode(&file), mode(&p.data_dir())), (0o600, 0o700));
     let shown = file.display().to_string();
-    // FILMCRAFT_DATA_DIR is set for this server only: the command names the folder
-    let print = format!("filmcraft-cli mcp-token --data-dir '{}'", p.data_dir().display());
+    // FILMCRAFT_DATA_DIR is set for this server only: the command names the folder; it runs this
+    // program by its full path, as it is not on PATH (the bare name failed on Windows)
+    let print = print_command(&lines[0]);
+    assert!(runs_program(&print, this_program(), &format!(" mcp-token --data-dir '{}'", p.data_dir().display())), "{print}");
     assert!(lines[0].contains(&format!("bearer token required (the one stored in {shown}; `{print}` prints it)")), "{lines:?}");
+    assert_eq!(p.run_printed(&print), token, "the printed command prints the server's token");
     let made = lines.iter().find(|l| l.contains("made a new random MCP token")).unwrap_or_else(|| panic!("{lines:?}"));
     assert!(made.contains(&format!("stored it in {shown}")) && made.ends_with(&format!("; `{print}` prints it, `{print} --new` replaces it")), "{made}");
     // on Windows the folder's permissions decide: in the user's profile, you and administrators
@@ -295,7 +329,19 @@ fn the_stored_token_lives_in_the_per_user_data_directory() {
     let token = std::fs::read_to_string(&want).unwrap();
     assert!(is_generated_token(&token));
     // where `mcp-token` looks from any shell: no --data-dir needed
+    let print = print_command(&lines[0]);
+    assert!(runs_program(&print, this_program(), " mcp-token"), "{print}");
+    assert!(lines[0].contains(&format!("the one stored in {}; `{print}` prints it", want.display())), "{lines:?}");
+    assert_eq!(p.run_printed(&print), token);
+    drop(p);
+    // with the program first on PATH, by its name
+    let dir = this_program().parent().unwrap().to_path_buf();
+    let path = std::env::join_paths(std::iter::once(dir).chain(std::env::split_paths(&path_without_the_program()))).unwrap();
+    let path = path.to_str().unwrap();
+    let p = Spawned::with_env(&["mcp", "--demo", "--http", "127.0.0.1:0"], &[&env[..], &[("PATH", path)]].concat());
+    let lines = banner(&p);
     assert!(lines[0].contains(&format!("the one stored in {}; `filmcraft-cli mcp-token` prints it", want.display())), "{lines:?}");
+    assert_eq!(p.run_printed("filmcraft-cli mcp-token"), token);
     drop(p);
     // a relative XDG_DATA_HOME or HOME would put the token in the current folder: refused
     let cwd = home.path("cwd");
@@ -335,6 +381,51 @@ fn the_stored_token_lives_in_the_per_user_data_directory() {
         assert_eq!(o.status.code(), Some(1), "{args:?}: {err}");
         assert!(err.contains("unusable") && err.contains(&again), "{args:?}: {err}");
     }
+}
+
+/// A portable install's program (`portable.txt` beside it) finds its own `data` folder and no
+/// other. Pointed at the per-user folder with `--data-dir`, as the Windows warning and the docs
+/// advise on a shared PC, it names that folder in the `mcp-token` command it prints; for its own
+/// folder it needs none. Run as printed, the command prints the server's token. It used to leave
+/// `--data-dir` out for the per-user folder: that printed (and made) another token, in the
+/// portable folder, which the server refused.
+#[test]
+fn a_portable_install_prints_commands_for_its_own_data_folder() {
+    let root = TempDir::new("portable");
+    let bin = root.path("FilmCraft portable");
+    std::fs::create_dir_all(&bin).unwrap();
+    let exe = std::path::Path::new(env!("CARGO_BIN_EXE_filmcraft-cli"));
+    let copy = bin.join(exe.file_name().unwrap());
+    if std::fs::hard_link(exe, &copy).is_err() {
+        return; // the temporary folder is on another drive or file system
+    }
+    std::fs::write(bin.join("portable.txt"), "").unwrap();
+    let homes: Vec<(&str, String)> =
+        ["HOME", "XDG_DATA_HOME", "APPDATA", "LOCALAPPDATA"].iter().map(|k| (*k, root.path(&k.to_ascii_lowercase()).display().to_string())).collect();
+    let mut env: Vec<(&str, &str)> = homes.iter().map(|(k, v)| (*k, v.as_str())).collect();
+    env.push(("FILMCRAFT_DATA_DIR", ""));
+    let per_user = String::from_utf8(cli_exit(&["mcp-token", "--path"], &env).stdout).unwrap();
+    let per_user = std::path::Path::new(&per_user).parent().unwrap().to_path_buf();
+    let spawn = |args: &[&str]| {
+        let mut cmd = Command::new(&copy);
+        cmd.args(args).envs(env.iter().copied());
+        Spawned::spawn(cmd)
+    };
+    // the per-user folder: named
+    let p = spawn(&["mcp", "--demo", "--http", "127.0.0.1:0", "--data-dir", per_user.to_str().unwrap()]);
+    let print = print_command(&banner(&p)[0]);
+    assert!(runs_program(&print, &copy, &format!(" mcp-token --data-dir '{}'", per_user.display())), "{print}");
+    let token = std::fs::read_to_string(per_user.join("mcp-token")).unwrap();
+    assert_eq!(p.run_printed(&print), token);
+    assert!(!bin.join("data").join("mcp-token").exists(), "no other token made");
+    drop(p);
+    // its own folder: found without --data-dir
+    let p = spawn(&["mcp", "--demo", "--http", "127.0.0.1:0"]);
+    let print = print_command(&banner(&p)[0]);
+    assert!(runs_program(&print, &copy, " mcp-token"), "{print}");
+    let own = std::fs::read_to_string(bin.join("data").join("mcp-token")).unwrap();
+    assert_ne!(own, token);
+    assert_eq!(p.run_printed(&print), own);
 }
 
 /// `FILMCRAFT_MCP_TOKEN` comes first, then `--token-file`, then the stored token; the stored one
@@ -494,6 +585,8 @@ struct Spawned {
     err: std::sync::mpsc::Receiver<String>,
     /// Its own folder, with its default data directory (`data`) and home.
     root: TempDir,
+    /// The environment it was given on top of this process's.
+    env: Vec<(std::ffi::OsString, Option<std::ffi::OsString>)>,
 }
 
 impl Spawned {
@@ -507,13 +600,14 @@ impl Spawned {
     }
     /// `cmd` (filmcraft-cli, or a program that runs it) without `FILMCRAFT_MCP_TOKEN` unless set,
     /// and in a folder of its own for the data directory and home unless set. Its user profile
-    /// (Windows) is the temporary folder, where every test folder is, unless set.
+    /// (Windows) is the temporary folder, where every test folder is, and the folder of the
+    /// program under test is not on its `PATH` (cargo puts it there on Windows), unless set.
     fn spawn(mut cmd: Command) -> Self {
         use std::io::BufRead;
         let root = TempDir::new("spawned");
         let set = |k: &str| cmd.get_envs().any(|(n, _)| n == k);
         let (token_set, own) = (set("FILMCRAFT_MCP_TOKEN"), ["FILMCRAFT_DATA_DIR", "HOME", "XDG_DATA_HOME", "APPDATA", "LOCALAPPDATA"].map(|k| (k, !set(k))));
-        let profile_set = set("USERPROFILE");
+        let (profile_set, path_set) = (set("USERPROFILE"), set("PATH"));
         if !token_set {
             cmd.env_remove("FILMCRAFT_MCP_TOKEN");
         }
@@ -526,6 +620,10 @@ impl Spawned {
         if !profile_set {
             cmd.env("USERPROFILE", std::env::temp_dir());
         }
+        if !path_set {
+            cmd.env("PATH", path_without_the_program());
+        }
+        let env = cmd.get_envs().map(|(k, v)| (k.to_os_string(), v.map(std::ffi::OsStr::to_os_string))).collect();
         let mut child = cmd.stdin(Stdio::piped()).stdout(Stdio::piped()).stderr(Stdio::piped()).spawn().expect("spawn filmcraft-cli");
         let lines = |r: Box<dyn std::io::Read + Send>| {
             let (tx, rx) = std::sync::mpsc::channel();
@@ -538,7 +636,34 @@ impl Spawned {
         };
         let out = lines(Box::new(child.stdout.take().unwrap()));
         let err = lines(Box::new(child.stderr.take().unwrap()));
-        Self { stdin: child.stdin.take(), child, out, err, root }
+        Self { stdin: child.stdin.take(), child, out, err, root, env }
+    }
+    /// Run `cmd`, a command line it printed, as its user would in another shell: in PowerShell on
+    /// Windows and sh elsewhere, with its home, profile and `PATH`, but without the
+    /// `FILMCRAFT_DATA_DIR` or token it was started with. What it printed on stdout, trimmed.
+    fn run_printed(&self, cmd: &str) -> String {
+        let mut c = if cfg!(windows) {
+            // a script file: no command-line quoting in between; UTF-8 with a byte-order mark
+            let ps1 = self.root.path("printed.ps1");
+            std::fs::write(&ps1, [&[0xEF, 0xBB, 0xBF][..], cmd.as_bytes()].concat()).unwrap();
+            let mut c = Command::new("powershell");
+            c.args(["-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass", "-File"]).arg(ps1);
+            c
+        } else {
+            let mut c = Command::new("sh");
+            c.args(["-c", cmd]);
+            c
+        };
+        for (k, v) in &self.env {
+            match v {
+                Some(v) => c.env(k, v),
+                None => c.env_remove(k),
+            };
+        }
+        c.env_remove("FILMCRAFT_DATA_DIR").env_remove("FILMCRAFT_MCP_TOKEN");
+        let o = c.output().expect("run the printed command");
+        assert!(o.status.success(), "{cmd}: {}", String::from_utf8_lossy(&o.stderr));
+        String::from_utf8_lossy(&o.stdout).trim().to_string()
     }
     /// Its default data directory (when the test did not set `FILMCRAFT_DATA_DIR`).
     fn data_dir(&self) -> std::path::PathBuf {
