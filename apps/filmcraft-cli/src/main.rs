@@ -120,7 +120,8 @@ OPTIONS
                                 being this file's first line (or set FILMCRAFT_MCP_TOKEN)
   --allow-origin <origin>       mcp --http: let this browser origin call, with CORS headers:
                                 scheme://host:port with the port spelled out (repeatable; any
-                                other request with an Origin header is refused)
+                                other request with an Origin header is refused). `null` (any
+                                sandboxed frame or file: page) needs a token of 32+ characters
   --allow-host <host[:port]>    mcp --http: also answer to this Host (repeatable; a LAN name,
                                 host.docker.internal:PORT, a tunnel). A name that is not this
                                 machine (a tunnel, a proxy) needs a token of 32+ characters
@@ -529,7 +530,7 @@ async fn cli() {
 /// `None` for stdio.
 fn mcp_http_options(a: &Args) -> Option<(std::net::SocketAddr, filmcraft_automation::HttpOptions)> {
     use filmcraft_automation::http_transport::{
-        TOKEN_ENV, check_allowed_host, check_allowed_origin, check_bind, check_host_exposure, check_token, parse_listen_addr,
+        TOKEN_ENV, check_allowed_host, check_allowed_origin, check_bind, check_host_exposure, check_origin_exposure, check_token, parse_listen_addr,
     };
     if !a.flag("--http") {
         if let Some(o) = ["--token-file", "--allow-origin", "--allow-host"].into_iter().find(|o| a.flag(o)) {
@@ -559,11 +560,7 @@ fn mcp_http_options(a: &Args) -> Option<(std::net::SocketAddr, filmcraft_automat
     check_bind(addr, token.as_deref()).unwrap_or_else(|e| usage(format!("mcp --http: {e}")));
     let allowed_origins: Vec<String> =
         a.opt_all("--allow-origin").into_iter().map(|o| check_allowed_origin(o).unwrap_or_else(|e| usage(format!("mcp --allow-origin: {e}")))).collect();
-    if allowed_origins.iter().any(|o| o == "null") {
-        diag(format_args!(
-            "filmcraft-cli: warning: --allow-origin null lets any web page call (a sandboxed frame or a file: page sends `Origin: null`); use it only with a token"
-        ));
-    }
+    check_origin_exposure(&allowed_origins, token.as_deref()).unwrap_or_else(|e| usage(format!("mcp --allow-origin: {e}")));
     let allowed_hosts: Vec<String> =
         a.opt_all("--allow-host").into_iter().map(|h| check_allowed_host(h).unwrap_or_else(|e| usage(format!("mcp --allow-host: {e}")))).collect();
     check_host_exposure(&allowed_hosts, token.as_deref()).unwrap_or_else(|e| usage(format!("mcp --allow-host: {e}")));

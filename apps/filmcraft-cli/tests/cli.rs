@@ -59,6 +59,9 @@ fn mcp_http_usage_errors() {
         &["mcp", "--http", "127.0.0.1:0", "--allow-host", "lan.example:http"],
         // a tunnel or proxy's name: clients from the network, so a token is needed
         &["mcp", "--http", "127.0.0.1:0", "--allow-host", "my-tunnel.trycloudflare.com"],
+        // any web page sends `Origin: null`: a token is needed too
+        &["mcp", "--http", "127.0.0.1:0", "--allow-origin", "null"],
+        &["mcp", "--http", "127.0.0.1:0", "--allow-origin", "http://127.1:6274"],
     ] {
         let o = cli_no_token(args);
         assert_eq!(o.status.code(), Some(2), "{args:?}: {}", String::from_utf8_lossy(&o.stderr));
@@ -68,7 +71,11 @@ fn mcp_http_usage_errors() {
     // reachable from the network (directly, or through a tunnel): a token too short to resist
     // guessing is refused
     let short = "x".repeat(31);
-    for args in [&["mcp", "--http", "0.0.0.0:0"][..], &["mcp", "--http", "127.0.0.1:0", "--allow-host", "proxy.example:443"]] {
+    for args in [
+        &["mcp", "--http", "0.0.0.0:0"][..],
+        &["mcp", "--http", "127.0.0.1:0", "--allow-host", "proxy.example:443"],
+        &["mcp", "--http", "127.0.0.1:0", "--allow-origin", "null"],
+    ] {
         let o = cli_exit(args, &[("FILMCRAFT_MCP_TOKEN", &short)]);
         let err = String::from_utf8_lossy(&o.stderr);
         assert_eq!(o.status.code(), Some(2), "{args:?}: {err}");

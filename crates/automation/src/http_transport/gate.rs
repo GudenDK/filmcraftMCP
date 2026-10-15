@@ -282,7 +282,8 @@ impl Gate {
         if right && (blocked.is_none() || expected.len() >= MIN_REMOTE_TOKEN_LEN) {
             return Ok(());
         }
-        if let Some(left) = blocked {
+        // a request without a token was never counted: it learns what it lacks (401)
+        if let Some(left) = blocked.filter(|_| given.is_some()) {
             let mut no = refusal(StatusCode::TOO_MANY_REQUESTS, "Too Many Requests: too many failed authentications from this address; try again later");
             no.retry_after = Some(left.as_secs().saturating_add(1));
             return Err(no);

@@ -209,6 +209,24 @@ pub fn check_bind(addr: SocketAddr, token: Option<&str>) -> Result<(), Automatio
     }
 }
 
+/// An `allowed_origins` entry of `null` lets every web page call: every sandboxed frame and `file:`
+/// page sends `Origin: null`. That is the network, as a non-loopback address is, so it needs a
+/// token of at least [`MIN_REMOTE_TOKEN_LEN`] characters.
+pub fn check_origin_exposure(allowed_origins: &[String], token: Option<&str>) -> Result<(), AutomationError> {
+    if !allowed_origins.iter().any(|o| o.trim().eq_ignore_ascii_case("null")) {
+        return Ok(());
+    }
+    match token.map_or(0, str::len) {
+        0 => Err(AutomationError::BadRequest(format!(
+            "allowed origin `null` lets any web page call (every sandboxed frame and file: page sends it): that needs a bearer token of {MIN_REMOTE_TOKEN_LEN}+ characters (set {TOKEN_ENV})"
+        ))),
+        n if n < MIN_REMOTE_TOKEN_LEN => Err(AutomationError::BadRequest(format!(
+            "allowed origin `null` lets any web page call: that needs a token of at least {MIN_REMOTE_TOKEN_LEN} characters, this one has {n}: make one with `openssl rand -hex 32`"
+        ))),
+        _ => Ok(()),
+    }
+}
+
 /// An `allowed_hosts` entry that names something other than this machine's loopback (a LAN name,
 /// a tunnel, a reverse proxy) means requests from the network, relayed to a loopback address, so
 /// it needs a token of at least [`MIN_REMOTE_TOKEN_LEN`] characters, as a non-loopback address
@@ -248,9 +266,10 @@ pub fn check_token(token: &str) -> Result<(), AutomationError> {
 /// An `allowed_origins` entry: `scheme://host:port` with an `http` or `https` scheme and the port
 /// spelled out (`http://localhost:6274`), or `null`. Returns it normalized. A `*` anywhere, a
 /// missing port (which rmcp would match against every port), a port out of range, a fragment, a
-/// trailing dot and anything else are refused.
-/// `null` is accepted, but every web page can send it (from a sandboxed frame or a `file:` page),
-/// so the caller should warn about it.
+/// trailing dot and anything else are refused, as are spellings that browsers rewrite before they
+/// send them, so that the entry would never match (`127.1`, `0x7f.0.0.1`, an IPv6 zone id, `+80`).
+/// `null` is accepted here, but every web page can send it (from a sandboxed frame or a `file:`
+/// page): it needs a long token ([`check_origin_exposure`]).
 pub fn check_allowed_origin(origin: &str) -> Result<String, AutomationError> {
     let o = origin.trim();
     let bad = |why: String| Err(AutomationError::BadRequest(format!("allowed origin `{o}`: {why}")));
@@ -276,8 +295,21 @@ pub fn check_allowed_origin(origin: &str) -> Result<String, AutomationError> {
     if !host.starts_with('[') && host.split('.').any(str::is_empty) {
         return bad("the host has an empty label (a trailing dot?): browsers send the name without one".into());
     }
-    // what follows the host: nothing, or `:port`
+    if host.contains('%') {
+        return bad("browsers send no IPv6 zone id (%...) in an origin".into());
+    }
+    // a name whose last label is a number is an IPv4 address to a browser, which sends it as four
+    // decimal numbers (`127.1` and `0x7f.0.0.1` arrive as `127.0.0.1`)
+    let last = host.rsplit('.').next().unwrap_or_default();
+    let numeric = !last.is_empty() && (last.bytes().all(|b| b.is_ascii_digit()) || last.get(..2).is_some_and(|p| p.eq_ignore_ascii_case("0x")));
+    if !host.starts_with('[') && numeric && host.parse::<Ipv4Addr>().is_err() {
+        return bad("write an IPv4 address as browsers send it, four decimal numbers: e.g. http://127.0.0.1:6274".into());
+    }
+    // what follows the host: nothing, or `:port` in digits
     let after_host = authority.as_str().get(host.len()..).unwrap_or_default();
+    if after_host.strip_prefix(':').is_some_and(|p| !p.bytes().all(|b| b.is_ascii_digit())) {
+        return bad("the port must be 1-65535".into());
+    }
     match authority.port_u16() {
         Some(0) => return bad("the port must be 1-65535".into()),
         Some(_) => {}
@@ -421,8 +453,9 @@ impl FilmcraftMcp {
         }
         let extra_hosts = opts.allowed_hosts.iter().map(|h| check_allowed_host(h)).collect::<Result<Vec<_>, _>>()?;
         check_host_exposure(&extra_hosts, token.as_deref())?;
-        let token = token.map(|t| t.into_bytes().into_boxed_slice());
         let origins = opts.allowed_origins.iter().map(|o| check_allowed_origin(o)).collect::<Result<Vec<_>, _>>()?;
+        check_origin_exposure(&origins, token.as_deref())?;
+        let token = token.map(|t| t.into_bytes().into_boxed_slice());
         let mut hosts: Vec<String> = bound.iter().flat_map(|addr| accepted_hosts(*addr, &extra_hosts)).collect();
         let mut seen = std::collections::HashSet::new();
         hosts.retain(|h| seen.insert(h.to_ascii_lowercase()));

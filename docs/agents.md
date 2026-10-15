@@ -274,8 +274,10 @@ wherever the user can, so the endpoint is locked down by default:
   with `--allow-origin` (repeatable). MCP clients send no `Origin`. An entry is `scheme://host:port`
   with the port written out, exactly as the browser sends it: `http://localhost:6274` and
   `http://127.0.0.1:6274` are different origins. Wildcards (a `*` anywhere), an entry without a
-  port (it would match every port), paths, fragments, user names and a trailing dot exit 2. `null` is accepted with a warning:
-  every sandboxed frame and `file:` page sends it, so use it only with a token.
+  port (it would match every port), paths, fragments, user names, a trailing dot and spellings
+  browsers rewrite before sending them (`127.1`, `0x7f.0.0.1`, an IPv6 zone id) exit 2. `null`
+  needs a token of 32+ characters (else exit 2): every sandboxed frame and `file:` page sends
+  it, so it lets any web page call.
 - A listed origin gets CORS headers, so a page there can call the server: its preflight
   (`OPTIONS` with `Access-Control-Request-Method`) gets 204 with `Access-Control-Allow-Origin`,
   `Access-Control-Allow-Methods: GET, POST, DELETE` and the MCP request headers
@@ -353,7 +355,7 @@ its body holds, and has its connection closed.
 | 403 | an `Origin` that is not listed |
 | 403 | a request relayed by a proxy or tunnel (it has `X-Forwarded-For`, `Via` or another forwarding header), without a token of 32+ characters |
 | 429 | a wrong token from an address that sent 10 wrong ones in a minute (for a minute; `Retry-After`); with a token under 32 characters, the right one too |
-| 401 | no or wrong bearer token (`WWW-Authenticate: Bearer realm="filmcraft"`) |
+| 401 | no or wrong bearer token (`WWW-Authenticate: Bearer realm="filmcraft"`); a request without one gets 401 even while its address is blocked |
 | 405 | a method other than `GET`, `POST`, `DELETE`, such as an `OPTIONS` that is no CORS preflight |
 | 406 | a `POST` whose `Accept` lacks `application/json` or `text/event-stream` |
 | 415 | a `POST` whose `Content-Type` is not `application/json`; after the body, a JSON-RPC batch (array) |

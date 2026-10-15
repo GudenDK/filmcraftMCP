@@ -587,9 +587,28 @@ fn allowed_origins_and_hosts_are_checked() {
         "http://localhost.:6274",
         "http://app..example:80",
         "http://localhost:0",
+        // spellings a browser rewrites before it sends them: they would never match
+        "http://127.1:80",
+        "http://0x7f.0.0.1:80",
+        "http://2130706433:80",
+        "http://127.000.0.1:80",
+        "http://[fe80::1%25eth0]:80",
+        "http://localhost:+80",
     ] {
         assert!(check_allowed_origin(bad).is_err(), "{bad:?}");
     }
+    for ok in ["http://127.0.0.1:6274", "http://192.168.1.5:80", "http://app1.example:80", "http://1.example.com:80"] {
+        assert!(check_allowed_origin(ok).is_ok(), "{ok}");
+    }
+    // `null`: every web page can send it, so it needs a token too long to guess
+    let origins = |o: &[&str]| o.iter().map(|s| s.to_string()).collect::<Vec<_>>();
+    let long = "x".repeat(MIN_REMOTE_TOKEN_LEN);
+    assert!(check_origin_exposure(&origins(&["http://localhost:6274"]), None).is_ok());
+    let e = check_origin_exposure(&origins(&["http://localhost:6274", "null"]), None).unwrap_err().to_string();
+    assert!(e.contains("`null`") && e.contains("32+ characters"), "{e}");
+    let e = check_origin_exposure(&origins(&["null"]), Some("short")).unwrap_err().to_string();
+    assert!(e.contains("at least 32 characters") && e.contains("has 5"), "{e}");
+    assert!(check_origin_exposure(&origins(&["null"]), Some(&long)).is_ok());
     let e = check_allowed_origin("http://localhost").unwrap_err().to_string();
     assert!(e.contains("http://localhost:80"), "names the port to add: {e}");
     let e = check_allowed_origin("http://localhost:99999").unwrap_err().to_string();
@@ -870,6 +889,7 @@ async fn failed_authentications_get_a_peer_refused_for_a_while() {
     assert!(r.header("mcp-session-id").is_none());
     let (sid, _) = init(srv.addr, &[("Authorization", &bearer)]).await;
     assert!(!sid.is_empty(), "the right token still gets in");
+    assert_eq!(post(srv.addr, None, &[], &initialize).await.status, 401, "no token is no guess: told what it lacks");
     tokio::time::sleep(Duration::from_millis(1600)).await;
     assert_eq!(post(srv.addr, None, &[("Authorization", "Bearer d")], &initialize).await.status, 401, "the block ends");
     let l = lines.lock().unwrap().join("\n");
@@ -1503,6 +1523,10 @@ async fn a_non_loopback_bind_needs_a_token() {
         let m = FilmcraftMcp::headless(Session::default());
         let opts = HttpOptions { allowed_hosts: vec!["my-tunnel.trycloudflare.com".into()], token: Some("abc".into()), ..HttpOptions::default() };
         let r = m.serve_http("127.0.0.1:0".parse().unwrap(), opts, async {}).await;
+        assert!(matches!(r, Err(AutomationError::BadRequest(_))), "{r:?}");
+        // loopback, but every web page may call
+        let m = FilmcraftMcp::headless(Session::default());
+        let r = m.serve_http("127.0.0.1:0".parse().unwrap(), HttpOptions { allowed_origins: vec!["null".into()], ..HttpOptions::default() }, async {}).await;
         assert!(matches!(r, Err(AutomationError::BadRequest(_))), "{r:?}");
     })
     .await;
