@@ -407,6 +407,16 @@ async fn rejects_hostile_requests() {
         assert_eq!(r.status, 403, "Origin {origin}");
     }
     assert_eq!(post(srv.addr, None, &[("Origin", "http://localhost:6274")], &initialize).await.status, 200);
+    // more than one Host (RFC 9112 § 3.2), Origin or Authorization: 400, whichever comes first
+    let host = srv.host();
+    for dup in [
+        [("Host", host.as_str()), ("Host", "evil.example")],
+        [("Host", "evil.example"), ("Host", host.as_str())],
+        [("Origin", "http://localhost:6274"), ("Origin", "http://evil.example")],
+        [("Authorization", "Bearer a"), ("Authorization", "Bearer b")],
+    ] {
+        assert_eq!(post(srv.addr, None, &dup, &initialize).await.status, 400, "{dup:?}");
+    }
     // browser-shaped requests: preflight and "simple" requests
     assert_eq!(send(srv.addr, "OPTIONS", &[("Origin", "http://evil.example")], "").await.status, 403);
     assert_eq!(send(srv.addr, "OPTIONS", &[], "").await.status, 405);
@@ -611,10 +621,11 @@ async fn cors_for_listed_origins_only() {
     let mut wrong_host = preflight.to_vec();
     wrong_host.push(("Host", "evil.example"));
     assert_eq!(send(srv.addr, "OPTIONS", &wrong_host, "").await.status, 403);
-    // another origin: the token check first, and never a CORS header
+    // another origin: refused (before the token check, so it never counts as a failed
+    // authentication), and never a CORS header
     let evil = [("Origin", "http://evil.example"), ("Access-Control-Request-Method", "POST")];
     let r = send(srv.addr, "OPTIONS", &evil, "").await;
-    assert!(r.status == 401 && no_cors(&r), "{} {:?}", r.status, r.headers);
+    assert!(r.status == 403 && no_cors(&r), "{} {:?}", r.status, r.headers);
     let initialize = json!({"jsonrpc":"2.0","id":0,"method":"initialize","params":{"protocolVersion":"2025-06-18","capabilities":{},"clientInfo":{"name":"t","version":"1"}}});
     let r = post(srv.addr, None, &[("Origin", "http://evil.example"), ("Authorization", &bearer)], &initialize).await;
     assert!(r.status == 403 && no_cors(&r), "{} {:?}", r.status, r.headers);
@@ -657,77 +668,85 @@ async fn refusals_are_logged_without_credentials() {
     .await;
 }
 
-/// One address cannot take every connection, with or without credentials: past its share (or
-/// the total) a connection gets a 503 it can retry, while other addresses still get in. A client
-/// that sends nothing, an idle keep-alive connection and a body that never ends are dropped after
-/// a timeout.
+/// A connection that has made a request (its reply read), kept alive for more.
+async fn keep_alive_request(addr: SocketAddr) -> TcpStream {
+    let mut s = TcpStream::connect(addr).await.unwrap();
+    s.write_all(format!("DELETE {MCP_PATH} HTTP/1.1\r\nHost: 127.0.0.1:{}\r\n\r\n", addr.port()).as_bytes()).await.unwrap();
+    let mut got = Vec::new();
+    while !String::from_utf8_lossy(&got).contains("Session ID is required") {
+        let mut b = [0u8; 512];
+        let n = tokio::time::timeout(WAIT, s.read(&mut b)).await.expect("a reply in time").unwrap();
+        assert!(n > 0, "closed before the reply: {}", String::from_utf8_lossy(&got));
+        got.extend_from_slice(b.get(..n).unwrap());
+    }
+    assert!(got.starts_with(b"HTTP/1.1 400 "), "{}", String::from_utf8_lossy(&got));
+    s
+}
+
+/// Connections are capped per peer (every loopback address is one: this machine) and in all.
+/// One that has sent nothing valid yet is closed to make room for a new one, oldest first, so
+/// that silent connections cannot lock clients out; only when every one has made a request that
+/// passed does a new one get a 503 it can retry. A client that sends nothing, an idle keep-alive
+/// connection and a body that never ends are dropped after a timeout.
 #[tokio::test(flavor = "multi_thread")]
 async fn connections_are_capped_per_peer_and_timed_out() {
     within(async {
-    let (log, lines) = log_capture();
-    let limits = Limits {
-        connections: 5,
-        connections_per_peer: 3,
-        header_timeout: Duration::from_millis(1500),
-        body_timeout: Duration::from_millis(500),
-        ..Limits::default()
-    };
-    let srv = Server::start_limited(demo(), HttpOptions { log, ..HttpOptions::default() }, limits).await;
-    let initialize = json!({"jsonrpc":"2.0","id":0,"method":"initialize","params":{"protocolVersion":"2025-06-18","capabilities":{},"clientInfo":{"name":"t","version":"1"}}}).to_string();
-    let t0 = std::time::Instant::now();
-    let mut silent = Vec::new();
-    for _ in 0..3 {
-        silent.push(TcpStream::connect(srv.addr).await.unwrap());
-    }
-    let refused = read_all(TcpStream::connect(srv.addr).await.unwrap()).await;
-    assert!(refused.starts_with("HTTP/1.1 503 ") && refused.contains("Retry-After: 1\r\n") && refused.contains("Connection: close\r\n"), "{refused}");
-    assert!(refused.ends_with("too many connections"), "{refused}");
-    match connect_from("127.0.0.2", srv.addr).await {
-        None => eprintln!("skipped the second-address checks: cannot bind 127.0.0.2 here"),
-        Some(s) => {
-            // another address is not locked out by the first one's idle connections
-            let r = exchange(s, srv.addr, "POST", &[ACCEPT, JSON], initialize.len(), &initialize).await;
-            assert_eq!(r.status, 200);
-            drop(r);
-            tokio::time::sleep(Duration::from_millis(100)).await;
-            // two more fill the total of 5: a third address is refused too
-            for _ in 0..2 {
-                silent.push(connect_from("127.0.0.2", srv.addr).await.unwrap());
-            }
-            let s = connect_from("127.0.0.3", srv.addr).await.unwrap();
-            let refused = read_all(s).await;
-            assert!(refused.starts_with("HTTP/1.1 503 "), "{refused}");
-            assert!(t0.elapsed() < Duration::from_millis(1400), "the checks ran before the header timeout: {:?}", t0.elapsed());
+        let (log, lines) = log_capture();
+        let limits = Limits {
+            connections: 5,
+            connections_per_peer: 3,
+            header_timeout: Duration::from_millis(1500),
+            body_timeout: Duration::from_millis(500),
+            ..Limits::default()
+        };
+        let srv = Server::start_limited(demo(), HttpOptions { log, ..HttpOptions::default() }, limits).await;
+        let t0 = std::time::Instant::now();
+        // silent connections, from several loopback addresses where the system allows it
+        let mut silent = Vec::new();
+        for local in ["127.0.0.2", "127.0.0.3", "127.0.0.1"] {
+            silent.push(match connect_from(local, srv.addr).await {
+                Some(s) => s,
+                None => TcpStream::connect(srv.addr).await.unwrap(),
+            });
         }
-    }
-    // the silent connections are dropped after the header timeout, which frees the share
-    for s in &mut silent {
+        // they fill this machine's share, but the oldest makes room for a client with a request
+        let mut kept = vec![keep_alive_request(srv.addr).await];
         let mut b = [0u8; 1];
-        let n = tokio::time::timeout(WAIT, s.read(&mut b)).await.expect("closed in time").unwrap_or(0);
-        assert_eq!(n, 0, "closed without a reply");
-    }
-    assert!(t0.elapsed() >= Duration::from_millis(1400), "{:?}", t0.elapsed());
-    assert_eq!(send(srv.addr, "POST", &[ACCEPT, JSON], &initialize).await.status, 200);
-    // a body that never ends: 408
-    let r = send_declaring(srv.addr, "POST", &[ACCEPT, JSON], 1000, "{\"jsonrpc\"").await;
-    assert_eq!(r.status, 408);
-    // an idle keep-alive connection is closed after the header timeout as well
-    let mut s = TcpStream::connect(srv.addr).await.unwrap();
-    s.write_all(format!("GET / HTTP/1.1\r\nHost: {}\r\n\r\n", srv.host()).as_bytes()).await.unwrap();
-    let mut got = Vec::new();
-    while !String::from_utf8_lossy(&got).contains("the MCP endpoint is /mcp") {
-        let mut b = [0u8; 512];
-        let n = tokio::time::timeout(WAIT, s.read(&mut b)).await.expect("a reply in time").unwrap();
-        assert!(n > 0, "closed before the reply");
-        got.extend_from_slice(b.get(..n).unwrap());
-    }
-    let idle = std::time::Instant::now();
-    let mut b = [0u8; 1];
-    assert_eq!(tokio::time::timeout(WAIT, s.read(&mut b)).await.expect("closed in time").unwrap_or(0), 0);
-    assert!(idle.elapsed() >= Duration::from_millis(1000), "kept alive for a while: {:?}", idle.elapsed());
-    let l = lines.lock().unwrap().join("\n");
-    assert!(l.contains("refused a connection from 127.0.0.1:") && l.contains("503: too many connections from this address"), "{l}");
-    assert!(l.contains("408 Request Timeout"), "{l}");
+        assert_eq!(tokio::time::timeout(WAIT, silent[0].read(&mut b)).await.expect("closed in time").unwrap_or(0), 0);
+        assert!(t0.elapsed() < Duration::from_millis(1400), "closed to make room, before the header timeout: {:?}", t0.elapsed());
+        // connections whose requests passed are kept: three fill the share (the other silent ones
+        // make room), and one more gets a 503
+        for _ in 0..2 {
+            kept.push(keep_alive_request(srv.addr).await);
+        }
+        let refused = read_all(TcpStream::connect(srv.addr).await.unwrap()).await;
+        assert!(refused.starts_with("HTTP/1.1 503 ") && refused.contains("Retry-After: 1\r\n") && refused.contains("Connection: close\r\n"), "{refused}");
+        assert!(refused.ends_with("too many connections"), "{refused}");
+        if let Some(s) = connect_from("127.0.0.4", srv.addr).await {
+            assert!(read_all(s).await.starts_with("HTTP/1.1 503 "), "another loopback address is this machine too");
+        }
+        assert!(t0.elapsed() < Duration::from_millis(1400), "the checks ran before the header timeout: {:?}", t0.elapsed());
+        // the rest of the silent connections made room for the kept ones
+        for s in silent.iter_mut().skip(1) {
+            assert_eq!(tokio::time::timeout(WAIT, s.read(&mut b)).await.expect("closed in time").unwrap_or(0), 0);
+        }
+        // an idle keep-alive connection is closed after the header timeout
+        let idle = std::time::Instant::now();
+        for s in &mut kept {
+            assert_eq!(tokio::time::timeout(WAIT, s.read(&mut b)).await.expect("closed in time").unwrap_or(0), 0);
+        }
+        assert!(idle.elapsed() >= Duration::from_millis(500), "kept alive for a while: {:?}", idle.elapsed());
+        // a client that sends nothing is dropped after the header timeout
+        let mut s = TcpStream::connect(srv.addr).await.unwrap();
+        let quiet = std::time::Instant::now();
+        assert_eq!(tokio::time::timeout(WAIT, s.read(&mut b)).await.expect("closed in time").unwrap_or(0), 0, "closed without a reply");
+        assert!(quiet.elapsed() >= Duration::from_millis(1400), "{:?}", quiet.elapsed());
+        // a body that never ends: 408
+        let r = send_declaring(srv.addr, "POST", &[ACCEPT, JSON], 1000, "{\"jsonrpc\"").await;
+        assert_eq!(r.status, 408);
+        let l = lines.lock().unwrap().join("\n");
+        assert!(l.contains("refused a connection from 127.0.0.1:") && l.contains("503: too many connections from this address"), "{l}");
+        assert!(l.contains("408 Request Timeout"), "{l}");
     })
     .await;
 }
@@ -747,8 +766,9 @@ async fn bearer_token_is_required() {
         assert!(r.header("mcp-session-id").is_none());
         assert!(r.next().await.is_none());
     }
-    // every method, before Host/Origin
-    assert_eq!(send(srv.addr, "OPTIONS", &[("Origin", "http://evil.example")], "").await.status, 401);
+    // every method; a browser's foreign Origin is refused first (403), so a web page cannot
+    // count as failed authentications
+    assert_eq!(send(srv.addr, "OPTIONS", &[("Origin", "http://evil.example")], "").await.status, 403);
     assert_eq!(send(srv.addr, "DELETE", &[("Mcp-Session-Id", "x")], "").await.status, 401);
     let good = format!("Bearer {token}");
     let lower = format!("bearer {token}");
@@ -765,9 +785,11 @@ async fn bearer_token_is_required() {
     .await;
 }
 
-/// A peer that fails authentication too often is refused for a while (429 with Retry-After),
-/// even with the right token, so the token cannot be guessed at speed; it is logged, other peers
-/// are not affected, and the block ends.
+/// A peer that sends wrong tokens too often gets 429 (with Retry-After) instead of 401 for a
+/// while; it is logged, and the block ends. With a token of 32+ characters (too long to guess) the
+/// right one still gets in meanwhile: every local client shares 127.0.0.1, so a local process, or a
+/// client set up with the wrong token, must not lock the others out. Requests a web page can make
+/// (no token, a foreign `Origin`) are no guesses and never count.
 #[tokio::test(flavor = "multi_thread")]
 async fn failed_authentications_get_a_peer_refused_for_a_while() {
     within(async {
@@ -778,24 +800,47 @@ async fn failed_authentications_get_a_peer_refused_for_a_while() {
     let srv = Server::start_limited(demo(), HttpOptions { token: Some(token.into()), log, ..HttpOptions::default() }, limits).await;
     let initialize = json!({"jsonrpc":"2.0","id":0,"method":"initialize","params":{"protocolVersion":"2025-06-18","capabilities":{},"clientInfo":{"name":"t","version":"1"}}});
     assert_eq!(post(srv.addr, None, &[("Authorization", &bearer)], &initialize).await.status, 200);
-    for guess in ["Bearer a", "Bearer b", "Bearer c"] {
+    for _ in 0..5 {
+        assert_eq!(post(srv.addr, None, &[], &initialize).await.status, 401);
+        assert_eq!(send(srv.addr, "GET", &[], "").await.status, 401);
+        assert_eq!(post(srv.addr, None, &[("Origin", "https://evil.example"), ("Authorization", "Bearer guess")], &initialize).await.status, 403);
+    }
+    assert_eq!(post(srv.addr, None, &[("Authorization", "Bearer still-no-block")], &initialize).await.status, 401, "none of those counted");
+    for guess in ["Bearer a", "Bearer b"] {
         assert_eq!(post(srv.addr, None, &[("Authorization", guess)], &initialize).await.status, 401);
     }
-    let r = post(srv.addr, None, &[("Authorization", &bearer)], &initialize).await;
-    assert_eq!(r.status, 429, "blocked, right token or not");
+    let r = post(srv.addr, None, &[("Authorization", "Bearer c")], &initialize).await;
+    assert_eq!(r.status, 429, "blocked");
     assert!(r.header("retry-after").and_then(|s| s.parse::<u64>().ok()).is_some_and(|s| (1..=2).contains(&s)), "{:?}", r.headers);
     assert!(r.header("mcp-session-id").is_none());
-    if let Some(s) = connect_from("127.0.0.2", srv.addr).await {
-        let body = initialize.to_string();
-        let r = exchange(s, srv.addr, "POST", &[ACCEPT, JSON, ("Authorization", &bearer)], body.len(), &body).await;
-        assert_eq!(r.status, 200, "another address is not blocked");
-    }
+    let (sid, _) = init(srv.addr, &[("Authorization", &bearer)]).await;
+    assert!(!sid.is_empty(), "the right token still gets in");
     tokio::time::sleep(Duration::from_millis(1600)).await;
-    assert_eq!(post(srv.addr, None, &[("Authorization", &bearer)], &initialize).await.status, 200, "the block ends");
+    assert_eq!(post(srv.addr, None, &[("Authorization", "Bearer d")], &initialize).await.status, 401, "the block ends");
     let l = lines.lock().unwrap().join("\n");
-    assert!(l.contains("too many failed authentications from 127.0.0.1: refusing it for a while"), "{l}");
+    assert!(l.contains("too many failed authentications from 127.0.0.1: refusing wrong tokens from it with 429 for a while"), "{l}");
     assert!(l.contains("429 Too Many Requests"), "{l}");
     assert!(!l.contains(token), "{l}");
+    })
+    .await;
+}
+
+/// A token shorter than 32 characters (allowed on loopback only) could be guessed: while a peer is
+/// blocked, even the right one gets 429.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_short_token_is_refused_while_blocked() {
+    within(async {
+    let token = "short-token";
+    let bearer = format!("Bearer {token}");
+    let limits = Limits { auth_failures: 2, auth_block: Duration::from_millis(1000), ..Limits::default() };
+    let srv = Server::start_limited(demo(), HttpOptions { token: Some(token.into()), ..HttpOptions::default() }, limits).await;
+    let initialize = json!({"jsonrpc":"2.0","id":0,"method":"initialize","params":{"protocolVersion":"2025-06-18","capabilities":{},"clientInfo":{"name":"t","version":"1"}}});
+    for guess in ["Bearer a", "Bearer b"] {
+        assert_eq!(post(srv.addr, None, &[("Authorization", guess)], &initialize).await.status, 401);
+    }
+    assert_eq!(post(srv.addr, None, &[("Authorization", &bearer)], &initialize).await.status, 429);
+    tokio::time::sleep(Duration::from_millis(1100)).await;
+    assert_eq!(post(srv.addr, None, &[("Authorization", &bearer)], &initialize).await.status, 200, "the block ends");
     })
     .await;
 }
@@ -959,8 +1004,9 @@ async fn initializes_dropped_mid_request_leave_no_untracked_session() {
         let gate = gate_of(&stats).await;
         let peer: SocketAddr = "127.0.0.1:5555".parse().unwrap();
         let mut abandoned = 0;
+        let trusted = std::sync::atomic::AtomicBool::new(false);
         for _ in 0..7 {
-            let mut answer = Box::pin(gate.route(peer, initialize_request(&srv.host())));
+            let mut answer = Box::pin(gate.route(peer, initialize_request(&srv.host()), &trusted));
             // one poll: the session is created, and the request waits for the handler's answer
             let pending = std::future::poll_fn(|cx| std::task::Poll::Ready(answer.as_mut().poll(cx).is_pending())).await;
             // the handler answers (on a single thread, only while this test waits)

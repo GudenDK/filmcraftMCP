@@ -1,5 +1,5 @@
-//! The checks in front of rmcp, cheapest first: the path, the bearer token, `Host` and `Origin`
-//! (DNS rebinding, browsers), and for a POST its `Accept` and `Content-Type`; only then is the body
+//! The checks in front of rmcp, cheapest first: the path, `Host` and `Origin` (DNS rebinding,
+//! browsers), the bearer token, and for a POST its `Accept` and `Content-Type`; only then is the body
 //! read (bounded), and parsed once to keep rmcp's caches and sessions bounded. rmcp repeats the
 //! header checks with the same lists; running them here first means a refused request costs no body
 //! read and gets the same answer whatever its body holds (no oracle for a DNS-rebinding page).
@@ -8,6 +8,7 @@ use std::future::Future;
 use std::net::SocketAddr;
 use std::panic::AssertUnwindSafe;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
 use bytes::Bytes;
@@ -23,7 +24,7 @@ use serde_json::{Value, json};
 use super::limits::{AuthFailures, Log};
 use super::sessions::{Duplicate, Sessions, hold};
 use super::tracked::{INITIALIZING, Initializing, TrackedSessions};
-use super::{HttpBody, MAX_BODY, MCP_PATH, Mcp};
+use super::{HttpBody, MAX_BODY, MCP_PATH, MIN_REMOTE_TOKEN_LEN, Mcp};
 use crate::FilmcraftMcp;
 
 /// Request headers a listed browser origin may send (answer to its CORS preflight).
@@ -79,16 +80,17 @@ impl Refusal {
 
 impl Gate {
     /// [`Self::route`], with a panic (here or in rmcp) answered with 500 and logged.
-    pub(super) async fn serve<B: ReqBody>(&self, peer: SocketAddr, req: Request<B>) -> Response<HttpBody>
+    pub(super) async fn serve<B: ReqBody>(&self, peer: SocketAddr, req: Request<B>, trusted: &AtomicBool) -> Response<HttpBody>
     where
         B::Error: std::error::Error + Send + Sync + 'static,
     {
         let (method, path) = (req.method().clone(), req.uri().path().to_string());
-        or_500(&self.log, peer, &method, &path, self.route(peer, req)).await
+        or_500(&self.log, peer, &method, &path, self.route(peer, req, trusted)).await
     }
 
-    /// Check `req`, then hand it to rmcp. Never fails: errors are responses.
-    pub(super) async fn route<B: ReqBody>(&self, peer: SocketAddr, req: Request<B>) -> Response<HttpBody>
+    /// Check `req`, then hand it to rmcp. Never fails: errors are responses. `trusted` (its
+    /// connection's) is set when it passes the `Host`, `Origin` and token checks.
+    pub(super) async fn route<B: ReqBody>(&self, peer: SocketAddr, req: Request<B>, trusted: &AtomicBool) -> Response<HttpBody>
     where
         B::Error: std::error::Error + Send + Sync + 'static,
     {
@@ -98,7 +100,7 @@ impl Gate {
         // CORS headers go to a listed origin only (a page allowed with `--allow-origin`).
         let cors = req.headers().get(header::ORIGIN).filter(|o| self.origin_listed(o)).cloned();
         let method = req.method().clone();
-        let mut r = match self.checked(peer, req, cors.is_some()).await {
+        let mut r = match self.checked(peer, req, cors.is_some(), trusted).await {
             Ok(r) => r,
             Err(no) => self.refuse(peer, &method, no),
         };
@@ -108,19 +110,23 @@ impl Gate {
         r
     }
 
-    async fn checked<B: ReqBody>(&self, peer: SocketAddr, req: Request<B>, listed_origin: bool) -> Result<Response<HttpBody>, Refusal>
+    async fn checked<B: ReqBody>(&self, peer: SocketAddr, req: Request<B>, listed_origin: bool, trusted: &AtomicBool) -> Result<Response<HttpBody>, Refusal>
     where
         B::Error: std::error::Error + Send + Sync + 'static,
     {
+        check_single(req.headers())?;
         // A browser sends a CORS preflight without credentials: it is answered before the token
         // check, and only for a listed origin.
         if listed_origin && req.method() == Method::OPTIONS && req.headers().contains_key(header::ACCESS_CONTROL_REQUEST_METHOD) {
             self.check_host(&req)?;
             return Ok(preflight(req.headers()));
         }
-        self.check_token(peer, req.headers())?;
+        // Host and Origin first: a web page (DNS rebinding, a foreign origin) gets 403 and never
+        // counts as a failed authentication of this address.
         self.check_host(&req)?;
         self.check_origin(req.headers())?;
+        self.check_token(peer, req.headers())?;
+        trusted.store(true, Ordering::Relaxed);
         let session = session_id(req.headers());
         match *req.method() {
             Method::POST => {}
@@ -257,20 +263,28 @@ impl Gate {
         r
     }
 
-    /// The bearer token, unless this peer failed too often lately: then it is refused whatever it
-    /// sends, so that guessing gets nowhere.
+    /// The bearer token. A peer that sent wrong tokens too often lately gets 429 for a while
+    /// instead of 401, but the right token still gets in: one of 32+ characters cannot be guessed
+    /// anyway, and every local client shares one address (127.0.0.1), so refusing it would let
+    /// any local process, or a misconfigured client, lock the others out. A shorter token (allowed
+    /// on loopback only) could be guessed: while blocked, it is refused too.
     fn check_token(&self, peer: SocketAddr, headers: &HeaderMap) -> Result<(), Refusal> {
         let Some(expected) = self.token.as_deref() else { return Ok(()) };
-        if let Some(left) = self.auth.blocked(peer.ip()) {
+        let given = headers.get(header::AUTHORIZATION);
+        let right = bearer_matches(given, expected);
+        let blocked = self.auth.blocked(peer.ip());
+        if right && (blocked.is_none() || expected.len() >= MIN_REMOTE_TOKEN_LEN) {
+            return Ok(());
+        }
+        if let Some(left) = blocked {
             let mut no = refusal(StatusCode::TOO_MANY_REQUESTS, "Too Many Requests: too many failed authentications from this address; try again later");
             no.retry_after = Some(left.as_secs().saturating_add(1));
             return Err(no);
         }
-        if bearer_matches(headers.get(header::AUTHORIZATION), expected) {
-            return Ok(());
-        }
-        if self.auth.failed(peer.ip()) {
-            self.log.line(format_args!("too many failed authentications from {}: refusing it for a while", peer.ip()));
+        // only a wrong token counts as a failed authentication: a request without one (a web
+        // page's <img>, a client not set up yet) is no guess
+        if given.is_some() && self.auth.failed(peer.ip()) {
+            self.log.line(format_args!("too many failed authentications from {}: refusing wrong tokens from it with 429 for a while", peer.ip()));
         }
         Err(refusal(StatusCode::UNAUTHORIZED, "Unauthorized: missing or wrong bearer token"))
     }
@@ -327,6 +341,21 @@ pub(super) async fn or_500(log: &Log, peer: SocketAddr, method: &Method, path: &
             text(StatusCode::INTERNAL_SERVER_ERROR, "Internal Server Error")
         }
     }
+}
+
+/// At most one `Host` (RFC 9112 § 3.2: else 400), `Origin` and `Authorization`: a proxy that adds
+/// its own must not make the gate and rmcp, or the gate and the client, read different ones.
+fn check_single(headers: &HeaderMap) -> Result<(), Refusal> {
+    for (name, no) in [
+        (header::HOST, "Bad Request: more than one Host header"),
+        (header::ORIGIN, "Bad Request: more than one Origin header"),
+        (header::AUTHORIZATION, "Bad Request: more than one Authorization header"),
+    ] {
+        if headers.get_all(name).iter().nth(1).is_some() {
+            return Err(refusal(StatusCode::BAD_REQUEST, no));
+        }
+    }
+    Ok(())
 }
 
 /// The `Mcp-Session-Id` header.

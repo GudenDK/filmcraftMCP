@@ -4,13 +4,13 @@
 //!
 //! Secure by default (MCP spec, transports § Security Warning):
 //! * loopback addresses only, unless a bearer token of 32+ characters is set;
-//! * with a token, every request needs `Authorization: Bearer <token>` (constant-time compare),
-//!   checked before anything else but a listed origin's CORS preflight, else 401; a peer that
-//!   fails 10 times in a minute is refused (429) for a minute;
 //! * `Host` must name this server (`127.0.0.1:<port>`, `localhost:<port>`, `[::1]:<port>`, the
 //!   bound address, plus any `allowed_hosts`): a DNS-rebinding page gets 403;
 //! * a request with an `Origin` header (a browser) gets 403 unless that origin is listed in
-//!   `allowed_origins` (which then also get CORS headers); MCP clients send none.
+//!   `allowed_origins` (which then also get CORS headers); MCP clients send none;
+//! * with a token, every request needs `Authorization: Bearer <token>` (constant-time compare),
+//!   checked next, else 401; a peer that sends 10 wrong tokens in a minute gets 429 for its
+//!   wrong ones for a minute (and for the right one too if it is shorter than 32 characters).
 //!
 //! The gate (`gate.rs`) runs these checks before reading a body, maps a non-JSON body to a
 //! JSON-RPC parse error (`-32700`, as `serve_io` does on stdio), and keeps rmcp's per-tool-name
@@ -68,18 +68,21 @@ const MAX_REFUSING: usize = 32;
 /// The server's limits and timeouts (tests shorten them).
 #[derive(Clone, Debug)]
 pub(crate) struct Limits {
-    /// Connections served at once; one more gets a 503 and is closed.
+    /// Connections served at once. At this cap (or `connections_per_peer`), the oldest connection
+    /// that has not made a request past the token, `Host` and `Origin` checks is closed for a new
+    /// one; when every one has, the new one gets a 503 and is closed.
     pub(crate) connections: u32,
-    /// Connections from one peer (an IPv4 address or an IPv6 /64) at once, so that one address
-    /// cannot hold them all, credentials or not. Local clients all come from 127.0.0.1.
+    /// Connections from one peer (an IPv4 address or an IPv6 /64; every loopback address is one,
+    /// this machine) at once, so that one address cannot hold them all.
     pub(crate) connections_per_peer: usize,
     /// How long a client may take to send a request's head; also how long a keep-alive
     /// connection may sit idle between requests.
     pub(crate) header_timeout: Duration,
     /// How long a client may take to send a request's body (408 after).
     pub(crate) body_timeout: Duration,
-    /// With a token: this many failed authentications from one peer within `auth_window` get
-    /// it refused (429), right token or not, for `auth_block`.
+    /// With a token: this many wrong tokens from one peer within `auth_window` get its wrong
+    /// tokens 429 instead of 401 for `auth_block`, and its right one too when that is shorter than
+    /// [`MIN_REMOTE_TOKEN_LEN`].
     pub(crate) auth_failures: u32,
     pub(crate) auth_window: Duration,
     pub(crate) auth_block: Duration,
@@ -488,15 +491,16 @@ async fn serve_connection(
     gate: Arc<gate::Gate>,
     stream: tokio::net::TcpStream,
     peer: SocketAddr,
-    _slot: limits::ConnSlot,
+    slot: limits::ConnSlot,
     header_timeout: Duration,
     stop: CancellationToken,
 ) {
     let reporter = gate.clone();
+    let trusted = slot.trusted();
     // a panic in a request is answered with 500 (Gate::serve)
     let svc = service_fn(move |req: Request<Incoming>| {
-        let gate = gate.clone();
-        async move { Ok::<_, Infallible>(gate.serve(peer, req).await) }
+        let (gate, trusted) = (gate.clone(), trusted.clone());
+        async move { Ok::<_, Infallible>(gate.serve(peer, req, &trusted).await) }
     });
     // hyper panics on a timeout configured without a timer (hyper common/time.rs). Its header
     // timer also runs while a keep-alive connection waits for its next request.
@@ -505,6 +509,8 @@ async fn serve_connection(
         tokio::pin!(conn);
         tokio::select! {
             _ = conn.as_mut() => {}
+            // closed to make room for another connection: it never made a request that passed
+            _ = slot.made_room() => {}
             _ = stop.cancelled() => {
                 conn.as_mut().graceful_shutdown();
                 let _ = tokio::time::timeout(Duration::from_secs(5), conn).await;

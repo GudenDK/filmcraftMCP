@@ -168,8 +168,9 @@ Unlike this control channel, that endpoint speaks HTTP, so a web page can addres
 `Host` and `Origin` (a browser's request gets 403 unless its origin is listed with
 `--allow-origin`, which also turns on CORS for it), listens on loopback only unless a bearer token
 of 32+ characters is set (`FILMCRAFT_MCP_TOKEN` or `--token-file`), and with a token refuses every
-request without it (401; 429 for a while after 10 failures). It caps connections per address and
-in all, times out slow clients, closes idle sessions and logs what it refuses. Those checks guard
+request without it (401; 429 for wrong tokens for a while after 10 of them). It caps connections
+per address and in all (closing ones that never sent a valid request to make room), times out slow
+clients, closes idle sessions and logs what it refuses. Those checks guard
 only the HTTP endpoint: in bridge mode this control channel stays as it is, without
 authentication, so any local process can still drive the app through `--control` directly.
 Details: [agents.md § HTTP transport](agents.md#http-transport). Tools: `command_list`, `command_run`,

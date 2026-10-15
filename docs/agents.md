@@ -264,7 +264,8 @@ wherever the user can, so the endpoint is locked down by default:
   `Access-Control-Expose-Headers: Mcp-Session-Id, Mcp-Protocol-Version, WWW-Authenticate`. Other
   origins never get CORS headers.
 - **Token.** Set `FILMCRAFT_MCP_TOKEN`, or pass `--token-file FILE` (its first line), and every
-  request (every method, before anything else) needs `Authorization: Bearer <token>`, else 401. The
+  request (every method, checked right after `Host` and `Origin`) needs
+  `Authorization: Bearer <token>`, else 401. The
   token is compared in constant time and never printed or logged. There is no `--token VALUE`:
   other users can read a command line. Without a token, any local process (any user, on a shared
   machine) can drive FilmCraft; use one on shared machines. Generate one with
@@ -278,15 +279,24 @@ wherever the user can, so the endpoint is locked down by default:
   in PowerShell, `(umask 077; openssl rand -hex 32 > token.txt)` elsewhere. On Linux and macOS a
   token file that other users can read or change gets a warning (`chmod 600` it). On Windows,
   your profile folder is readable only by you and administrators by default.
-- After 10 failed authentications within a minute, an address gets 429 (`Retry-After`) for a
-  minute, whatever token it sends, so guessing a token gets nowhere. Other addresses are not
-  affected.
+- After 10 wrong tokens within a minute, an address gets 429 (`Retry-After`) instead of 401 for its
+  wrong tokens, for a minute. The right token still gets in: one of 32+ characters cannot be
+  guessed anyway, and every local client connects from the same address (127.0.0.1), so a local
+  process, or a client set up with the wrong token, must not lock the others out. A token shorter
+  than 32 characters (loopback only) could be guessed, so while the address is blocked it is
+  refused too; a local process can then lock local clients out for a minute at a time, one more
+  reason to use a long token. Requests without an `Authorization` header and browser requests
+  (refused for their `Host` or `Origin` first) never count.
 
 #### Limits and timeouts
 
 - **Connections.** At most 32 at once from one address (an IPv4 address, or an IPv6 /64) and 256
-  in all. Local clients all connect from 127.0.0.1 (or ::1), so they share those 32. One more
-  gets `503 Service Unavailable` with `Retry-After: 1` and is closed.
+  in all. Every loopback address (127.0.0.0/8, ::1) counts as one, this machine: local clients
+  share those 32. At a limit, the oldest connection that has not yet made a request past the
+  `Host`, `Origin` and token checks is closed to make room, so connections that send nothing (or
+  nothing valid) cannot lock out clients that have the token. Only when every connection there has
+  made such a request does a new one get `503 Service Unavailable` with `Retry-After: 1` and is
+  closed.
 - **Slow and idle clients.** A request's line and headers must arrive within 10 s. A keep-alive
   connection with no request for 10 s is closed. A body must arrive within 30 s, else 408. Bodies
   are limited to 4 MiB (413 above).
@@ -307,13 +317,14 @@ its body holds, and has its connection closed.
 
 | Status | When |
 |---|---|
-| 503 | too many connections (`Retry-After: 1`), answered before the request is read |
+| 503 | too many connections and none can make room (`Retry-After: 1`), answered before the request is read |
 | 404 | a path other than `/mcp` |
+| 400 | more than one `Host`, `Origin` or `Authorization` header |
 | 204 | a listed origin's CORS preflight |
-| 429 | an address that failed authentication 10 times in a minute (for a minute; `Retry-After`) |
-| 401 | no or wrong bearer token (`WWW-Authenticate: Bearer realm="filmcraft"`) |
 | 400 / 403 | a malformed / foreign `Host` |
 | 403 | an `Origin` that is not listed |
+| 429 | a wrong token from an address that sent 10 wrong ones in a minute (for a minute; `Retry-After`); with a token under 32 characters, the right one too |
+| 401 | no or wrong bearer token (`WWW-Authenticate: Bearer realm="filmcraft"`) |
 | 405 | a method other than `GET`, `POST`, `DELETE`, such as an `OPTIONS` that is no CORS preflight |
 | 406 | a `POST` whose `Accept` lacks `application/json` or `text/event-stream` |
 | 415 | a `POST` whose `Content-Type` is not `application/json`; after the body, a JSON-RPC batch (array) |

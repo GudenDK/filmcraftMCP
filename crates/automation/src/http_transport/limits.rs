@@ -1,16 +1,18 @@
-//! Per-peer bookkeeping: open connections (so one address cannot take every connection), failed
-//! authentications (so a token cannot be guessed quickly), and log lines about refused requests (at
-//! most one per peer and kind every few seconds, so a flood of bad requests cannot flood the log).
+//! Per-peer bookkeeping: open connections (so one address cannot take every connection, and
+//! connections that send nothing valid cannot lock out the ones that do), failed authentications
+//! (so a short token cannot be guessed quickly), and log lines about refused requests (at most one
+//! per peer and kind every few seconds, so a flood of bad requests cannot flood the log).
 
 use std::collections::HashMap;
 use std::fmt::Display;
 use std::io::Write as _;
-use std::net::{IpAddr, Ipv6Addr};
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use std::time::{Duration, Instant};
 
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
-use tokio::sync::{OwnedSemaphorePermit, Semaphore};
+use tokio_util::sync::CancellationToken;
 
 /// Where the HTTP server reports refused requests and failures: one line each, never a credential.
 pub type LogSink = Arc<dyn Fn(&str) + Send + Sync>;
@@ -21,18 +23,23 @@ const MAX_PEERS: usize = 1024;
 const MAX_AUTH_PEERS: usize = 4096;
 
 /// The address a limit applies to: an IPv4 address, or an IPv6 /64 (one host's or one LAN's
-/// share; a client can pick any address in it). An IPv4-mapped IPv6 address counts as IPv4.
+/// share; a client can pick any address in it). An IPv4-mapped IPv6 address counts as IPv4. Every
+/// loopback address (127.0.0.0/8, ::1) is one peer, this machine: a local process can send from
+/// any of them.
 pub(super) fn peer_key(ip: IpAddr) -> IpAddr {
+    let ip = match ip {
+        IpAddr::V6(v6) => v6.to_ipv4_mapped().map_or(ip, IpAddr::V4),
+        IpAddr::V4(_) => ip,
+    };
+    if ip.is_loopback() {
+        return IpAddr::V4(Ipv4Addr::LOCALHOST);
+    }
     match ip {
         IpAddr::V4(_) => ip,
-        IpAddr::V6(v6) => match v6.to_ipv4_mapped() {
-            Some(v4) => IpAddr::V4(v4),
-            None if v6.is_loopback() => ip,
-            None => {
-                let [a, b, c, d, ..] = v6.segments();
-                IpAddr::V6(Ipv6Addr::new(a, b, c, d, 0, 0, 0, 0))
-            }
-        },
+        IpAddr::V6(v6) => {
+            let [a, b, c, d, ..] = v6.segments();
+            IpAddr::V6(Ipv6Addr::new(a, b, c, d, 0, 0, 0, 0))
+        }
     }
 }
 
@@ -41,60 +48,117 @@ fn lock<T>(m: &Mutex<T>) -> MutexGuard<'_, T> {
 }
 
 /// Open connections, in all and per peer. A connection is counted from accept to close, before it
-/// has sent anything, so the per-peer share is what keeps one address (with or without the token)
-/// from holding every connection.
+/// has sent anything. At a limit, the oldest connection (of that peer, or of all) that has not
+/// yet made a request the server accepted (past the token, `Host` and `Origin` checks) is closed
+/// to make room, so that connections that send nothing, or nothing valid, cannot lock out clients
+/// that have the token, from another address or from the same one (every local client is
+/// 127.0.0.1). Only when every connection there has proven itself is the new one refused.
 pub(super) struct Conns {
-    total: Arc<Semaphore>,
-    max: u32,
+    max: usize,
     per_peer: usize,
-    peers: Mutex<HashMap<IpAddr, usize>>,
+    inner: Mutex<Open>,
+    /// How many connections are open (for [`Self::all_closed`]).
+    count: tokio::sync::watch::Sender<usize>,
+}
+
+#[derive(Default)]
+struct Open {
+    next: u64,
+    /// By age: ids only grow.
+    conns: std::collections::BTreeMap<u64, Conn>,
+    peers: HashMap<IpAddr, usize>,
+}
+
+struct Conn {
+    peer: IpAddr,
+    trusted: Arc<AtomicBool>,
+    close: CancellationToken,
 }
 
 /// One open connection; dropping it closes its slot.
 pub(super) struct ConnSlot {
     conns: Arc<Conns>,
-    peer: IpAddr,
-    _total: OwnedSemaphorePermit,
+    id: u64,
+    trusted: Arc<AtomicBool>,
+    close: CancellationToken,
+}
+
+impl ConnSlot {
+    /// Set once a request on this connection passed the token, `Host` and `Origin` checks: it is
+    /// no longer closed to make room.
+    pub(super) fn trusted(&self) -> Arc<AtomicBool> {
+        self.trusted.clone()
+    }
+
+    /// Resolves when this connection was closed to make room for another.
+    pub(super) async fn made_room(&self) {
+        self.close.cancelled().await;
+    }
 }
 
 impl Conns {
     pub(super) fn new(max: u32, per_peer: usize) -> Arc<Self> {
-        Arc::new(Self { total: Arc::new(Semaphore::new(max as usize)), max, per_peer, peers: Mutex::new(HashMap::new()) })
+        Arc::new(Self { max: (max as usize).max(1), per_peer: per_peer.max(1), inner: Mutex::new(Open::default()), count: tokio::sync::watch::Sender::new(0) })
     }
 
-    /// A slot for a connection from `ip`, or why there is none.
+    /// A slot for a connection from `ip` (another connection may be closed to make room), or why
+    /// there is none.
     pub(super) fn open(self: &Arc<Self>, ip: IpAddr) -> Result<ConnSlot, &'static str> {
         let peer = peer_key(ip);
-        let mut peers = lock(&self.peers);
-        let n = peers.get(&peer).copied().unwrap_or(0);
-        if n >= self.per_peer {
+        let mut open = lock(&self.inner);
+        if open.peers.get(&peer).copied().unwrap_or(0) >= self.per_peer && !open.make_room(|c| c.peer == peer) {
             return Err("too many connections from this address");
         }
-        let Ok(total) = self.total.clone().try_acquire_owned() else { return Err("too many connections") };
-        peers.insert(peer, n.saturating_add(1));
-        Ok(ConnSlot { conns: self.clone(), peer, _total: total })
+        if open.conns.len() >= self.max && !open.make_room(|_| true) {
+            return Err("too many connections");
+        }
+        let id = open.next;
+        open.next = open.next.wrapping_add(1);
+        let (trusted, close) = (Arc::new(AtomicBool::new(false)), CancellationToken::new());
+        open.conns.insert(id, Conn { peer, trusted: trusted.clone(), close: close.clone() });
+        let n = open.peers.entry(peer).or_insert(0);
+        *n = n.saturating_add(1);
+        self.count.send_replace(open.conns.len());
+        Ok(ConnSlot { conns: self.clone(), id, trusted, close })
     }
 
     /// Wait until every connection has closed.
     pub(super) async fn all_closed(&self) {
-        let _ = self.total.acquire_many(self.max).await;
+        let _ = self.count.subscribe().wait_for(|n| *n == 0).await;
     }
 }
 
-impl Drop for ConnSlot {
-    fn drop(&mut self) {
-        let mut peers = lock(&self.conns.peers);
-        if let Some(n) = peers.get_mut(&self.peer) {
+impl Open {
+    /// Close the oldest connection that `among` picks and that has not proven itself; false when
+    /// there is none.
+    fn make_room(&mut self, among: impl Fn(&Conn) -> bool) -> bool {
+        let Some(id) = self.conns.iter().find(|(_, c)| among(c) && !c.trusted.load(Ordering::Relaxed)).map(|(id, _)| *id) else { return false };
+        self.remove(id);
+        true
+    }
+
+    fn remove(&mut self, id: u64) {
+        let Some(c) = self.conns.remove(&id) else { return };
+        c.close.cancel();
+        if let Some(n) = self.peers.get_mut(&c.peer) {
             *n = n.saturating_sub(1);
             if *n == 0 {
-                peers.remove(&self.peer);
+                self.peers.remove(&c.peer);
             }
         }
     }
 }
 
-/// Failed authentications per peer: `limit` of them within `window` get the peer refused for
-/// `block`, whatever token it sends then, so a token cannot be guessed at speed.
+impl Drop for ConnSlot {
+    fn drop(&mut self) {
+        let mut open = lock(&self.conns.inner);
+        open.remove(self.id);
+        self.conns.count.send_replace(open.conns.len());
+    }
+}
+
+/// Failed authentications per peer: `limit` of them within `window` get the peer blocked for
+/// `block` (the gate decides what that refuses), so a token cannot be guessed at speed.
 pub(super) struct AuthFailures {
     limit: u32,
     window: Duration,
@@ -236,24 +300,56 @@ mod tests {
         let k = |s: &str| peer_key(s.parse().unwrap()).to_string();
         assert_eq!(k("192.168.1.5"), "192.168.1.5");
         assert_eq!(k("::ffff:10.0.0.1"), "10.0.0.1");
-        assert_eq!(k("::1"), "::1");
         assert_eq!(k("2001:db8:1:2:aaaa:bbbb:cccc:dddd"), "2001:db8:1:2::");
         assert_eq!(k("2001:db8:1:2::9"), k("2001:db8:1:2:ffff::1"));
+        // this machine is one peer, whichever loopback address a process sends from
+        for local in ["127.0.0.1", "127.0.0.2", "127.255.0.9", "::1", "::ffff:127.0.0.3"] {
+            assert_eq!(k(local), "127.0.0.1", "{local}");
+        }
     }
 
     #[test]
     fn connections_are_counted_per_peer_and_in_all() {
         let conns = Conns::new(4, 2);
-        let (a, b, c): (IpAddr, IpAddr, IpAddr) = ("10.0.0.1".parse().unwrap(), "10.0.0.2".parse().unwrap(), "10.0.0.3".parse().unwrap());
-        let a1 = conns.open(a).unwrap();
-        let _a2 = conns.open(a).unwrap();
-        assert_eq!(conns.open(a).err(), Some("too many connections from this address"));
-        let _b1 = conns.open(b).unwrap();
-        let _b2 = conns.open(b).unwrap();
-        assert_eq!(conns.open(c).err(), Some("too many connections"));
-        drop(a1);
-        assert!(conns.open(c).is_ok(), "a closed connection frees its slot");
-        assert_eq!(lock(&conns.peers).len(), 2, "c's slot was dropped at once");
+        let ip = |s: &str| -> IpAddr { s.parse().unwrap() };
+        let proven = |slot: ConnSlot| {
+            slot.trusted().store(true, Ordering::Relaxed);
+            slot
+        };
+        let _a1 = proven(conns.open(ip("10.0.0.1")).unwrap());
+        let _a2 = proven(conns.open(ip("10.0.0.1")).unwrap());
+        assert_eq!(conns.open(ip("10.0.0.1")).err(), Some("too many connections from this address"), "both proved themselves");
+        let b1 = conns.open(ip("10.0.0.2")).unwrap();
+        let b2 = conns.open(ip("10.0.0.2")).unwrap();
+        // full: the oldest connection that has not proven itself makes room
+        let c1 = conns.open(ip("10.0.0.3")).unwrap();
+        assert!(b1.close.is_cancelled() && !b2.close.is_cancelled() && !c1.close.is_cancelled());
+        drop(b1); // its task ends: nothing more to count
+        assert_eq!(lock(&conns.inner).conns.len(), 4);
+        assert_eq!(lock(&conns.inner).peers.get(&ip("10.0.0.2")), Some(&1));
+        let _b2 = proven(b2);
+        let _c1 = proven(c1);
+        assert_eq!(conns.open(ip("10.0.0.4")).err(), Some("too many connections"), "every one proved itself");
+    }
+
+    /// Connections that send nothing from several loopback addresses cannot lock local clients
+    /// out: they are one peer, and the oldest of them make room.
+    #[test]
+    fn silent_local_connections_make_room() {
+        let conns = Conns::new(256, 32);
+        let mut silent = Vec::new();
+        for i in 0..8u8 {
+            for _ in 0..32 {
+                if let Ok(s) = conns.open(IpAddr::V4(Ipv4Addr::new(127, 0, 0, 2 + i))) {
+                    silent.push(s);
+                }
+            }
+        }
+        let open = |slots: &[ConnSlot]| slots.iter().filter(|s| !s.close.is_cancelled()).count();
+        assert_eq!((silent.len(), open(&silent), lock(&conns.inner).conns.len()), (256, 32, 32), "one share for this machine, the oldest closed");
+        let client = conns.open(IpAddr::V4(Ipv4Addr::LOCALHOST)).unwrap();
+        assert_eq!(open(&silent), 31, "a silent one made room");
+        assert!(!client.close.is_cancelled());
     }
 
     #[test]
