@@ -1982,6 +1982,70 @@ async fn a_stop_does_not_wait_for_an_export_that_waits_for_the_engine() {
     .await;
 }
 
+/// A stop waits only for the exports it stops: not for a `command_batch` whose ordinary step holds
+/// the engine (here `export.queue.cancel` with `wait`, which waits for a queue encode nothing else
+/// stops; `export.queue.start` with `wait` holds it the same way), which has nothing to delete. An
+/// export started without `wait` that the stop cut short has its partial file deleted as soon as it
+/// has stopped. The stop used to wait for such a batch for its whole grace (15 s), and delete that
+/// file only then: a supervisor that killed the server before (docker stop after 10 s) left it.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_stop_does_not_wait_for_a_batch_step_that_holds_the_engine() {
+    within(async {
+        let dir = crate::TestDir::new("http-batch-holds-engine");
+        let mut srv = Server::start(demo(), HttpOptions::default()).await;
+        let (sid, _) = init(srv.addr, &[]).await;
+        let params = |path: &std::path::Path, seconds: f64| {
+            json!({"path": path.to_string_lossy(), "format": "h264", "width": 640, "height": 360, "audio": false, "range": "custom", "startSeconds": 0, "endSeconds": seconds})
+        };
+        // a queue encode, and a queued item after it: the batch's step cancels that one and waits
+        // for the queue to stop encoding
+        // long enough that it still encodes when the server has ended, on a fast machine too
+        let mut encoding = params(&dir.join("queued.mp4"), 600.0);
+        encoding["start"] = json!(true);
+        let r = tool_json(&call(srv.addr, &sid, 1, "command_run", json!({"id": "export.queue.add", "params": encoding})).await);
+        assert!(r["added"][0].as_u64().is_some(), "{r}");
+        let r = tool_json(&call(srv.addr, &sid, 2, "command_run", json!({"id": "export.queue.add", "params": params(&dir.join("next.mp4"), 1.0)})).await);
+        let next = r["added"][0].as_u64().expect("queued");
+        let queue_job = job_handle(&srv.mcp, 0);
+        // an export without `wait`: the stop cuts it short
+        let background = dir.join("background.mp4");
+        let r = tool_json(&call(srv.addr, &sid, 3, "command_run", json!({"id": "file.exportMedia", "params": params(&background, 600.0)})).await);
+        assert!(r["job"].as_u64().is_some(), "{r}");
+        let t0 = std::time::Instant::now();
+        while !background.exists() {
+            assert!(t0.elapsed() < Duration::from_secs(30), "the export wrote");
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        let steps = json!({"steps": [{"id": "export.queue.cancel", "params": {"id": next, "wait": true}}]});
+        let batch = post(srv.addr, Some(&sid), &[], &json!({"jsonrpc":"2.0","id":4,"method":"tools/call","params":{"name":"command_batch","arguments":steps}})).await;
+        // its step holds the engine
+        let session = srv.mcp.headless_session().unwrap();
+        let held = || matches!(session.try_lock(), Err(std::sync::TryLockError::WouldBlock));
+        while srv.mcp.long_calls.count() == 0 || !held() {
+            assert!(t0.elapsed() < Duration::from_secs(30), "the batch's step took the engine");
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        assert!(held(), "the step still holds the engine");
+        let t0 = std::time::Instant::now();
+        let _ = srv.stop.take().unwrap().send(Stop::Graceful);
+        let stopped = tokio::time::timeout(Duration::from_secs(30), &mut srv.done).await.expect("stopped").unwrap();
+        let took = t0.elapsed();
+        assert!(stopped.is_ok(), "{stopped:?}");
+        assert!(took < Duration::from_secs(5), "the stop waited for the batch's step: {took:?}");
+        assert!(held(), "the step still held the engine when the server ended");
+        assert!(!background.exists(), "the stopped export's partial file is deleted");
+        // done: stop the queue encode, which ends the step
+        queue_job.progress.cancel.store(true, Ordering::Relaxed);
+        while held() {
+            assert!(t0.elapsed() < STOPS_WITHIN, "the batch's step ended");
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        drop(batch);
+    })
+    .await;
+}
+
 /// The engine's job `i` (in the order they started): its cancel flag and result can be read
 /// without the engine's lock, which another call may hold.
 fn job_handle(mcp: &FilmcraftMcp, i: usize) -> filmcraft_engine::Job {

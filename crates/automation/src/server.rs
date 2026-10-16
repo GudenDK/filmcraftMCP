@@ -36,6 +36,17 @@ fn join_error(e: tokio::task::JoinError) -> AutomationError {
     }
 }
 
+/// Stop the reader of a stdio server's input, and wait until it has. Aborting only asks: a reader
+/// being polled on another worker at that moment runs on to its next await, and one that has just
+/// read the end of its input stops the exports there ([`crate::long_job::LongCalls::stop_exports`]).
+/// That must come before the drain that ends the stop, or a later server on a clone of the handler
+/// (tests, embedding) would cancel every export from the start.
+async fn end_reader(reader: tokio::task::JoinHandle<()>) {
+    reader.abort();
+    // cancelled, or it had ended: either way it has stopped
+    let _ = reader.await;
+}
+
 #[derive(Clone)]
 pub struct FilmcraftMcp {
     backend: Arc<Backend>,
@@ -282,10 +293,11 @@ impl FilmcraftMcp {
                 }
             }
             // EOF: the client is done (MCP's stdio shutdown starts by closing the server's input).
-            // Long calls are cancelled at once, as on a stop: rmcp would first wait up to 5 s for
-            // their responses, while their exports went on writing, and a client that then kills
-            // the process would leave their partial files.
-            at_eof.stop();
+            // Exports are cancelled at once, as on a stop: rmcp would first wait up to 5 s for
+            // their responses, while they went on writing, and a client that then kills the
+            // process would leave their partial files. Other calls run on within that wait, a
+            // batch's other steps too: a piped batch of edits and a save is not lost.
+            at_eof.stop_exports();
             // closing the pipe ends the service
             let _ = to_service.shutdown().await;
         });
@@ -313,14 +325,14 @@ impl FilmcraftMcp {
                     // the input ended, or its first message was no `initialize`, before the client
                     // initialized: nothing ran. The input may still be open: its reader must not
                     // stop the calls of a later server on a clone of this handler when it ends.
-                    reader.abort();
+                    end_reader(reader).await;
                     long_calls.drain(tokio::time::Instant::now()).await;
                     return Err(AutomationError::Other(format!("MCP init: {e}")));
                 }
             },
             _ = &mut stop => {
                 // stopped before the client initialized: nothing runs yet
-                reader.abort();
+                end_reader(reader).await;
                 long_calls.drain(tokio::time::Instant::now()).await;
                 return Ok(());
             }
@@ -350,7 +362,7 @@ impl FilmcraftMcp {
                 (tokio::time::timeout_at(deadline, &mut waiting).await.ok(), deadline)
             }
         };
-        reader.abort();
+        end_reader(reader).await;
         let _ = tokio::time::timeout_at(deadline, writer).await;
         long_calls.drain(deadline).await;
         match r {
@@ -513,14 +525,17 @@ impl FilmcraftMcp {
         // The whole batch is one long call: cancelled by its client (`notifications/cancelled`, a
         // 2026-07-28 client closing its stream), by its session closing or by the server stopping,
         // it runs no more steps, also while a step waits for the engine. A step that exports with
-        // `wait: true` is a long call of its own, as from `command_run`.
-        let call = self.begin_long(&context);
+        // `wait: true` is a long call of its own, as from `command_run`: a stdio client closing its
+        // input cancels it (and the batch's later exports), and the batch's other steps run on.
+        let call = self.begin_long(&context, false);
         let mut rep = crate::long_job::Reporter::new(&context);
         for st in p.steps {
             let params = st.params.unwrap_or(json!({}));
             let r = if call.cancelled(&context.ct) {
                 Err(LongError::Cancelled)
             } else if crate::long_job::is_long(&st.id, &params) {
+                // a stop waits for it to clean up, and for no other step
+                call.exports();
                 let r = self.long_call(&call, &st.id, params, &context, &mut rep).await;
                 rep.next_step();
                 // the step is over: what it wrote is not the batch's to delete at a stop
@@ -529,7 +544,6 @@ impl FilmcraftMcp {
             } else {
                 self.batch_step(&call, &st.id, params, &context).await
             };
-            let cancelled = matches!(r, Err(LongError::Cancelled));
             let r = r.map_err(|e| e.to_string());
             match r {
                 Ok(v) => {
@@ -539,8 +553,9 @@ impl FilmcraftMcp {
                 Err(e) => {
                     failed += 1;
                     results.push(json!({"ok": false, "error": e}));
-                    // a cancelled batch (by its client, the server stopping, its session closing) runs no more steps
-                    if stop || cancelled {
+                    // a cancelled batch (by its client, the server stopping, its session closing)
+                    // runs no more steps; one whose export alone was cancelled goes on as asked
+                    if stop || call.cancelled(&context.ct) {
                         break;
                     }
                 }
@@ -1241,6 +1256,102 @@ mod tests {
             let jobs = session.lock().unwrap_or_else(PoisonError::into_inner).execute("jobs.list", json!({})).unwrap();
             assert_eq!(jobs[0]["result"]["error"], "cancelled", "{name}: {jobs}");
         }
+    }
+
+    /// A stdio client that closes its input right after its last request (`filmcraft-cli mcp <
+    /// requests.jsonl`) has its batches run as its `command_run`s are: closing the input stops only
+    /// exports, a batch's export steps too. It used to cancel every batch in flight: none of their
+    /// steps ran, a final `file.saveAs` included, while a `command_run` sent after them ran.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn closing_the_input_runs_a_piped_batch_and_stops_only_its_exports() {
+        use tokio::io::{AsyncBufReadExt, AsyncWriteExt};
+        let dir = crate::TestDir::new("stdio-piped-batch");
+        let (saved, also, export) = (dir.join("saved.fcproj"), dir.join("also.fcproj"), dir.join("never.mp4"));
+        let mcp = FilmcraftMcp::headless(demo());
+        let (session, long_calls) = (mcp.headless_session().unwrap(), mcp.long_calls.clone());
+        let (mut tx, server_in) = tokio::io::duplex(1 << 20);
+        let (server_out, rx) = tokio::io::duplex(1 << 20);
+        let done = tokio::spawn(mcp.serve_io(server_in, server_out));
+        let init = json!({"jsonrpc":"2.0","id":0,"method":"initialize","params":{"protocolVersion":"2025-06-18","capabilities":{},"clientInfo":{"name":"t","version":"1"}}});
+        let initialized = json!({"jsonrpc":"2.0","method":"notifications/initialized"});
+        let batch = |id: u64, args: Value| json!({"jsonrpc":"2.0","id":id,"method":"tools/call","params":{"name":"command_batch","arguments":args}});
+        let edits = json!({"steps": [{"id": "playhead.set", "params": {"seconds": 1.5}}, {"id": "file.saveAs", "params": {"path": saved.to_string_lossy()}}]});
+        let params = json!({"path": export.to_string_lossy(), "format": "h264", "width": 640, "height": 360, "audio": false, "range": "custom", "startSeconds": 0, "endSeconds": 30.0, "wait": true});
+        let with_export = json!({"steps": [{"id": "file.exportMedia", "params": params}, {"id": "file.saveAs", "params": {"path": also.to_string_lossy()}}], "stop_on_error": false});
+        tx.write_all(format!("{init}\n{initialized}\n{}\n{}\n", batch(1, edits), batch(2, with_export)).as_bytes()).await.unwrap();
+        drop(tx);
+        // every reply, until the server ends
+        let mut rx = tokio::io::BufReader::new(rx).lines();
+        let mut replies = std::collections::HashMap::new();
+        while let Some(l) = tokio::time::timeout(std::time::Duration::from_secs(30), rx.next_line()).await.expect("the server ends").unwrap() {
+            let m: Value = serde_json::from_str(&l).unwrap();
+            if let Some(id) = m["id"].as_u64() {
+                replies.insert(id, m);
+            }
+        }
+        let r = tokio::time::timeout(std::time::Duration::from_secs(30), done).await.expect("ended").unwrap();
+        assert!(r.is_ok(), "{r:?}");
+        let result = |id: u64| -> Value {
+            let text = replies.get(&id).and_then(|m| m["result"]["content"][0]["text"].as_str()).unwrap_or_else(|| panic!("no reply {id}: {replies:?}"));
+            serde_json::from_str(text).unwrap()
+        };
+        let edits = result(1);
+        assert_eq!((&edits["completed"], &edits["failed"]), (&json!(2), &json!(0)), "{edits}");
+        assert!(saved.exists(), "the batch's save ran");
+        let mut want = demo();
+        want.execute("playhead.set", json!({"seconds": 1.5})).unwrap();
+        let playhead = |s: &mut Session| s.execute("sequence.inspect", json!({})).unwrap()["playhead"].clone();
+        assert_eq!(playhead(&mut session.lock().unwrap_or_else(PoisonError::into_inner)), playhead(&mut want), "the batch's edit ran");
+        // its export step was cancelled, and the step after it ran (`stop_on_error: false`)
+        let with_export = result(2);
+        assert_eq!(with_export["results"][0]["error"], "cancelled", "{with_export}");
+        assert_eq!((&with_export["results"][1]["ok"], &with_export["completed"]), (&json!(true), &json!(1)), "{with_export}");
+        assert!(also.exists());
+        assert!(!export.exists());
+        let jobs = session.lock().unwrap_or_else(PoisonError::into_inner).execute("jobs.list", json!({})).unwrap();
+        assert!(jobs.as_array().unwrap().iter().all(|j| j["result"]["error"] == "cancelled"), "{jobs}");
+        assert!(!long_calls.is_stopping(), "a later server on the handler starts afresh");
+    }
+
+    /// An input that gives `first`, then holds its reader's thread for `hold` before it ends: input
+    /// that ends while the server fails to initialize, its reader being polled at that moment.
+    struct EndsSlowly {
+        first: Option<Vec<u8>>,
+        hold: std::time::Duration,
+    }
+
+    impl tokio::io::AsyncRead for EndsSlowly {
+        fn poll_read(
+            mut self: std::pin::Pin<&mut Self>,
+            _: &mut std::task::Context<'_>,
+            buf: &mut tokio::io::ReadBuf<'_>,
+        ) -> std::task::Poll<std::io::Result<()>> {
+            match self.first.take() {
+                Some(b) => buf.put_slice(&b),
+                // the end, after a while: the reader is busy until then, aborted or not
+                None => std::thread::sleep(self.hold),
+            }
+            std::task::Poll::Ready(Ok(()))
+        }
+    }
+
+    /// A failed initialization waits for the reader of its input to stop before it resets the
+    /// stop: aborting it only asks, and one being polled at that moment, about to read the end of
+    /// its input, stopped the exports after the reset, so a later server on a clone of the handler
+    /// cancelled every export from the start.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_failed_initialization_waits_for_its_reader_to_stop() {
+        let mcp = FilmcraftMcp::headless(demo());
+        let input = EndsSlowly {
+            first: Some(format!("{}\n", json!({"jsonrpc":"2.0","method":"notifications/initialized"})).into_bytes()),
+            hold: std::time::Duration::from_millis(500),
+        };
+        let (server_out, _rx) = tokio::io::duplex(1 << 20);
+        let r = tokio::time::timeout(std::time::Duration::from_secs(30), mcp.clone().serve_io(input, server_out)).await.expect("fails at once");
+        assert!(r.is_err(), "{r:?}");
+        // the reader would have seen the end by now
+        tokio::time::sleep(std::time::Duration::from_millis(800)).await;
+        assert!(!mcp.long_calls.is_stopping(), "the reader stopped the exports after the server had reset them");
     }
 
     /// A line that is no UTF-8 text gets a parse error (`-32700`, id null), as a line that is no

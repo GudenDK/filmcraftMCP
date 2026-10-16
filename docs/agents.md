@@ -118,8 +118,11 @@ are cancelled and sessions closed, and exports get time to delete their partial 
 `file.exportMedia` or `export.quick` that returned `{job, path}`) as well: still running at the
 stop, they are cancelled and their output deleted; finished ones are kept. An export that finished
 just before the stop reached it is kept too, and one still waiting for the engine (another call
-holds it) gives up at once without starting. The output of an export still running at the end is
-deleted. Other engine jobs (the export queue, proxies, …) are not cancelled; they end with the
+holds it) gives up at once without starting. The server waits only for the exports it stops: a
+call that holds the engine otherwise (`export.queue.start` with `wait`, as a `command_run` or as a
+step of a `command_batch`) is not waited for, and an export the stop cut short has its partial file
+deleted as soon as it has stopped, not at the end of the wait. The output of an export still running at the
+end is deleted. Other engine jobs (the export queue, proxies, …) are not cancelled; they end with the
 process, so cancel a queue export with `jobs.cancel` first if you want its file gone. A second
 signal quits at once.
 Stdio mode (`mcp` without `--http`) stops on the same signals. Signals are watched from before the
@@ -575,7 +578,8 @@ progress and stop it. `export.quick` with `wait: true` runs the same way (its re
 same `{job, path, result, offlineMedia}`, and the batch's progress token reports on through its
 exports (progress only increases). A batch that is cancelled (by its client, by its session closing,
 by a stop) runs no more steps, of any kind; a step still waiting for the engine (another client's
-call holds it) is not run either.
+call holds it) is not run either. A stdio client closing its input cancels only a batch's exports
+(see below): its other steps run, as `command_run`s sent before do.
 
 - The export runs as the same background job `jobs.list` shows. The session is locked only for short
   polls, so other requests (`ping`, `doc_inspect`, `jobs.list`, …) are answered while it encodes.
@@ -595,8 +599,11 @@ call holds it) is not run either.
   reached it is whole, and kept. Over HTTP the progress notifications come on the call's SSE stream,
   and a 2026-07-28 client cancels by closing that stream instead (see
   [HTTP transport](#http-transport)). On stdio, closing the server's input (the first step of MCP's
-  stdio shutdown) cancels a running export at once, as a stop does: wait for an export's result
-  before you close it.
+  stdio shutdown) cancels every export at once, as a stop does: one running, and one that begins
+  after, also as a step of a `command_batch` (that step fails `cancelled`; the batch goes on only
+  with `stop_on_error: false`). Other calls still run, and answer within the 5 s the server waits
+  for them before it exits: a piped batch of edits and a `file.saveAs` takes effect, as the same
+  `command_run`s do. Wait for an export's result before you close the input.
 - Without `wait` the command returns `{job, path}` at once, as before: poll `jobs.list` and stop it
   with `jobs.cancel` (which leaves the partial file). When the MCP server stops (or a stdio client
   closes its input) while such an export runs, it is cancelled and its partial output deleted.
