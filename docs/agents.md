@@ -181,7 +181,9 @@ per-user folder). It is the app's data directory (autosaves, presets; see
   FilmCraft folder made directly under `C:\`, or a `--data-dir` there or on another drive. The
   server then warns at every start; on a PC others use, keep the token in your profile with
   `--data-dir "$env:APPDATA\FilmCraft"` (or move the portable folder into your profile), or use
-  `FILMCRAFT_MCP_TOKEN`.
+  `FILMCRAFT_MCP_TOKEN`. A junction or link from such a folder into your profile (`mklink /J data
+  %APPDATA%\FilmCraft`) does not make the token private: other users may replace the link itself,
+  so the server warns about that too. Give the profile folder itself with `--data-dir`.
 - **Print it.** `filmcraft-cli mcp-token` prints the stored token on stdout (making it if
   needed), for scripts: `--header "Authorization: Bearer $(filmcraft-cli mcp-token)"`. Notes go
   to stderr, so `$(...)` takes only the token. With `FILMCRAFT_MCP_TOKEN` set it still prints the

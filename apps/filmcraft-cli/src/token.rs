@@ -572,26 +572,53 @@ fn privacy_note(windows: bool, outside: bool) -> &'static str {
 /// warning when `path` is outside `profile`. Both are compared as the file system names them where
 /// they exist (an 8.3 short name such as `C:\Users\RUNNER~1`, a junction, a `subst` drive or a
 /// link resolved), else as written; Windows paths: no case, either slash.
+///
+/// A warning too when `path` is in the profile only through a link (a junction, a symbolic link)
+/// that is itself in a folder outside it, such as a portable `data` folder made with
+/// `mklink /J data %APPDATA%\FilmCraft`: whoever may change that folder can put a link to a folder
+/// of theirs in its place, holding a token they know. (A link that is the profile folder as its
+/// variables name it, a profile moved to another drive, is the user's own.)
 fn windows_exposure(path: &Path, profile: &[PathBuf]) -> Option<String> {
-    let p = windows_name(path);
-    let inside = profile.iter().map(|d| windows_name(d)).filter(|d| !d.is_empty()).any(|d| p.strip_prefix(&d).is_some_and(|rest| rest.starts_with('\\')));
-    (!inside).then(|| {
-        format!(
+    let real: Vec<String> = profile.iter().map(|d| windows_name(d)).filter(|d| !d.is_empty()).collect();
+    let written: Vec<String> = profile.iter().map(|d| written_name(&d.to_string_lossy())).filter(|d| !d.is_empty()).collect();
+    if !real.iter().any(|d| is_within(&windows_name(path), d, false)) {
+        return Some(format!(
             "the stored token {} is outside your user profile, so its folder's permissions decide who can read it: other users of this PC may be able to read or replace it. Keep it in your profile with --data-dir \"$env:APPDATA\\FilmCraft\", or set {TOKEN_ENV}",
             path.display()
-        )
-    })
+        ));
+    }
+    let link = path.ancestors().skip(1).filter(|a| !a.as_os_str().is_empty()).find(|a| {
+        std::fs::symlink_metadata(a).is_ok_and(|m| m.file_type().is_symlink())
+            && !written.iter().any(|d| is_within(&written_name(&a.to_string_lossy()), d, true))
+            && a.parent().is_some_and(|folder| !real.iter().any(|d| is_within(&windows_name(folder), d, true)))
+    })?;
+    Some(format!(
+        "the stored token {} is in your user profile only through the link {}, which is in a folder outside it: other users of this PC may be able to put a link to a folder of theirs in its place. Keep it in your profile with --data-dir \"$env:APPDATA\\FilmCraft\" (the folder itself, not a link to it), or set {TOKEN_ENV}",
+        path.display(),
+        link.display()
+    ))
+}
+
+/// Whether Windows path `p` is inside folder `dir`, or is it (`or_same`); both as [`windows_name`]
+/// or [`written_name`] give them.
+fn is_within(p: &str, dir: &str, or_same: bool) -> bool {
+    (or_same && p == dir) || p.strip_prefix(dir).is_some_and(|rest| rest.starts_with('\\'))
 }
 
 /// `p` for comparing Windows paths: as the file system names it when it exists (canonical, without
-/// the `\\?\` prefix that gives), backslashes, no trailing one, lower case.
+/// the `\\?\` prefix that gives), else as written ([`written_name`]).
 fn windows_name(p: &Path) -> String {
     let real = std::fs::canonicalize(p).map(|r| r.to_string_lossy().into_owned()).unwrap_or_else(|_| p.to_string_lossy().into_owned());
     let real = match real.strip_prefix(r"\\?\UNC\") {
         Some(share) => format!(r"\\{share}"),
         None => real.strip_prefix(r"\\?\").map(str::to_string).unwrap_or(real),
     };
-    real.replace('/', "\\").trim_end_matches('\\').to_lowercase()
+    written_name(&real)
+}
+
+/// A Windows path as written, for comparing: backslashes, no trailing one, lower case.
+fn written_name(p: &str) -> String {
+    p.replace('/', "\\").trim_end_matches('\\').to_lowercase()
 }
 
 /// Replace the token stored at `path` with a new random one, in one step: a reader sees the old
@@ -1463,15 +1490,60 @@ mod tests {
     #[test]
     fn the_windows_profile_check_resolves_other_names_for_a_folder() {
         let tmp = TempDir::new("profile-alias");
-        let profile = tmp.0.join("Users").join("Ann");
+        // no link on the way to it (macOS: /var is one)
+        let base = std::fs::canonicalize(&tmp.0).unwrap();
+        let profile = base.join("Users").join("Ann");
         std::fs::create_dir_all(profile.join("AppData")).unwrap();
-        let alias = tmp.0.join("ANN~1");
+        let alias = base.join("ANN~1");
         std::os::unix::fs::symlink(&profile, &alias).unwrap();
-        let token = alias.join("AppData").join(STORED_FILE);
+        let token = profile.join("AppData").join(STORED_FILE);
         std::fs::write(&token, TOKEN).unwrap();
-        assert_eq!(windows_exposure(&token, std::slice::from_ref(&profile)), None, "the same folder by another name");
-        assert_eq!(windows_exposure(&profile.join("AppData").join(STORED_FILE), std::slice::from_ref(&alias)), None);
-        assert!(windows_exposure(&tmp.0.join(STORED_FILE), &[alias]).is_some(), "outside it all the same");
+        assert_eq!(windows_exposure(&token, std::slice::from_ref(&alias)), None, "the profile by another name");
+        assert!(windows_exposure(&base.join(STORED_FILE), &[alias]).is_some(), "outside it all the same");
+    }
+
+    /// A token in the profile only through a link that is itself in a folder outside the profile
+    /// (a portable `data` folder made with `mklink /J data %APPDATA%\FilmCraft`) is warned about:
+    /// whoever may change that folder can put a link to a folder of theirs in its place. The link
+    /// was resolved and the token taken for one in the profile, with no warning, so the first start
+    /// that warned was one that already used their token. A link that is the profile as its
+    /// variables name it (a profile moved to another drive), or one inside the profile, is fine.
+    #[cfg(unix)]
+    #[test]
+    fn a_link_into_the_windows_profile_from_outside_is_warned_about() {
+        let tmp = TempDir::new("profile-link");
+        let base = std::fs::canonicalize(&tmp.0).unwrap();
+        let profile = base.join("Users").join("Ann");
+        let appdata = profile.join("AppData").join("Roaming").join("FilmCraft");
+        std::fs::create_dir_all(&appdata).unwrap();
+        std::fs::write(appdata.join(STORED_FILE), TOKEN).unwrap();
+        // C:\claude\filmcraft\data -> %APPDATA%\FilmCraft
+        let portable = base.join("claude").join("filmcraft");
+        std::fs::create_dir_all(&portable).unwrap();
+        std::os::unix::fs::symlink(&appdata, portable.join("data")).unwrap();
+        let through = portable.join("data").join(STORED_FILE);
+        let w = windows_exposure(&through, std::slice::from_ref(&profile)).expect("a link from outside the profile");
+        assert!(w.contains(&format!("through the link {}", portable.join("data").display())) && w.contains("--data-dir") && !w.contains(TOKEN), "{w}");
+        assert_eq!(windows_exposure(&appdata.join(STORED_FILE), std::slice::from_ref(&profile)), None, "the folder itself");
+        // a profile moved elsewhere: C:\Users\Ann is a link to D:\Users\Ann, and the profile's
+        // variables name it C:\Users\Ann
+        let moved = base.join("D").join("Ann");
+        std::fs::create_dir_all(moved.join("AppData")).unwrap();
+        std::fs::create_dir_all(base.join("C")).unwrap();
+        let named = base.join("C").join("Ann");
+        std::os::unix::fs::symlink(&moved, &named).unwrap();
+        std::fs::write(moved.join("AppData").join(STORED_FILE), TOKEN).unwrap();
+        assert_eq!(windows_exposure(&named.join("AppData").join(STORED_FILE), std::slice::from_ref(&named)), None);
+        // a link inside the profile, to a folder in it
+        std::os::unix::fs::symlink(profile.join("AppData"), profile.join("Short")).unwrap();
+        std::fs::write(profile.join("AppData").join(STORED_FILE), TOKEN).unwrap();
+        assert_eq!(windows_exposure(&profile.join("Short").join(STORED_FILE), std::slice::from_ref(&profile)), None);
+        // to a folder outside it: outside
+        std::os::unix::fs::symlink(&portable, profile.join("Out")).unwrap();
+        std::fs::write(portable.join(STORED_FILE), TOKEN).unwrap();
+        assert!(
+            windows_exposure(&profile.join("Out").join(STORED_FILE), std::slice::from_ref(&profile)).is_some_and(|w| w.contains("outside your user profile"))
+        );
     }
 
     /// The server says who can read a token it just stored: on unix only you (mode 600); on
