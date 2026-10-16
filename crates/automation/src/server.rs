@@ -234,9 +234,9 @@ impl FilmcraftMcp {
         self.serve_io_until(tokio::io::stdin(), tokio::io::stdout(), stop).await
     }
 
-    /// Serve MCP over any line stream. A line that isn't JSON gets a JSON-RPC parse error
-    /// (`-32700`, id null) instead of being dropped silently; the rest go to the rmcp service. One
-    /// writer task owns `output`, so replies never interleave.
+    /// Serve MCP over any line stream. A line that isn't JSON (or isn't UTF-8 text) gets a JSON-RPC
+    /// parse error (`-32700`, id null) instead of being dropped silently; the rest go to the rmcp
+    /// service. One writer task owns `output`, so replies never interleave.
     pub async fn serve_io(
         self,
         input: impl tokio::io::AsyncRead + Unpin + Send + 'static,
@@ -259,13 +259,18 @@ impl FilmcraftMcp {
         let (err_tx, mut err_rx) = tokio::sync::mpsc::unbounded_channel::<String>();
         let at_eof = self.long_calls.clone();
         let reader = tokio::spawn(async move {
-            let mut lines = BufReader::new(input).lines();
-            while let Ok(Some(line)) = lines.next_line().await {
-                if line.trim().is_empty() {
+            let mut input = BufReader::new(input);
+            let mut bytes = Vec::new();
+            // until the input ends (or cannot be read): a line that is no UTF-8 text is a parse
+            // error like any other, not the end (it used to end the server, cancelling its exports)
+            while input.read_until(b'\n', &mut bytes).await.is_ok_and(|n| n > 0) {
+                let raw = std::mem::take(&mut bytes);
+                if raw.iter().all(u8::is_ascii_whitespace) {
                     continue;
                 }
-                match serde_json::from_str::<Value>(&line) {
-                    Ok(_) => {
+                let line = std::str::from_utf8(&raw).map(|l| l.trim_end_matches(['\n', '\r'])).map_err(|_| "the line is not UTF-8 text".to_string());
+                match line.and_then(|l| serde_json::from_str::<Value>(l).map(|_| l).map_err(|e| e.to_string())) {
+                    Ok(line) => {
                         if to_service.write_all(format!("{line}\n").as_bytes()).await.is_err() {
                             break;
                         }
@@ -1231,6 +1236,64 @@ mod tests {
             let jobs = session.lock().unwrap_or_else(PoisonError::into_inner).execute("jobs.list", json!({})).unwrap();
             assert_eq!(jobs[0]["result"]["error"], "cancelled", "{name}: {jobs}");
         }
+    }
+
+    /// A line that is no UTF-8 text gets a parse error (`-32700`, id null), as a line that is no
+    /// JSON does, and the server goes on: the pings around it are answered and a running export
+    /// goes on. It used to end the input there, as if the client had closed it: the server
+    /// stopped, cancelling the export and deleting its file.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_line_that_is_not_utf8_gets_a_parse_error() {
+        use tokio::io::{AsyncBufReadExt, AsyncWriteExt};
+        let dir = crate::TestDir::new("stdio-not-utf8");
+        let out = dir.join("goes-on.mp4");
+        let (mut tx, server_in) = tokio::io::duplex(1 << 22);
+        let (server_out, rx) = tokio::io::duplex(1 << 22);
+        let mcp = FilmcraftMcp::headless(demo());
+        let (session, long_calls) = (mcp.headless_session().unwrap(), mcp.long_calls.clone());
+        let done = tokio::spawn(mcp.serve_io(server_in, server_out));
+        let mut rx = tokio::io::BufReader::new(rx).lines();
+        let mut next = async || -> Value {
+            let line = tokio::time::timeout(std::time::Duration::from_secs(30), rx.next_line()).await.expect("a message in time").unwrap();
+            serde_json::from_str(&line.expect("the server goes on")).unwrap()
+        };
+        let init = json!({"jsonrpc":"2.0","id":0,"method":"initialize","params":{"protocolVersion":"2025-06-18","capabilities":{},"clientInfo":{"name":"t","version":"1"}}});
+        tx.write_all(format!("{init}\n{}\n", json!({"jsonrpc":"2.0","method":"notifications/initialized"})).as_bytes()).await.unwrap();
+        assert_eq!(next().await["id"], 0);
+        let params = json!({"path": out.to_string_lossy(), "format": "h264", "width": 640, "height": 360, "audio": false, "range": "custom", "startSeconds": 0, "endSeconds": 30.0, "wait": true});
+        let call = json!({"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"command_run","arguments":{"id":"file.exportMedia","params":params},"_meta":{"progressToken":"p"}}});
+        tx.write_all(format!("{call}\n").as_bytes()).await.unwrap();
+        while next().await["method"] != "notifications/progress" {}
+        let ping = |id: u64| format!("{}\n", json!({"jsonrpc":"2.0","id":id,"method":"ping"}));
+        tx.write_all(&[ping(2).as_bytes(), b"\xff\xfe not text \xc3\x28\r\n", ping(3).as_bytes()].concat()).await.unwrap();
+        // the parse error and the service's replies come through different channels: any order
+        let (mut pongs, mut parse_errors) = (Vec::new(), 0);
+        while pongs.len() < 2 || parse_errors < 1 {
+            let m = next().await;
+            assert_ne!(m["id"], 1, "the export ended: {m}");
+            if m["error"]["code"] == -32700 {
+                assert!(m["id"].is_null() && m["error"]["message"].as_str().is_some_and(|e| e.contains("not UTF-8")), "{m}");
+                parse_errors += 1;
+            } else if m["result"].is_object() {
+                pongs.extend(m["id"].as_u64());
+            }
+        }
+        pongs.sort_unstable();
+        assert_eq!(pongs, [2, 3]);
+        let job = session.lock().unwrap_or_else(PoisonError::into_inner).jobs.first().cloned().unwrap();
+        assert!(!job.progress.cancel.load(std::sync::atomic::Ordering::Relaxed) && !long_calls.is_stopping(), "the export goes on");
+        assert_eq!(long_calls.count(), 1);
+        // done with it: cancel it, and close the input
+        tx.write_all(b"{\"jsonrpc\":\"2.0\",\"method\":\"notifications/cancelled\",\"params\":{\"requestId\":1}}\n").await.unwrap();
+        let t0 = std::time::Instant::now();
+        while long_calls.count() > 0 {
+            assert!(t0.elapsed() < std::time::Duration::from_secs(30), "the cancelled export stopped");
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+        assert!(!out.exists());
+        drop(tx);
+        let r = tokio::time::timeout(std::time::Duration::from_secs(30), done).await.expect("ended").unwrap();
+        assert!(r.is_ok(), "{r:?}");
     }
 
     /// A hurried stop (Windows kills the process about 5 s after its console closes) keeps to its

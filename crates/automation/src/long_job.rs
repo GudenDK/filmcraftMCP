@@ -105,6 +105,12 @@ impl LongCalls {
         self.running.lock().unwrap_or_else(PoisonError::into_inner)
     }
 
+    /// Whether the server is stopping: long calls that begin now are cancelled from the start.
+    #[cfg(test)]
+    pub(crate) fn is_stopping(&self) -> bool {
+        self.lock().stopping
+    }
+
     /// Counts one long call, of HTTP session `session` if any, for as long as the returned guard
     /// lives. It is cancelled from the start when the server is stopping or its session was
     /// closed already.

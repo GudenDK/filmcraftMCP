@@ -558,9 +558,9 @@ driven one app can drive the others.
   accepted ones (`unknown argument "filtr" for command_list; expected: enabled_only, filter`), not a
   silently ignored key. `command_run.params` goes to the command unchanged.
 - **Errors.** A failing command is an `isError` result with the engine's message. A line that is not
-  JSON gets a `-32700` parse error (id `null`) and the server keeps serving (over HTTP: a body that
-  is not JSON, with HTTP status 400). A command that panics is reported as `internal error: …`, and
-  the session stays usable.
+  JSON (or not UTF-8 text) gets a `-32700` parse error (id `null`) and the server keeps serving
+  (over HTTP: a body that is not JSON, with HTTP status 400). A command that panics is reported as
+  `internal error: …`, and the session stays usable.
 - **Resources.** `filmcraft://document` (the project tree and active sequence, as `doc_inspect`) and
   `filmcraft://commands` (the command catalog, as `command_list`), both `application/json`. For MCP
   2026-07-28 clients such as current Claude Code, list and read results carry the `ttlMs` and
