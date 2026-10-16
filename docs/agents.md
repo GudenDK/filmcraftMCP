@@ -120,11 +120,12 @@ stop, they are cancelled and their output deleted; finished ones are kept. An ex
 just before the stop reached it is kept too, and one still waiting for the engine (another call
 holds it) gives up at once without starting. The server waits only for the exports it stops: a
 call that holds the engine otherwise (`export.queue.start` with `wait`, as a `command_run` or as a
-step of a `command_batch`) is not waited for, and an export the stop cut short has its partial file
-deleted as soon as it has stopped, not at the end of the wait. The output of an export still running at the
-end is deleted. Other engine jobs (the export queue, proxies, …) are not cancelled; they end with the
-process, so cancel a queue export with `jobs.cancel` first if you want its file gone. A second
-signal quits at once.
+step of a `command_batch`) is not waited for, except that stdio mode gives every call in flight up
+to 2 s to answer (5 s once its client has closed the input) before it ends. An export the stop cut
+short has its partial file deleted as soon as it has stopped, within a fraction of a second, not at
+the end of any of these waits. The output of an export still running at the end is deleted. Other
+engine jobs (the export queue, proxies, …) are not cancelled; they end with the process, so cancel
+a queue export with `jobs.cancel` first if you want its file gone. A second signal quits at once.
 Stdio mode (`mcp` without `--http`) stops on the same signals. Signals are watched from before the
 first line is printed, so one sent right after it still stops the server cleanly. On Linux a
 server started with `nohup` (SIGHUP ignored) keeps running when its terminal closes; macOS gives no
@@ -606,7 +607,8 @@ call holds it) is not run either. A stdio client closing its input cancels only 
   `command_run`s do. Wait for an export's result before you close the input.
 - Without `wait` the command returns `{job, path}` at once, as before: poll `jobs.list` and stop it
   with `jobs.cancel` (which leaves the partial file). When the MCP server stops (or a stdio client
-  closes its input) while such an export runs, it is cancelled and its partial output deleted.
+  closes its input) while such an export runs, it is cancelled and its partial output deleted as
+  soon as it has stopped, also while the server still waits for other calls.
   Other exports (`file.exportFrame`, interchange formats, …) finish quickly and ignore the token.
 - The export queue is not a long call: `export.queue.start` (and `export.queue.add` or
   `export.queue.retry` with `start`) with `wait: true` encodes the whole queue holding the engine,

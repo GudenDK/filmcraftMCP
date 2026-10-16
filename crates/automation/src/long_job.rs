@@ -27,6 +27,10 @@ pub const LONG_COMMANDS: &[&str] = &["file.exportMedia", "export.quick"];
 /// How often the job is polled (and at most how often progress is reported).
 const POLL: Duration = Duration::from_millis(100);
 
+/// How often the exports a stop cancelled are looked at, to delete what they wrote once they have
+/// ended ([`LongCalls::reap`]).
+const REAP_EVERY: Duration = Duration::from_millis(50);
+
 /// How many closed sessions [`LongCalls`] remembers (see [`LongCalls::cancel_session`]).
 const CLOSED_KEPT: usize = 1024;
 
@@ -174,17 +178,19 @@ impl LongCalls {
     /// cancels it if it still runs then, and deletes what it wrote. Once the server is stopping,
     /// one that begins is cancelled at once.
     pub(crate) fn background(&self, job: filmcraft_engine::Job, path: &str, since: SystemTime) {
-        let mut running = self.lock();
-        // the finished ones need nothing more
-        running.background.retain(|b| !job_finished(&b.job));
-        if job_finished(&job) {
-            return;
-        }
-        let stopped = running.stopping || running.exports_stopping;
-        if stopped {
-            job.progress.cancel.store(true, Ordering::Relaxed);
-        }
-        running.background.push(Background { job, output: Output { path: path.to_string(), since, job: None }, stopped });
+        let ended = {
+            let mut running = self.lock();
+            let ended = take_ended(&mut running);
+            if !job_finished(&job) {
+                let stopped = running.stopping || running.exports_stopping;
+                if stopped {
+                    job.progress.cancel.store(true, Ordering::Relaxed);
+                }
+                running.background.push(Background { job, output: Output { path: path.to_string(), since, job: None }, stopped });
+            }
+            ended
+        };
+        remove_cut(ended);
     }
 
     /// The server is stopping: cancel every long call now, and those that begin until
@@ -192,12 +198,15 @@ impl LongCalls {
     /// their session, after waiting up to 5 s for their responses. Exports started without `wait`
     /// that still run are cancelled too.
     pub(crate) fn stop(&self) {
-        let mut running = self.lock();
-        running.stopping = true;
-        for c in running.calls.values() {
-            c.cancel.cancel();
-        }
-        stop_background(&mut running);
+        let ended = {
+            let mut running = self.lock();
+            running.stopping = true;
+            for c in running.calls.values() {
+                c.cancel.cancel();
+            }
+            stop_background(&mut running)
+        };
+        remove_cut(ended);
     }
 
     /// A stdio client closed its input: cancel every export now (long calls, the steps of batches
@@ -205,42 +214,69 @@ impl LongCalls {
     /// ends, as a stop does. Other calls, and the other steps of a batch, run on as rmcp lets them
     /// (it waits up to 5 s for their responses), as `command_run`s sent before the input closed do.
     pub(crate) fn stop_exports(&self) {
-        let mut running = self.lock();
-        running.exports_stopping = true;
-        for c in running.calls.values() {
-            c.export.cancel();
+        let ended = {
+            let mut running = self.lock();
+            running.exports_stopping = true;
+            for c in running.calls.values() {
+                c.export.cancel();
+            }
+            stop_background(&mut running)
+        };
+        remove_cut(ended);
+    }
+
+    /// Forget the exports started without `wait` that have ended, deleting what those a stop cut
+    /// short wrote. Every path that forgets one ([`Self::background`], the stops, the drain) does it
+    /// so ([`take_ended`], then [`remove_cut`]): the stop that follows a closed stdio input, or an
+    /// export that begins during a stop, used to forget one that had stopped meanwhile without
+    /// deleting its partial file.
+    pub(crate) fn reap(&self) {
+        let ended = take_ended(&mut self.lock());
+        remove_cut(ended);
+    }
+
+    /// [`Self::reap`] every [`REAP_EVERY`], for as long as it is polled.
+    pub(crate) async fn reaping(&self) -> std::convert::Infallible {
+        loop {
+            self.reap();
+            tokio::time::sleep(REAP_EVERY).await;
         }
-        stop_background(&mut running);
+    }
+
+    /// `f`, meanwhile deleting what each export a stop cut short wrote as soon as it has stopped
+    /// ([`Self::reaping`]): before the drain, rmcp waits up to 2 s (a signal) or 5 s (a closed
+    /// stdio input) for the calls in flight, and a client or supervisor may kill the process
+    /// within that wait.
+    pub(crate) async fn reap_during<F: Future>(&self, f: F) -> F::Output {
+        tokio::select! {
+            r = f => r,
+            n = self.reaping() => match n {},
+        }
     }
 
     /// Wait until no call has an export to clean up and every export the stop cancelled has ended,
     /// or `deadline` passes; what an export the stop cut short wrote is deleted as soon as it has
-    /// ended, so that a supervisor that kills the process before the grace is over (docker stop
-    /// after 10 s, a second Ctrl+C) finds no partial file. Then delete the partial output of the
-    /// exports still running: the process is about to exit, and an export it stops leaves a
-    /// truncated file. One that finished anyway, its last frames written before the stop reached
-    /// it, is whole: kept. The calls must have been cancelled already ([`Self::stop`]).
+    /// ended ([`Self::reap`], as [`Self::reap_during`] does before the drain), so that a supervisor
+    /// that kills the process before the grace is over (docker stop after 10 s, a second Ctrl+C)
+    /// finds no partial file. Then delete the partial output of the exports still running: the
+    /// process is about to exit, and an export it stops leaves a truncated file. One that finished
+    /// anyway, its last frames written before the stop reached it, is whole: kept. The calls must
+    /// have been cancelled already ([`Self::stop`]).
     ///
     /// A batch is waited for only while a step of it exports: another step may hold the engine for
     /// long (`export.queue.start` with `wait`), and has nothing to delete. It used to keep the stop
     /// waiting for its whole grace, as the same command from `command_run` never did.
     pub(crate) async fn drain(&self, deadline: tokio::time::Instant) {
         loop {
-            let (busy, ended) = {
-                let mut running = self.lock();
-                let (ended, going): (Vec<Background>, Vec<Background>) =
-                    std::mem::take(&mut running.background).into_iter().partition(|b| job_finished(&b.job));
-                running.background = going;
-                let busy = running.calls.values().any(|c| c.exporting) || running.background.iter().any(|b| b.stopped);
-                (busy, ended)
+            self.reap();
+            let busy = {
+                let running = self.lock();
+                running.calls.values().any(|c| c.exporting) || running.background.iter().any(|b| b.stopped)
             };
-            for b in ended.iter().filter(|b| b.cut()) {
-                remove_partial(&b.output.path, b.output.since);
-            }
             if !busy || tokio::time::Instant::now() >= deadline {
                 break;
             }
-            tokio::time::sleep(Duration::from_millis(50)).await;
+            tokio::time::sleep(REAP_EVERY).await;
         }
         let left: Vec<Output> = {
             let mut running = self.lock();
@@ -258,12 +294,32 @@ impl LongCalls {
     }
 }
 
-/// Cancel the exports started without `wait` that still run, and forget those that have ended.
-fn stop_background(running: &mut Running) {
-    running.background.retain(|b| !job_finished(&b.job));
+/// Cancel the exports started without `wait` that still run, and take out those that have ended:
+/// the caller deletes what the cut ones wrote ([`remove_cut`]), once it has let go of the lock.
+fn stop_background(running: &mut Running) -> Vec<Background> {
+    let ended = take_ended(running);
     for b in &mut running.background {
         b.job.progress.cancel.store(true, Ordering::Relaxed);
         b.stopped = true;
+    }
+    ended
+}
+
+/// Take the exports started without `wait` that have ended out of `running`. Only these are ever
+/// forgotten, and [`remove_cut`] must see them: one a stop cancelled has its partial file still on
+/// disk.
+fn take_ended(running: &mut Running) -> Vec<Background> {
+    let (ended, going): (Vec<Background>, Vec<Background>) = std::mem::take(&mut running.background).into_iter().partition(|b| job_finished(&b.job));
+    running.background = going;
+    ended
+}
+
+/// Delete what the exports of `ended` that a stop cut short wrote. One that finished anyway is
+/// whole, and one that ended before any stop (finished, failed, or cancelled with `jobs.cancel`,
+/// which leaves its file) is not the server's to delete.
+fn remove_cut(ended: Vec<Background>) {
+    for b in ended.iter().filter(|b| b.cut()) {
+        remove_partial(&b.output.path, b.output.since);
     }
 }
 
@@ -861,6 +917,83 @@ mod tests {
         drop(slow);
         tokio::time::timeout(Duration::from_secs(5), drain).await.expect("the wait ends with the last export").unwrap();
         assert!(calls.lock().background.is_empty());
+    }
+
+    /// An export started without `wait` that a stop cut short, and that has ended by the time the
+    /// next stop call (or another such export) comes, has its partial file deleted all the same.
+    /// Both forgot it unseen: a stdio client closing its input stops the exports at once, and the
+    /// stop proper comes only after rmcp's wait of up to 5 s for the calls in flight, while the
+    /// cancelled export ends within a batch, so its truncated file stayed after a clean exit.
+    #[test]
+    fn an_export_cut_short_that_ended_between_two_stops_is_deleted() {
+        let dir = crate::TestDir::new("long-background-ended");
+        let job = |id| filmcraft_engine::Job { id, label: "export".into(), progress: Default::default(), result: Default::default() };
+        let cancelled = |j: &filmcraft_engine::Job| *j.result.lock().unwrap() = Some(Err("cancelled".into()));
+        let drained = |calls: &LongCalls| futures_util::FutureExt::now_or_never(calls.drain(tokio::time::Instant::now())).expect("nothing to wait for");
+        let file = |name: &str| {
+            let p = dir.join(name);
+            std::fs::write(&p, b"partial").unwrap();
+            p
+        };
+        let calls = Arc::new(LongCalls::default());
+        // the input closes, the export stops, then the server does
+        let (eof, at_eof) = (file("eof.mp4"), job(1));
+        calls.background(at_eof.clone(), &eof.to_string_lossy(), SystemTime::now());
+        calls.stop_exports();
+        cancelled(&at_eof);
+        calls.stop();
+        drained(&calls);
+        assert!(!eof.exists(), "the export the closed input cut short is deleted");
+        // another export begins during a stop, after the first one stopped
+        let (first, during) = (file("first.mp4"), file("during.mp4"));
+        let (a, b) = (job(2), job(3));
+        calls.background(a.clone(), &first.to_string_lossy(), SystemTime::now());
+        calls.stop();
+        cancelled(&a);
+        calls.background(b.clone(), &during.to_string_lossy(), SystemTime::now());
+        assert!(b.progress.cancel.load(Ordering::Relaxed), "cancelled as it begins");
+        cancelled(&b);
+        drained(&calls);
+        assert!(!first.exists() && !during.exists(), "both cut short, both deleted");
+        // one that was whole when it ended, and one that ended before any stop, are kept
+        let (whole, before) = (file("whole.mp4"), file("before.mp4"));
+        let (c, d) = (job(4), job(5));
+        calls.background(d.clone(), &before.to_string_lossy(), SystemTime::now());
+        cancelled(&d); // as `jobs.cancel` does: its file is the client's
+        calls.background(c.clone(), &whole.to_string_lossy(), SystemTime::now());
+        calls.stop_exports();
+        let report = finished_job(4, Ok(())).result.lock().unwrap().take();
+        *c.result.lock().unwrap() = report;
+        calls.stop();
+        drained(&calls);
+        assert!(whole.exists() && before.exists());
+        assert!(calls.lock().background.is_empty());
+    }
+
+    /// While a stop waits for something else (rmcp's wait for the calls in flight comes before the
+    /// drain), what an export the stop cut short wrote goes as soon as it has ended.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn reaping_deletes_an_export_cut_short_while_the_stop_waits() {
+        let dir = crate::TestDir::new("long-reap-during");
+        let calls = Arc::new(LongCalls::default());
+        let job = filmcraft_engine::Job { id: 1, label: "export".into(), progress: Default::default(), result: Default::default() };
+        let out = dir.join("background.mp4");
+        std::fs::write(&out, b"partial").unwrap();
+        calls.background(job.clone(), &out.to_string_lossy(), SystemTime::now());
+        calls.stop_exports();
+        let ended = async {
+            tokio::time::sleep(Duration::from_millis(100)).await;
+            *job.result.lock().unwrap() = Some(Err("cancelled".into()));
+        };
+        let gone = async {
+            while out.exists() {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        };
+        // what the stop waits for meanwhile: it ends only once the file is gone
+        let waited = calls.reap_during(async { tokio::join!(ended, gone) });
+        tokio::time::timeout(Duration::from_secs(10), waited).await.expect("deleted while the stop waited");
+        assert!(calls.lock().background.is_empty(), "and forgotten");
     }
 
     /// An export started without `wait` that still runs at the stop is cancelled, waited for and

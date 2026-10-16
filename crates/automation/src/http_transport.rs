@@ -664,7 +664,8 @@ async fn wind_down(gate: &gate::Gate, long_calls: &crate::long_job::LongCalls, c
     let close_all = futures_util::future::join_all(ids.iter().map(|id| async move {
         let _ = gate.rmcp_sessions.close_session(&id.as_str().into()).await;
     }));
-    let _ = tokio::time::timeout_at(deadline, close_all).await;
+    // closing a session may wait for its calls in flight: exports cut short go meanwhile
+    let _ = long_calls.reap_during(tokio::time::timeout_at(deadline, close_all)).await;
     long_calls.drain(deadline).await;
     let _ = tokio::time::timeout_at(deadline, conns.all_closed()).await;
 }

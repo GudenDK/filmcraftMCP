@@ -269,6 +269,9 @@ impl FilmcraftMcp {
         let (service_out, from_service) = tokio::io::duplex(1 << 20);
         let (err_tx, mut err_rx) = tokio::sync::mpsc::unbounded_channel::<String>();
         let at_eof = self.long_calls.clone();
+        // cancelled once the reader has seen the end of the input, and stopped the exports
+        let eof = tokio_util::sync::CancellationToken::new();
+        let input_ended = eof.clone();
         let reader = tokio::spawn(async move {
             let mut input = BufReader::new(input);
             let mut bytes = Vec::new();
@@ -298,6 +301,7 @@ impl FilmcraftMcp {
             // process would leave their partial files. Other calls run on within that wait, a
             // batch's other steps too: a piped batch of edits and a save is not lost.
             at_eof.stop_exports();
+            input_ended.cancel();
             // closing the pipe ends the service
             let _ = to_service.shutdown().await;
         });
@@ -344,14 +348,18 @@ impl FilmcraftMcp {
         let stopped: Result<Stop, _> = tokio::select! {
             r = &mut waiting => Err(r),
             s = &mut stop => Ok(s),
+            // The input ended, and its reader stopped the exports: rmcp now waits up to 5 s for
+            // the calls in flight before it ends. What an export cut short wrote goes meanwhile,
+            // as soon as it has stopped, not after that wait (a client that then kills the server
+            // left it, or the stop that follows forgot it).
+            n = async { eof.cancelled().await; long_calls.reaping().await } => match n {},
         };
         // One deadline for everything that follows, from the moment the stop came (or the input
         // ended): a hurried stop must be over before the process is killed, however long rmcp
         // waits for handlers that do not finish.
         let (r, deadline) = match stopped {
             Err(r) => {
-                // the input ended (the calls were cancelled then); exports started without `wait`
-                // would be cut off at exit
+                // the input ended (its exports were cancelled then): stop what rmcp gave up on
                 long_calls.stop();
                 (Some(r), crate::http_transport::deadline_after(Stop::Graceful.grace()))
             }
@@ -359,11 +367,16 @@ impl FilmcraftMcp {
                 let deadline = crate::http_transport::deadline_after(how.grace());
                 long_calls.stop();
                 quit.cancel();
-                (tokio::time::timeout_at(deadline, &mut waiting).await.ok(), deadline)
+                // rmcp waits up to 2 s for the calls in flight: exports cut short go meanwhile
+                (long_calls.reap_during(tokio::time::timeout_at(deadline, &mut waiting)).await.ok(), deadline)
             }
         };
-        end_reader(reader).await;
-        let _ = tokio::time::timeout_at(deadline, writer).await;
+        long_calls
+            .reap_during(async {
+                end_reader(reader).await;
+                let _ = tokio::time::timeout_at(deadline, writer).await;
+            })
+            .await;
         long_calls.drain(deadline).await;
         match r {
             Some(r) => r.map(|_| ()).map_err(|e| AutomationError::Other(e.to_string())),
@@ -1253,6 +1266,86 @@ mod tests {
             let r = tokio::time::timeout(std::time::Duration::from_secs(30), done).await.expect("stopped in time").unwrap();
             assert!(r.is_ok(), "{r:?}");
             assert!(!out.exists(), "{name}: the partial export is deleted");
+            let jobs = session.lock().unwrap_or_else(PoisonError::into_inner).execute("jobs.list", json!({})).unwrap();
+            assert_eq!(jobs[0]["result"]["error"], "cancelled", "{name}: {jobs}");
+        }
+    }
+
+    /// A stdio server that stops while a call holds the engine (as `export.queue.start` with `wait`
+    /// does) deletes the partial file of an export started without `wait` as soon as that export
+    /// has stopped, while rmcp still waits for the call: up to 5 s once the client closed the
+    /// input, up to 2 s after a signal. After a closed input the stop that followed the wait
+    /// forgot the export, which had stopped meanwhile, and its truncated file stayed after a clean
+    /// exit; after a signal the file went only once the wait was over, so a client that killed the
+    /// server within it (MCP's stdio shutdown: close the input, then SIGTERM, then SIGKILL) left it.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_cut_export_is_deleted_while_the_server_waits_for_a_call_in_flight() {
+        use std::time::Duration;
+        use tokio::io::{AsyncBufReadExt, AsyncWriteExt};
+        // how long the call holds the engine: past rmcp's wait after a signal, within the one after
+        // a closed input
+        const HOLD: Duration = Duration::from_secs(4);
+        let dir = crate::TestDir::new("stdio-cut-background");
+        for (name, by_signal) in [("eof.mp4", false), ("signal.mp4", true)] {
+            let out = dir.join(name);
+            let (mut tx, server_in) = tokio::io::duplex(1 << 22);
+            let (server_out, rx) = tokio::io::duplex(1 << 22);
+            let (stop, stop_rx) = tokio::sync::oneshot::channel::<Stop>();
+            let mcp = FilmcraftMcp::headless(demo());
+            let session = mcp.headless_session().unwrap();
+            let done = tokio::spawn(mcp.serve_io_until(server_in, server_out, async move { stop_rx.await.unwrap_or(Stop::Graceful) }));
+            let mut rx = tokio::io::BufReader::new(rx).lines();
+            let mut next = async || -> Value {
+                let line = tokio::time::timeout(Duration::from_secs(30), rx.next_line()).await.expect("a message in time").unwrap();
+                serde_json::from_str(&line.expect("the server goes on")).unwrap()
+            };
+            let init = json!({"jsonrpc":"2.0","id":0,"method":"initialize","params":{"protocolVersion":"2025-06-18","capabilities":{},"clientInfo":{"name":"t","version":"1"}}});
+            tx.write_all(format!("{init}\n{}\n", json!({"jsonrpc":"2.0","method":"notifications/initialized"})).as_bytes()).await.unwrap();
+            assert_eq!(next().await["id"], 0);
+            // an export without `wait`: it goes on as a job once its call has returned
+            let params = json!({"path": out.to_string_lossy(), "format": "h264", "width": 640, "height": 360, "audio": false, "range": "custom", "startSeconds": 0, "endSeconds": 30.0});
+            let run = |id: u64, cmd: &str, params: Value| json!({"jsonrpc":"2.0","id":id,"method":"tools/call","params":{"name":"command_run","arguments":{"id":cmd,"params":params}}});
+            tx.write_all(format!("{}\n", run(1, "file.exportMedia", params)).as_bytes()).await.unwrap();
+            let started = next().await;
+            assert_eq!((&started["id"], &started["result"]["isError"]), (&json!(1), &json!(false)), "{started}");
+            let t0 = std::time::Instant::now();
+            while !out.exists() {
+                assert!(t0.elapsed() < Duration::from_secs(30), "{name}: the export writes its file");
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+            // a call in flight that holds the engine
+            let (locked, is_locked) = std::sync::mpsc::channel();
+            let hog = {
+                let session = session.clone();
+                std::thread::spawn(move || {
+                    let _busy = session.lock().unwrap_or_else(PoisonError::into_inner);
+                    let _ = locked.send(());
+                    std::thread::sleep(HOLD);
+                })
+            };
+            is_locked.recv().unwrap();
+            let ping = json!({"jsonrpc":"2.0","id":3,"method":"ping"});
+            tx.write_all(format!("{}\n{ping}\n", run(2, "sequence.inspect", json!({}))).as_bytes()).await.unwrap();
+            // rmcp has taken the call once the ping after it is answered
+            assert_eq!(next().await["id"], 3);
+            let t0 = std::time::Instant::now();
+            if by_signal {
+                let _ = stop.send(Stop::Graceful);
+            } else {
+                drop(tx);
+            }
+            // the export stops at once, and its partial file goes as soon as it has stopped
+            while out.exists() {
+                assert!(t0.elapsed() < Duration::from_millis(1600), "{name}: the stopped export's partial file is still there");
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+            if !by_signal {
+                assert!(!done.is_finished(), "rmcp still waits for the call in flight");
+            }
+            let r = tokio::time::timeout(Duration::from_secs(30), done).await.expect("stopped in time").unwrap();
+            assert!(r.is_ok(), "{r:?}");
+            assert!(!out.exists(), "{name}: the partial export stays deleted");
+            hog.join().unwrap();
             let jobs = session.lock().unwrap_or_else(PoisonError::into_inner).execute("jobs.list", json!({})).unwrap();
             assert_eq!(jobs[0]["result"]["error"], "cancelled", "{name}: {jobs}");
         }
