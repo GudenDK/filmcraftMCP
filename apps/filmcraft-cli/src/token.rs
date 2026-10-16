@@ -576,8 +576,11 @@ fn privacy_note(windows: bool, outside: bool) -> &'static str {
 /// A warning too when `path` is in the profile only through a link (a junction, a symbolic link)
 /// that is itself in a folder outside it, such as a portable `data` folder made with
 /// `mklink /J data %APPDATA%\FilmCraft`: whoever may change that folder can put a link to a folder
-/// of theirs in its place, holding a token they know. (A link that is the profile folder as its
-/// variables name it, a profile moved to another drive, is the user's own.)
+/// of theirs in its place, holding a token they know. A link that is a profile folder as its
+/// variables name it (a profile moved to another drive), or holds one (`C:\Users` junctioned to
+/// another drive, `C:\Users\Ann` when the profile folder is `%TEMP%`), is the user's or the
+/// system's: it redirects the whole profile, and keeping the token "in the profile", as the
+/// warning would advise, cannot avoid it. No warning for those.
 fn windows_exposure(path: &Path, profile: &[PathBuf]) -> Option<String> {
     let real: Vec<String> = profile.iter().map(|d| windows_name(d)).filter(|d| !d.is_empty()).collect();
     let written: Vec<String> = profile.iter().map(|d| written_name(&d.to_string_lossy())).filter(|d| !d.is_empty()).collect();
@@ -588,8 +591,10 @@ fn windows_exposure(path: &Path, profile: &[PathBuf]) -> Option<String> {
         ));
     }
     let link = path.ancestors().skip(1).filter(|a| !a.as_os_str().is_empty()).find(|a| {
+        let name = written_name(&a.to_string_lossy());
         std::fs::symlink_metadata(a).is_ok_and(|m| m.file_type().is_symlink())
-            && !written.iter().any(|d| is_within(&written_name(&a.to_string_lossy()), d, true))
+            // in a profile folder, or it, or above one
+            && !written.iter().any(|d| is_within(&name, d, true) || is_within(d, &name, true))
             && a.parent().is_some_and(|folder| !real.iter().any(|d| is_within(&windows_name(folder), d, true)))
     })?;
     Some(format!(
@@ -1507,7 +1512,8 @@ mod tests {
     /// whoever may change that folder can put a link to a folder of theirs in its place. The link
     /// was resolved and the token taken for one in the profile, with no warning, so the first start
     /// that warned was one that already used their token. A link that is the profile as its
-    /// variables name it (a profile moved to another drive), or one inside the profile, is fine.
+    /// variables name it (a profile moved to another drive), one above it (`C:\Users` junctioned
+    /// elsewhere), or one inside the profile, is fine.
     #[cfg(unix)]
     #[test]
     fn a_link_into_the_windows_profile_from_outside_is_warned_about() {
@@ -1534,6 +1540,26 @@ mod tests {
         std::os::unix::fs::symlink(&moved, &named).unwrap();
         std::fs::write(moved.join("AppData").join(STORED_FILE), TOKEN).unwrap();
         assert_eq!(windows_exposure(&named.join("AppData").join(STORED_FILE), std::slice::from_ref(&named)), None);
+        // links above the profile folders: C:\Users\Ann moved to D: (as above) with the profile
+        // folder the temporary folder in it (the tests of the CLI), and C:\Users junctioned to
+        // another drive. They redirect the whole profile: the advice to keep the token in it
+        // cannot help, and tests failed on machines with such a link above %TEMP%.
+        let temp = named.join("AppData").join("Local").join("Temp");
+        std::fs::create_dir_all(moved.join("AppData").join("Local").join("Temp").join("data")).unwrap();
+        let token = temp.join("data").join(STORED_FILE);
+        std::fs::write(&token, TOKEN).unwrap();
+        assert_eq!(windows_exposure(&token, std::slice::from_ref(&temp)), None, "a link above the profile folder");
+        let users = base.join("E").join("Users");
+        std::fs::create_dir_all(users.join("Ann").join("AppData").join("Roaming").join("FilmCraft")).unwrap();
+        std::os::unix::fs::symlink(&users, base.join("C").join("Users")).unwrap();
+        let ann = base.join("C").join("Users").join("Ann");
+        let roaming = ann.join("AppData").join("Roaming");
+        let token = roaming.join("FilmCraft").join(STORED_FILE);
+        std::fs::write(&token, TOKEN).unwrap();
+        assert_eq!(windows_exposure(&token, &[ann.clone(), roaming.clone()]), None, "C:\\Users junctioned");
+        // the portable `data` link is no profile folder's ancestor: still warned about
+        let w = windows_exposure(&through, &[profile.clone(), ann, roaming]).expect("a link from outside the profile");
+        assert!(w.contains("through the link"), "{w}");
         // a link inside the profile, to a folder in it
         std::os::unix::fs::symlink(profile.join("AppData"), profile.join("Short")).unwrap();
         std::fs::write(profile.join("AppData").join(STORED_FILE), TOKEN).unwrap();
@@ -1658,21 +1684,36 @@ mod tests {
     /// a backtick and spaces in its name, for token files as PowerShell, cmd.exe and Notepad write
     /// them, and from the variable. Runs Windows PowerShell 5.1 on Windows, PowerShell 7 (`pwsh`)
     /// elsewhere when it is installed; skipped when there is neither. PowerShell's caches and module
-    /// folders go in the test's folder: on Linux and macOS `pwsh` wrote them in the real home
-    /// (`~/.cache/powershell`, `~/.local/share/powershell`). (.NET keeps its own `/tmp/.dotnet`.)
+    /// folders, and .NET's (`DOTNET_CLI_HOME`, the temporary folder where it keeps `.dotnet`), go in
+    /// the test's folder: on Linux and macOS `pwsh` wrote them in the real home
+    /// (`~/.cache/powershell`, `~/.local/share/powershell`) and in `/tmp/.dotnet`.
     #[test]
     fn the_header_to_paste_works_in_powershell() {
         let tmp = TempDir::new("powershell");
         let shell = |p: &str| {
             let mut c = std::process::Command::new(p);
+            let temp = tmp.0.join("temp");
+            let _ = std::fs::create_dir_all(&temp);
             c.env("HOME", &tmp.0)
                 .env("XDG_CACHE_HOME", tmp.0.join("cache"))
                 .env("XDG_DATA_HOME", tmp.0.join("data"))
                 .env("XDG_CONFIG_HOME", tmp.0.join("config"))
+                .env("DOTNET_CLI_HOME", tmp.0.join("dotnet"))
+                .env("TMPDIR", &temp)
+                .env("TEMP", &temp)
+                .env("TMP", &temp)
+                .env("DOTNET_CLI_TELEMETRY_OPTOUT", "1")
                 .env("POWERSHELL_TELEMETRY_OPTOUT", "1")
                 .env("POWERSHELL_UPDATECHECK", "Off");
             c
         };
+        // every folder it names for PowerShell and .NET is in the test's folder (checked also where
+        // there is no PowerShell to run)
+        let probe = shell("pwsh");
+        for k in ["HOME", "XDG_CACHE_HOME", "XDG_DATA_HOME", "XDG_CONFIG_HOME", "DOTNET_CLI_HOME", "TMPDIR", "TEMP", "TMP"] {
+            let v = probe.get_envs().find(|(n, _)| *n == k).and_then(|(_, v)| v).unwrap_or_else(|| panic!("{k} is not set"));
+            assert!(Path::new(v).starts_with(&tmp.0), "{k} = {v:?}");
+        }
         let runs = |p: &str| shell(p).args(["-NoProfile", "-NonInteractive", "-Command", "exit 0"]).output().is_ok_and(|o| o.status.success());
         let Some(ps) = ["powershell", "pwsh"].into_iter().find(|p| runs(p)) else { return };
         let dir = tmp.0.join("it's a $HOME `dir` [beta] O\u{2019}Brien");
