@@ -122,8 +122,9 @@ holds it) gives up at once without starting. The server waits only for the expor
 call that holds the engine otherwise (`export.queue.start` with `wait`, as a `command_run` or as a
 step of a `command_batch`) is not waited for, except that stdio mode gives every call in flight up
 to 2 s to answer (5 s once its client has closed the input) before it ends. An export the stop cut
-short has its partial file deleted as soon as it has stopped, within a fraction of a second, not at
-the end of any of these waits. The output of an export still running at the end is deleted. Other
+short has its partial file deleted as soon as it has stopped, without waiting for the end of these
+waits. Stopping takes an export until its current batch of frames is done: usually a fraction of a
+second, a few seconds at 4K or on a busy CPU. The output of an export still running at the end is deleted. Other
 engine jobs (the export queue, proxies, …) are not cancelled; they end with the process, so cancel
 a queue export with `jobs.cancel` first if you want its file gone. A second signal quits at once.
 Stdio mode (`mcp` without `--http`) stops on the same signals. Signals are watched from before the
