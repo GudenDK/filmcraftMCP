@@ -156,8 +156,9 @@ can reach.) The token is, first match wins:
 | Linux, Flatpak | `~/.var/app/ai.storyteller.filmcraft/data/filmcraft/mcp-token` |
 
 `--data-dir DIR` (or `FILMCRAFT_DATA_DIR=DIR`) keeps it in `DIR/mcp-token` instead: give
-`mcp-token` the same option (the server's messages include it whenever the token is not in the
-per-user folder). It is the app's data directory (autosaves, presets; see
+`mcp-token` the same option (the server's messages include it unless the program they print finds
+that folder by itself: a portable install's `data` folder for its own program, else the per-user
+folder). It is the app's data directory (autosaves, presets; see
 [project files](project-files.md)), never the current folder: a relative `XDG_DATA_HOME`, `HOME`,
 `APPDATA` or `FILMCRAFT_DATA_DIR` is refused (exit 1) rather than taken from the folder you are in.
 `filmcraft-cli mcp-token --path` prints where it is.
