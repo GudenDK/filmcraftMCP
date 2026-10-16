@@ -92,6 +92,8 @@ The commands it prints run this same program, so they work as pasted: as `filmcr
 is the one your shell finds on `PATH` (as above), else by its full path, such as
 `'/home/me/src/filmcraft/target/release/filmcraft-cli' mcp-token`, or in PowerShell
 `& 'C:\FilmCraft\filmcraft-cli.exe' mcp-token` (Windows installs put no `filmcraft-cli` on `PATH`).
+A copy under another name (`fc`, `filmcraft-cli-0.9`) is run by its full path too. In the Flatpak
+they run it from the host with `flatpak run --command=filmcraft-cli ai.storyteller.filmcraft`.
 They name the data directory with `--data-dir` unless that program finds it without one.
 
 `--http` is newer than the 0.8.0 release, whose `filmcraft-cli` stops with "unknown mcp option"
@@ -293,7 +295,8 @@ as its bearer token. Only its direct mode, where the browser calls the server, n
   cannot reach it until you grant network access:
   `flatpak override --user --share=network ai.storyteller.filmcraft`. The token is stored in the
   sandbox's data directory (table above);
-  `flatpak run --command=filmcraft-cli ai.storyteller.filmcraft mcp-token` prints it.
+  `flatpak run --command=filmcraft-cli ai.storyteller.filmcraft mcp-token` prints it, as the
+  server's messages say (`filmcraft-cli mcp-token` on the host is another program, or none).
 
 **Bridge mode.** The token and the checks below protect only the HTTP endpoint. The app's
 `--control` port has no authentication of its own: any local process can connect to it and drive

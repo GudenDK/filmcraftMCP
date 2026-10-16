@@ -268,8 +268,10 @@ pub fn mcp_token_command(path: &Path, powershell: bool) -> String {
 pub struct Program {
     /// Where it is (`None`: unknown, then it is named `filmcraft-cli`).
     exe: Option<PathBuf>,
-    /// The shell finds it by its name: it is the first `filmcraft-cli` on `PATH`.
+    /// The shell finds it by its file name: it is the first of that name on `PATH`.
     on_path: bool,
+    /// The id of the Flatpak it runs in, if it does: the host runs it through `flatpak run`.
+    flatpak: Option<String>,
     /// The data directory its `mcp-token` uses without `--data-dir` from any shell of this user:
     /// a portable install's own `data` folder, else the per-user one. `None` when that cannot be
     /// told: `FILMCRAFT_DATA_DIR` names another folder here, and may be set in those shells too.
@@ -281,6 +283,8 @@ impl Program {
     pub fn current() -> Self {
         let exe = std::env::current_exe().ok().filter(|e| e.is_absolute());
         let on_path = exe.as_deref().is_some_and(|e| first_on_path(e, std::env::var_os("PATH").as_deref()));
+        // a Flatpak's programs are in /app, and it sets FLATPAK_ID for them
+        let flatpak = std::env::var("FLATPAK_ID").ok().filter(|id| is_app_id(id) && exe.as_deref().is_some_and(|e| e.starts_with("/app")));
         let own = exe.as_deref().and_then(Path::parent).and_then(filmcraft_engine::autosave::portable_data_dir);
         let data_dir = own.or_else(filmcraft_engine::autosave::per_user_data_dir).filter(|d| d.is_absolute()).and_then(|d| std::path::absolute(d).ok());
         let env = std::env::var_os("FILMCRAFT_DATA_DIR").filter(|v| !v.is_empty()).and_then(|d| std::path::absolute(d).ok());
@@ -288,24 +292,44 @@ impl Program {
             Some(env) if Some(&env) != data_dir.as_ref() => None,
             _ => data_dir,
         };
-        Self { exe, on_path, data_dir }
+        Self { exe, on_path, flatpak, data_dir }
     }
 
     /// The command that runs it: `filmcraft-cli` when the shell finds this program by that name,
     /// else its full path, quoted (in PowerShell after `&`, which runs a quoted path). Windows puts
     /// no `filmcraft-cli` on `PATH` (the installer, the portable zip and a build from source alike),
-    /// and neither does a build on Linux or macOS.
+    /// and neither does a build on Linux or macOS. A copy under another name is run by its path
+    /// too: its name may be no command at all elsewhere, or a shell's own (`fc` is one in bash and
+    /// in PowerShell). In a Flatpak it is `flatpak run --command=… <app id>`, which runs it in the
+    /// same sandbox, with the same data directory, from the host (where `filmcraft-cli`, if there
+    /// is one, is another program).
     fn command(&self, powershell: bool) -> String {
-        match &self.exe {
-            Some(exe) if !self.on_path => {
-                let exe = exe.to_string_lossy();
-                // Windows: `\\?\C:\...` is `C:\...`
-                let exe = exe.strip_prefix(r"\\?\").filter(|e| e.get(1..2) == Some(":")).unwrap_or(&exe);
-                if powershell { format!("& {}", powershell_quote(exe)) } else { sh_quote(exe) }
-            }
-            _ => "filmcraft-cli".into(),
+        let Some(exe) = &self.exe else { return "filmcraft-cli".into() };
+        if let Some(id) = &self.flatpak
+            && let Some(name) = exe.file_name().and_then(|n| n.to_str()).filter(|n| is_app_id(n))
+        {
+            return format!("flatpak run --command={name} {id}");
         }
+        if self.on_path && exe.file_name().and_then(|n| n.to_str()).is_some_and(|n| is_found_as_filmcraft_cli(n, cfg!(windows))) {
+            return "filmcraft-cli".into();
+        }
+        let exe = exe.to_string_lossy();
+        // Windows: `\\?\C:\...` is `C:\...`
+        let exe = exe.strip_prefix(r"\\?\").filter(|e| e.get(1..2) == Some(":")).unwrap_or(&exe);
+        if powershell { format!("& {}", powershell_quote(exe)) } else { sh_quote(exe) }
     }
+}
+
+/// Whether a program file named `name` runs when a shell is given `filmcraft-cli`: that name, or
+/// on Windows (`windows`) `filmcraft-cli.exe` in any case.
+fn is_found_as_filmcraft_cli(name: &str, windows: bool) -> bool {
+    name == "filmcraft-cli" || (windows && name.eq_ignore_ascii_case("filmcraft-cli.exe"))
+}
+
+/// Whether `s` is a Flatpak application id (or a program name) that a shell takes as one word
+/// as it is: letters, digits, `.`, `_` and `-`, not starting with `-`.
+fn is_app_id(s: &str) -> bool {
+    !s.is_empty() && s.len() <= 255 && !s.starts_with('-') && s.bytes().all(|b| b.is_ascii_alphanumeric() || matches!(b, b'.' | b'_' | b'-'))
 }
 
 /// Whether `exe` is the program a shell runs for its name: the first file of that name in an
@@ -1314,33 +1338,76 @@ mod tests {
     #[test]
     fn the_mcp_token_command_runs_this_program_on_this_data_directory() {
         let per_user = PathBuf::from("/home/ann/.local/share/filmcraft");
-        let installed = Program { exe: Some("/usr/bin/filmcraft-cli".into()), on_path: true, data_dir: Some(per_user.clone()) };
+        let installed = Program { exe: Some("/usr/bin/filmcraft-cli".into()), on_path: true, flatpak: None, data_dir: Some(per_user.clone()) };
         assert_eq!(mcp_token_command_for(&per_user.join(STORED_FILE), &installed, false), "filmcraft-cli mcp-token");
         assert_eq!(mcp_token_command_for(Path::new("/srv/it's/mcp-token"), &installed, false), r"filmcraft-cli mcp-token --data-dir '/srv/it'\''s'");
         assert_eq!(mcp_token_command_for(Path::new("/srv/it's/mcp-token"), &installed, true), "filmcraft-cli mcp-token --data-dir '/srv/it''s'");
         // not on PATH: the full path, quoted (PowerShell runs a quoted path after `&`)
-        let built = Program { exe: Some("/home/ann/src/it's/target/release/filmcraft-cli".into()), on_path: false, data_dir: Some(per_user.clone()) };
+        let built =
+            Program { exe: Some("/home/ann/src/it's/target/release/filmcraft-cli".into()), on_path: false, flatpak: None, data_dir: Some(per_user.clone()) };
         assert_eq!(mcp_token_command_for(&per_user.join(STORED_FILE), &built, false), r"'/home/ann/src/it'\''s/target/release/filmcraft-cli' mcp-token");
         assert_eq!(mcp_token_command_for(&per_user.join(STORED_FILE), &built, true), "& '/home/ann/src/it''s/target/release/filmcraft-cli' mcp-token");
-        let windows = Program { exe: Some(r"\\?\C:\claude\FilmCraft\filmcraft-cli.exe".into()), on_path: false, data_dir: None };
+        let windows = Program { exe: Some(r"\\?\C:\claude\FilmCraft\filmcraft-cli.exe".into()), on_path: false, flatpak: None, data_dir: None };
         assert_eq!(
             mcp_token_command_for(Path::new("/x/mcp-token"), &windows, true),
             r"& 'C:\claude\FilmCraft\filmcraft-cli.exe' mcp-token --data-dir '/x'",
             "without the verbatim prefix"
         );
         // a portable install: its program finds `<exe dir>/data`, not the per-user folder
-        let portable = Program { exe: Some("/opt/fc/filmcraft-cli".into()), on_path: false, data_dir: Some("/opt/fc/data".into()) };
+        let portable = Program { exe: Some("/opt/fc/filmcraft-cli".into()), on_path: false, flatpak: None, data_dir: Some("/opt/fc/data".into()) };
         assert_eq!(mcp_token_command_for(Path::new("/opt/fc/data/mcp-token"), &portable, false), "'/opt/fc/filmcraft-cli' mcp-token");
         assert_eq!(
             mcp_token_command_for(&per_user.join(STORED_FILE), &portable, false),
             "'/opt/fc/filmcraft-cli' mcp-token --data-dir '/home/ann/.local/share/filmcraft'"
         );
         // FILMCRAFT_DATA_DIR names another folder: always --data-dir
-        let unknown = Program { exe: None, on_path: false, data_dir: None };
+        let unknown = Program { exe: None, on_path: false, flatpak: None, data_dir: None };
         assert_eq!(
             mcp_token_command_for(&per_user.join(STORED_FILE), &unknown, false),
             "filmcraft-cli mcp-token --data-dir '/home/ann/.local/share/filmcraft'"
         );
+        // a copy under another name, first on PATH by that name: by its path, as `filmcraft-cli`
+        // is another program or none, and its own name may be a shell's (`fc` is in bash and
+        // PowerShell). It used to print `filmcraft-cli mcp-token`.
+        for name in ["/usr/bin/fc", "/usr/local/bin/filmcraft-cli-0.9"] {
+            let renamed = Program { exe: Some(name.into()), on_path: true, flatpak: None, data_dir: Some(per_user.clone()) };
+            assert_eq!(mcp_token_command_for(&per_user.join(STORED_FILE), &renamed, false), format!("'{name}' mcp-token"));
+            assert_eq!(mcp_token_command_for(&per_user.join(STORED_FILE), &renamed, true), format!("& '{name}' mcp-token"));
+        }
+        for (name, windows, found) in [
+            ("filmcraft-cli", false, true),
+            ("filmcraft-cli", true, true),
+            ("filmcraft-cli.exe", true, true),
+            ("FilmCraft-CLI.EXE", true, true),
+            ("filmcraft-cli.exe", false, false),
+            ("filmcraft-cli-0.9.exe", true, false),
+            ("fc", false, false),
+            ("fc.exe", true, false),
+        ] {
+            assert_eq!(is_found_as_filmcraft_cli(name, windows), found, "{name}, windows: {windows}");
+        }
+        // in a Flatpak: through `flatpak run`, which reaches the same sandbox and data directory from
+        // the host, where `filmcraft-cli` is another program or none (it printed that)
+        let sandboxed = Path::new("/home/ann/.var/app/ai.storyteller.filmcraft/data/filmcraft");
+        let flatpak = Program {
+            exe: Some("/app/bin/filmcraft-cli".into()),
+            on_path: true,
+            flatpak: Some("ai.storyteller.filmcraft".into()),
+            data_dir: Some(sandboxed.into()),
+        };
+        assert_eq!(
+            mcp_token_command_for(&sandboxed.join(STORED_FILE), &flatpak, false),
+            "flatpak run --command=filmcraft-cli ai.storyteller.filmcraft mcp-token"
+        );
+        assert_eq!(
+            mcp_token_command_for(Path::new("/home/ann/fc/mcp-token"), &flatpak, false),
+            "flatpak run --command=filmcraft-cli ai.storyteller.filmcraft mcp-token --data-dir '/home/ann/fc'"
+        );
+        for (id, ok) in
+            [("ai.storyteller.filmcraft", true), ("org.example.App_2-x", true), ("", false), ("-x", false), ("a b", false), ("a;rm", false), ("a'b", false)]
+        {
+            assert_eq!(is_app_id(id), ok, "{id:?}");
+        }
         // the running test program, without its own folder on PATH (cargo puts it there for tests
         // on Windows: target\debug\deps, where the test program is): not on it
         let exe = Program::current().exe.expect("the test program's path");
