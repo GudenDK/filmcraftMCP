@@ -388,11 +388,13 @@ fn the_stored_token_lives_in_the_per_user_data_directory() {
 /// advise on a shared PC, it names that folder in the `mcp-token` command it prints; for its own
 /// folder it needs none. Run as printed, the command prints the server's token. It used to leave
 /// `--data-dir` out for the per-user folder: that printed (and made) another token, in the
-/// portable folder, which the server refused.
+/// portable folder, which the server refused. The folder's name has `[x]` in it, which PowerShell
+/// takes for a wildcard in some places: the printed `& '<path>'` still runs the program (Windows
+/// PowerShell 5.1 on Windows).
 #[test]
 fn a_portable_install_prints_commands_for_its_own_data_folder() {
     let root = TempDir::new("portable");
-    let bin = root.path("FilmCraft portable");
+    let bin = root.path("FilmCraft [x] portable");
     std::fs::create_dir_all(&bin).unwrap();
     let exe = std::path::Path::new(env!("CARGO_BIN_EXE_filmcraft-cli"));
     let copy = bin.join(exe.file_name().unwrap());
