@@ -310,8 +310,10 @@ impl FilmcraftMcp {
             r = self.serve((service_in, service_out)) => match r {
                 Ok(r) => r,
                 Err(e) => {
-                    // the input ended before the client initialized: nothing ran (a later server
-                    // on a clone of this handler starts afresh)
+                    // the input ended, or its first message was no `initialize`, before the client
+                    // initialized: nothing ran. The input may still be open: its reader must not
+                    // stop the calls of a later server on a clone of this handler when it ends.
+                    reader.abort();
                     long_calls.drain(tokio::time::Instant::now()).await;
                     return Err(AutomationError::Other(format!("MCP init: {e}")));
                 }
@@ -921,10 +923,13 @@ mod tests {
 
     impl Client {
         fn start(s: Session) -> Self {
+            Self::serve(FilmcraftMcp::headless(s))
+        }
+        fn serve(mcp: FilmcraftMcp) -> Self {
             use tokio::io::AsyncBufReadExt;
             let (tx, server_in) = tokio::io::duplex(1 << 22);
             let (server_out, rx) = tokio::io::duplex(1 << 22);
-            tokio::spawn(FilmcraftMcp::headless(s).serve_io(server_in, server_out));
+            tokio::spawn(mcp.serve_io(server_in, server_out));
             Self { tx, rx: tokio::io::BufReader::new(rx).lines() }
         }
         async fn send(&mut self, line: &str) {
@@ -1294,6 +1299,34 @@ mod tests {
         drop(tx);
         let r = tokio::time::timeout(std::time::Duration::from_secs(30), done).await.expect("ended").unwrap();
         assert!(r.is_ok(), "{r:?}");
+    }
+
+    /// A server whose client sent no `initialize` first fails, and leaves no reader of its input
+    /// behind: when that input closed later, the reader stopped the long calls of the handler's
+    /// clones, so every export of a later server on one was cancelled from the start.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_failed_initialization_leaves_no_reader_behind() {
+        use tokio::io::AsyncWriteExt;
+        let dir = crate::TestDir::new("stdio-failed-init");
+        let mcp = FilmcraftMcp::headless(demo());
+        let (mut tx, server_in) = tokio::io::duplex(1 << 20);
+        let (server_out, _rx) = tokio::io::duplex(1 << 20);
+        let first = tokio::spawn(mcp.clone().serve_io(server_in, server_out));
+        tx.write_all(format!("{}\n", json!({"jsonrpc":"2.0","method":"notifications/initialized"})).as_bytes()).await.unwrap();
+        let r = tokio::time::timeout(std::time::Duration::from_secs(30), first).await.expect("fails at once").unwrap();
+        assert!(r.is_err(), "{r:?}");
+        // its input closes later
+        drop(tx);
+        tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+        assert!(!mcp.long_calls.is_stopping());
+        // a later server on a clone: its export runs
+        let mut c = Client::serve(mcp.clone());
+        c.init().await;
+        let out = dir.join("runs.mp4");
+        let params = json!({"path": out.to_string_lossy(), "format": "h264", "width": 640, "height": 360, "audio": false, "range": "custom", "startSeconds": 0, "endSeconds": 0.25, "wait": true});
+        let r = c.call(1, "command_run", json!({"id": "file.exportMedia", "params": params})).await;
+        assert_eq!(r["result"]["isError"], false, "{r}");
+        assert!(out.exists());
     }
 
     /// A hurried stop (Windows kills the process about 5 s after its console closes) keeps to its
