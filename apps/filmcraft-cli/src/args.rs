@@ -20,6 +20,10 @@ const VALUED: &[&str] = &[
     "--data-dir",
     "--settings",
     "--gpu-rendering",
+    "--http",
+    "--token-file",
+    "--allow-origin",
+    "--allow-host",
 ];
 
 #[derive(Debug, Default)]
@@ -55,6 +59,11 @@ impl Args {
 
     pub fn opt(&self, k: &str) -> Option<&str> {
         self.opts.iter().rev().find(|(n, _)| n == k).and_then(|(_, v)| v.as_deref())
+    }
+
+    /// Every value of a repeatable option, in order (`--allow-origin a --allow-origin b`).
+    pub fn opt_all(&self, k: &str) -> Vec<&str> {
+        self.opts.iter().filter(|(n, _)| n == k).filter_map(|(_, v)| v.as_deref()).collect()
     }
 
     pub fn flag(&self, k: &str) -> bool {
@@ -163,6 +172,19 @@ mod tests {
         assert_eq!(args("mcp --automation-read-root X").unknown_opt(&allowed), Some("--automation-read-root"));
         assert_eq!(args("mcp --bridge=a --typo=1").unknown_opt(&allowed), Some("--typo"));
         assert_eq!(args("mcp --project p --bridge a").unknown_opt(&allowed), None);
+    }
+
+    #[test]
+    fn http_options_take_separate_values() {
+        let a = args("mcp --demo --http 127.0.0.1:9000 --allow-origin http://localhost:6274 --allow-origin=http://a:1 --token-file t.txt --allow-host h:9000");
+        assert_eq!(a.positionals, ["mcp"]);
+        assert_eq!(a.opt("--http"), Some("127.0.0.1:9000"));
+        assert_eq!(a.opt_all("--allow-origin"), ["http://localhost:6274", "http://a:1"]);
+        assert_eq!(a.opt("--token-file"), Some("t.txt"));
+        assert_eq!(a.opt_all("--allow-host"), ["h:9000"]);
+        assert!(a.flag("--demo"));
+        let b = args("mcp --http");
+        assert!(b.flag("--http") && b.opt("--http").is_none());
     }
 
     #[test]

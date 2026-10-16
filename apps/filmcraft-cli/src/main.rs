@@ -32,9 +32,10 @@ macro_rules! out {
 
 mod args;
 mod probe;
+mod token;
 
 use args::{Args, parse_value};
-use filmcraft_automation::BridgeClient;
+use filmcraft_automation::{BridgeClient, Stop};
 use filmcraft_engine::Session;
 use serde_json::{Value, json};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -96,6 +97,21 @@ SUBCOMMANDS
                                 --image-sequence <media> is the first numbered still of a sequence
   bench-decode <media> [--frames N]
   mcp                           MCP server on stdio (headless, or --bridge to the live app)
+  mcp --http <ADDR>             MCP server over Streamable HTTP at http://ADDR/mcp instead: a
+                                long-running server any number of clients connect to by URL;
+                                they all share one project (or the one live app with --bridge).
+                                Every request needs `Authorization: Bearer <token>`: the token
+                                is FILMCRAFT_MCP_TOKEN, else --token-file's, else the one stored
+                                in the data directory (made on first use; `mcp-token` prints
+                                it). ADDR is PORT, 127.0.0.1:PORT, [::1]:PORT or localhost:PORT
+                                (loopback; localhost listens on 127.0.0.1 and, with IPv6, on
+                                [::1]); a non-loopback address needs a token of 32+
+                                characters. Ctrl+C or SIGTERM stops it (on Windows also
+                                Ctrl+Break and closing the console)
+  mcp-token [--new | --path]    print the stored MCP token, making it if there is none, for
+                                --header \"Authorization: Bearer $(filmcraft-cli mcp-token)\";
+                                --new replaces it with a new random one and prints that (restart
+                                the server, register clients again); --path prints where it is
   help                          this text
   --version                     print the version
 
@@ -105,8 +121,21 @@ OPTIONS
   --save                        save the project back to --project when done
   --save-as <p.fcproj>          save the project to this path when done
   --bridge <127.0.0.1:PORT>     send commands to the running app (`filmcraft --control PORT`)
-  --data-dir <dir>              FilmCraft data directory for user export presets (headless;
-                                default: the app's data directory)
+  --data-dir <dir>              FilmCraft data directory: user export presets (headless) and
+                                the stored MCP token (default: the app's data directory)
+  --token-file <path>           mcp --http: the token is this file's first line instead of the
+                                stored one (FILMCRAFT_MCP_TOKEN, when set, comes first)
+  --no-token                    mcp --http: no token, so any program on this machine can drive
+                                FilmCraft. Loopback addresses only, and not with --allow-host,
+                                an --allow-origin other than this machine's (localhost, a
+                                loopback address), --token-file or FILMCRAFT_MCP_TOKEN
+  --allow-origin <origin>       mcp --http: let this browser origin call, with CORS headers:
+                                scheme://host:port with the port spelled out (repeatable; any
+                                other request with an Origin header is refused). `null` (any
+                                sandboxed frame or file: page) needs a token of 32+ characters
+  --allow-host <host[:port]>    mcp --http: also answer to this Host (repeatable; a LAN name,
+                                host.docker.internal:PORT, a tunnel). A name that is not this
+                                machine (a tunnel, a proxy) needs a token of 32+ characters
   --keep-going                  `run`: report failing lines and continue
   --compact                     one-line JSON output
 
@@ -275,6 +304,11 @@ async fn cli() {
     // `--version` anywhere and `-V` as the subcommand, also after global options (`--demo --version`, #710).
     if a.wants_version() {
         outln!("filmcraft-cli {}", env!("CARGO_PKG_VERSION"));
+        return;
+    }
+    // before the decoders and renderers start: scripts call it inside `$(...)`
+    if a.pos(0) == Some("mcp-token") {
+        mcp_token(&a);
         return;
     }
     register_hardware_decoders();
@@ -479,9 +513,12 @@ async fn cli() {
             diag(format_args!("rendered {}x{} in {:.1} ms → {out}", img.w, img.h, dt.as_secs_f64() * 1000.0));
         }
         "mcp" => {
-            if let Some(opt) = a.unknown_opt(&["--bridge", "--project", "--demo", "--data-dir"]) {
+            if let Some(opt) =
+                a.unknown_opt(&["--bridge", "--project", "--demo", "--data-dir", "--http", "--token-file", "--no-token", "--allow-origin", "--allow-host"])
+            {
                 usage(format!("unknown mcp option `{opt}`"));
             }
+            let http = mcp_http_options(&a);
             let server = match a.opt("--bridge") {
                 Some(addr) => filmcraft_automation::FilmcraftMcp::bridge(addr).unwrap_or_else(|e| usage(e)),
                 None => match Backend::open(&a) {
@@ -489,11 +526,398 @@ async fn cli() {
                     Backend::Bridge(_) => usage("mcp: use --bridge ADDR to drive a running app"),
                 },
             };
-            if let Err(e) = server.serve_stdio().await {
+            // from here on (before the server starts and says so), a stop signal stops it cleanly
+            let signals = StopSignals::watch();
+            let result = match http {
+                Some((addr, opts, source)) => serve_mcp_http(&a, server, addr, opts, source, signals).await,
+                None => server.serve_stdio_until(stop_signal(signals)).await,
+            };
+            if let Err(e) = result {
                 fail(format!("mcp: {e}"));
             }
+            // Don't wait on blocking work a cancelled call may still be doing (the runtime would on
+            // drop): the server has already given exports their grace, and on Windows a closing
+            // console's process is killed about 5 s after the event.
+            std::process::exit(i32::from(STDOUT_ERROR.load(Ordering::Relaxed)));
         }
         other => usage(format!("unknown subcommand `{other}`")),
+    }
+}
+
+/// `mcp --http` settings: the listen address, the server options and where its token came from
+/// (usage error on bad ones), or `None` for stdio. The token is on by default: see
+/// [`token::resolve`]. The stored one is only made once every option has been checked.
+fn mcp_http_options(a: &Args) -> Option<(std::net::SocketAddr, filmcraft_automation::HttpOptions, token::Source)> {
+    use filmcraft_automation::http_transport::{
+        TOKEN_ENV, check_allowed_host, check_allowed_origin, check_bind, check_host_exposure, check_origin_exposure, check_token, parse_listen_addr,
+    };
+    if !a.flag("--http") {
+        if let Some(o) = ["--token-file", "--no-token", "--allow-origin", "--allow-host"].into_iter().find(|o| a.flag(o)) {
+            usage(format!("mcp: {o} needs --http"));
+        }
+        return None;
+    }
+    let Some(addr) = a.opt("--http") else { usage("mcp: --http needs an address: PORT, 127.0.0.1:PORT, [::1]:PORT or localhost:PORT") };
+    let addr = parse_listen_addr(addr).unwrap_or_else(|e| usage(format!("mcp --http: {e}")));
+    // a missing value must not fall back to the stored token or the default data directory
+    if let Some(o) = ["--token-file", "--data-dir"].into_iter().find(|o| a.flag(o) && a.opt(o).is_none()) {
+        usage(format!("mcp: {o} needs a value"));
+    }
+    if a.opt("--no-token").is_some() {
+        usage("mcp: --no-token takes no value");
+    }
+    let allowed_origins: Vec<String> =
+        a.opt_all("--allow-origin").into_iter().map(|o| check_allowed_origin(o).unwrap_or_else(|e| usage(format!("mcp --allow-origin: {e}")))).collect();
+    let allowed_hosts: Vec<String> =
+        a.opt_all("--allow-host").into_iter().map(|h| check_allowed_host(h).unwrap_or_else(|e| usage(format!("mcp --allow-host: {e}")))).collect();
+    let no_token = a.flag("--no-token");
+    if no_token {
+        token::check_no_token(addr, &allowed_hosts, &allowed_origins).unwrap_or_else(|e| usage(format!("mcp: {e}")));
+    }
+    let env = match std::env::var(TOKEN_ENV) {
+        Ok(t) => Some(t),
+        Err(std::env::VarError::NotPresent) => None,
+        Err(std::env::VarError::NotUnicode(_)) => usage(format!("mcp: {TOKEN_ENV} is not valid text")),
+    };
+    let resolved =
+        token::resolve(no_token, env.as_deref(), a.opt("--token-file"), || token::stored_token_path(a.opt("--data-dir"))).unwrap_or_else(|p| match p {
+            token::Problem::Usage(m) => usage(format!("mcp: {m}")),
+            token::Problem::Failure(m) => fail(format!("mcp: {m}")),
+        });
+    for w in &resolved.warnings {
+        diag(format_args!("filmcraft-cli: warning: {w}"));
+    }
+    let token = resolved.token;
+    if let Some(t) = &token {
+        check_token(t).unwrap_or_else(|e| match &resolved.source {
+            token::Source::Stored { path, .. } => fail(format!(
+                "mcp: the stored token in {} is unusable: {e}; replace it with `{} --new`",
+                path.display(),
+                token::mcp_token_command(path, cfg!(windows))
+            )),
+            _ => usage(format!("mcp: {e}")),
+        });
+    }
+    check_bind(addr, token.as_deref()).unwrap_or_else(|e| usage(format!("mcp --http: {e}")));
+    check_origin_exposure(&allowed_origins, token.as_deref()).unwrap_or_else(|e| usage(format!("mcp --allow-origin: {e}")));
+    check_host_exposure(&allowed_hosts, token.as_deref()).unwrap_or_else(|e| usage(format!("mcp --allow-host: {e}")));
+    let opts = filmcraft_automation::HttpOptions { token, allowed_origins, allowed_hosts, ..Default::default() };
+    Some((addr, opts, resolved.source))
+}
+
+/// `mcp-token [--new | --path]`: print the stored MCP token (made if there is none) for scripts
+/// (`--header "Authorization: Bearer $(filmcraft-cli mcp-token)"`), replace it with a new one, or
+/// print where it is. Notes go to stderr, so `$(...)` takes only the token.
+fn mcp_token(a: &Args) {
+    use filmcraft_automation::http_transport::{TOKEN_ENV, check_token};
+    if let Some(opt) = a.unknown_opt(&["--new", "--path", "--data-dir"]) {
+        usage(format!("unknown mcp-token option `{opt}`"));
+    }
+    if let Some(extra) = a.pos(1) {
+        usage(format!("mcp-token takes no arguments, got `{extra}`"));
+    }
+    if a.flag("--data-dir") && a.opt("--data-dir").is_none() {
+        usage("mcp-token: --data-dir needs a value");
+    }
+    if let Some(o) = ["--new", "--path"].into_iter().find(|o| a.opt(o).is_some()) {
+        usage(format!("mcp-token: {o} takes no value"));
+    }
+    if a.flag("--new") && a.flag("--path") {
+        usage("mcp-token: give --new or --path, not both");
+    }
+    let path = token::stored_token_path(a.opt("--data-dir"))
+        .unwrap_or_else(|e| fail(format!("mcp-token: cannot locate the stored MCP token: {e}; pass --data-dir DIR to keep it elsewhere")));
+    // this command again, with the same data directory
+    let again = token::mcp_token_command(&path, cfg!(windows));
+    if a.flag("--path") {
+        outln!("{}", path.display());
+        return;
+    }
+    if std::env::var(TOKEN_ENV).ok().and_then(|v| token::token_from_env(&v)).is_some() {
+        diag(format_args!("filmcraft-cli: note: {TOKEN_ENV} is set, so `mcp --http` uses it instead of this stored token"));
+    }
+    let token = if a.flag("--new") {
+        let t = token::replace_stored(&path).unwrap_or_else(|e| fail(format!("mcp-token --new: {e}")));
+        diag(format_args!(
+            "filmcraft-cli: stored a new MCP token in {}. A running `mcp --http` server keeps the old one until it restarts, and clients need the new one (claude mcp remove, then add again)",
+            path.display()
+        ));
+        t
+    } else {
+        let stored = token::load_or_create(&path).unwrap_or_else(|e| {
+            let what = if e.unusable { format!("`{again} --new` replaces it") } else { "pass --data-dir DIR to keep it elsewhere".into() };
+            fail(format!("mcp-token: {}; {what}", e.message))
+        });
+        for w in &stored.warnings {
+            diag(format_args!("filmcraft-cli: warning: {w}"));
+        }
+        if stored.created {
+            diag(format_args!("filmcraft-cli: made a new MCP token and stored it in {}", path.display()));
+        }
+        stored.token
+    };
+    if let Err(e) = check_token(&token) {
+        fail(format!("mcp-token: the token in {} is unusable: {e}; `{again} --new` replaces it", path.display()));
+    }
+    outln!("{token}");
+}
+
+/// Serve MCP over HTTP until Ctrl+C or another stop signal. The listener is bound here so the URL
+/// printed (stderr) has the real port (`--http 127.0.0.1:0` picks a free one). `localhost:PORT`
+/// also listens on `[::1]:PORT` where the system has IPv6, as clients may resolve `localhost` to
+/// either address; failing that is not fatal.
+async fn serve_mcp_http(
+    a: &Args,
+    server: filmcraft_automation::FilmcraftMcp,
+    addr: std::net::SocketAddr,
+    opts: filmcraft_automation::HttpOptions,
+    source: token::Source,
+    signals: StopSignals,
+) -> Result<(), filmcraft_automation::AutomationError> {
+    let listener = match tokio::net::TcpListener::bind(addr).await {
+        Ok(l) => l,
+        Err(e) => {
+            let hint = match e.kind() {
+                std::io::ErrorKind::AddrInUse => " (another program uses this port: pick another with --http 127.0.0.1:<port>)",
+                // WSAEACCES 10013: Hyper-V / WSL / WinNAT reserve port ranges on Windows
+                std::io::ErrorKind::PermissionDenied => {
+                    " (the port may be reserved or privileged; on Windows see `netsh int ipv4 show excludedportrange protocol=tcp`; pick another port)"
+                }
+                _ => "",
+            };
+            fail(format!("mcp: cannot listen on {addr}: {e}{hint}"));
+        }
+    };
+    let bound = listener.local_addr().unwrap_or(addr);
+    let mut listeners = vec![listener];
+    let mut also = String::new();
+    if a.opt("--http").is_some_and(|h| h.trim().starts_with("localhost:")) {
+        match tokio::net::TcpListener::bind((std::net::Ipv6Addr::LOCALHOST, bound.port())).await {
+            Ok(v6) => {
+                also = format!(" (and [::1]:{})", bound.port());
+                listeners.push(v6);
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::AddrInUse => diag(format_args!(
+                "filmcraft-cli: warning: another program listens on [::1]:{0}, so a client that resolves localhost to ::1 reaches it instead: give clients http://127.0.0.1:{0}/mcp",
+                bound.port()
+            )),
+            Err(_) => {} // no IPv6 here: localhost can only mean 127.0.0.1
+        }
+    }
+    let backend = match (a.opt("--bridge"), a.opt("--project")) {
+        (Some(b), _) => format!("the live app at {b}"),
+        (None, Some(p)) => format!("a headless engine with {p}"),
+        (None, None) if a.flag("--demo") => "a headless engine with the demo project".to_string(),
+        (None, None) => "a headless engine".to_string(),
+    };
+    use filmcraft_automation::http_transport::{TOKEN_ENV, is_local_host};
+    // where the token is, never the token
+    let powershell = cfg!(windows);
+    // with --data-dir unless the token is where `mcp-token` looks from any shell
+    let print_it = match &source {
+        token::Source::Stored { path, .. } => token::mcp_token_command(path, powershell),
+        _ => "filmcraft-cli mcp-token".to_string(),
+    };
+    let auth = match &source {
+        token::Source::Env => format!("bearer token required (from {TOKEN_ENV})"),
+        token::Source::File(p) => format!("bearer token required (from {})", p.display()),
+        token::Source::Stored { path, .. } => format!("bearer token required (the one stored in {}; `{print_it}` prints it)", path.display()),
+        token::Source::Off => "no token (--no-token): any local program can connect".to_string(),
+    };
+    // 0.0.0.0 / [::] is no address a client can use: show the loopback URL, and what LAN clients need
+    let url_addr = match bound.ip() {
+        std::net::IpAddr::V4(ip) if ip.is_unspecified() => std::net::SocketAddr::from((std::net::Ipv4Addr::LOCALHOST, bound.port())),
+        std::net::IpAddr::V6(ip) if ip.is_unspecified() => std::net::SocketAddr::from((std::net::Ipv6Addr::LOCALHOST, bound.port())),
+        _ => bound,
+    };
+    diag(format_args!("filmcraft-cli: MCP (Streamable HTTP) on http://{url_addr}/mcp{also}, driving {backend}; {auth}. Ctrl+C stops it."));
+    match &source {
+        token::Source::Stored { path, created: true } => diag(format_args!(
+            "filmcraft-cli: made a new random MCP token and stored it in {}{}; `{print_it}` prints it, `{print_it} --new` replaces it",
+            path.display(),
+            // on Windows only the folder's permissions protect it (warned about above when they may not)
+            token::created_privacy(path)
+        )),
+        token::Source::Off => diag(format_args!(
+            "filmcraft-cli: warning: --no-token: any program on this machine, run by any user, can drive FilmCraft through this port; leave --no-token off to require the stored token"
+        )),
+        _ => {}
+    }
+    if bound.ip().is_unspecified() {
+        let hosts = filmcraft_automation::http_transport::accepted_hosts(bound, &opts.allowed_hosts).join(", ");
+        diag(format_args!("filmcraft-cli: listening on every interface ({bound}); a request's Host must be one of: {hosts}"));
+        match lan_address(bound.is_ipv6()).map(|ip| std::net::SocketAddr::new(ip, bound.port())) {
+            Some(lan) if filmcraft_automation::http_transport::allows_host(&opts.allowed_hosts, lan) => {
+                diag(format_args!("filmcraft-cli: LAN clients: http://{lan}/mcp"));
+            }
+            Some(lan) => diag(format_args!("filmcraft-cli: LAN clients get 403 until you add --allow-host {lan} (then they use http://{lan}/mcp)")),
+            None => diag(format_args!("filmcraft-cli: LAN clients get 403 until you add --allow-host <this machine's IP>:{}", bound.port())),
+        }
+    }
+    let relayed: Vec<&str> = opts.allowed_hosts.iter().map(String::as_str).filter(|h| !is_local_host(h)).collect();
+    if bound.ip().is_loopback() && !relayed.is_empty() {
+        diag(format_args!(
+            "filmcraft-cli: requests for {} arrive through a tunnel or proxy on this machine: they all come from its address, so the per-address limits (connections, wrong tokens) count them together with local clients",
+            relayed.join(", ")
+        ));
+    }
+    if let Some(n) = opts.token.as_ref().map(String::len).filter(|n| *n < filmcraft_automation::http_transport::MIN_REMOTE_TOKEN_LEN) {
+        diag(format_args!("filmcraft-cli: warning: the MCP token is short ({n} characters); use 32+ random characters"));
+    }
+    if !bound.ip().is_loopback() {
+        diag(format_args!(
+            "filmcraft-cli: warning: {bound} is reachable from the network and HTTP is not encrypted: the token and every request travel in clear text. Prefer 127.0.0.1 with `ssh -L` or a TLS reverse proxy (--allow-host)."
+        ));
+    }
+    // the line to paste: it reads the token where the server got it, and never shows it
+    let header = match token::header_arg(&source, powershell) {
+        Some(h) => format!(" {h}"),
+        None if opts.token.is_some() => " --header \"Authorization: Bearer <token>\"".to_string(),
+        None => String::new(),
+    };
+    let shell = if powershell { " (in PowerShell)" } else { "" };
+    diag(format_args!(
+        "filmcraft-cli: connect Claude Code{shell} with: claude mcp add --transport http --scope user filmcraft-http http://{url_addr}/mcp{header}"
+    ));
+    server.serve_http_listeners(listeners, opts, stop_signal(signals)).await?;
+    diag(format_args!("filmcraft-cli: MCP server stopped"));
+    Ok(())
+}
+
+/// This machine's address on its default route, if it has one (asks the routing table; sends
+/// nothing).
+fn lan_address(v6: bool) -> Option<std::net::IpAddr> {
+    let (any, probe) = if v6 { ("[::]:0", "[2001:db8::1]:9") } else { ("0.0.0.0:0", "192.0.2.1:9") };
+    let socket = std::net::UdpSocket::bind(any).ok()?;
+    socket.connect(probe).ok()?;
+    let ip = socket.local_addr().ok()?.ip();
+    (!ip.is_unspecified() && !ip.is_loopback()).then_some(ip)
+}
+
+/// Resolves when the process is asked to stop: Ctrl+C, SIGTERM or SIGHUP (kill, systemd, docker
+/// stop, a closed terminal), or on Windows Ctrl+Break, or the console closing, the user logging off
+/// or the system shutting down. Windows ends the process about 5 s after those last three, so the
+/// server hurries. A second signal quits at once.
+async fn stop_signal(mut signals: StopSignals) -> Stop {
+    let (how, what) = signals.first().await;
+    let grace = how.grace().as_secs();
+    diag(format_args!("filmcraft-cli: MCP server stopping ({what}): cancelling calls, up to {grace} s for exports to clean up; Ctrl+C again quits at once"));
+    tokio::spawn(async move {
+        signals.first().await;
+        std::process::exit(130);
+    });
+    how
+}
+
+/// The next signal on `watching`, or never when it could not be watched.
+macro_rules! next_signal {
+    ($watching:expr) => {
+        async {
+            if let Some(s) = $watching.as_mut()
+                && s.recv().await.is_some()
+            {
+                return;
+            }
+            std::future::pending::<()>().await
+        }
+    };
+}
+
+/// The stop signals, watched from the moment [`StopSignals::watch`] is called: before the server
+/// starts and says so, so that a signal sent as soon as it has (by a supervisor, a test) stops it
+/// cleanly instead of killing it.
+#[cfg(unix)]
+struct StopSignals {
+    int: Option<tokio::signal::unix::Signal>,
+    term: Option<tokio::signal::unix::Signal>,
+    hup: Option<tokio::signal::unix::Signal>,
+}
+
+#[cfg(unix)]
+impl StopSignals {
+    fn watch() -> Self {
+        use tokio::signal::unix::{SignalKind, signal};
+        Self {
+            int: signal(SignalKind::interrupt()).ok(),
+            term: signal(SignalKind::terminate()).ok(),
+            // under `nohup` (or a supervisor that ignores SIGHUP) the server keeps running after
+            // the terminal closes, as before: watching SIGHUP would undo that
+            hup: if hangup_ignored() { None } else { signal(SignalKind::hangup()).ok() },
+        }
+    }
+
+    async fn first(&mut self) -> (Stop, &'static str) {
+        let Self { int, term, hup } = self;
+        tokio::select! {
+            _ = next_signal!(int) => (Stop::Graceful, "Ctrl+C"),
+            _ = next_signal!(term) => (Stop::Graceful, "SIGTERM"),
+            _ = next_signal!(hup) => (Stop::Graceful, "SIGHUP"),
+        }
+    }
+}
+
+/// Whether this process started with SIGHUP ignored (`nohup`): Linux shows it in
+/// `/proc/self/status` (`SigIgn`, a hex mask, SIGHUP being bit 0). Elsewhere it cannot be told
+/// without `unsafe`, so SIGHUP is watched (docs/agents.md says what to use instead of `nohup`).
+#[cfg(unix)]
+fn hangup_ignored() -> bool {
+    std::fs::read_to_string("/proc/self/status").ok().is_some_and(|status| sighup_in_mask(&status))
+}
+
+/// SIGHUP's bit in the `SigIgn:` line of a `/proc/<pid>/status`.
+#[cfg(unix)]
+fn sighup_in_mask(status: &str) -> bool {
+    status.lines().find_map(|l| l.strip_prefix("SigIgn:")).and_then(|mask| u64::from_str_radix(mask.trim(), 16).ok()).is_some_and(|mask| mask & 1 == 1)
+}
+
+#[cfg(windows)]
+struct StopSignals {
+    ctrl_c: Option<tokio::signal::windows::CtrlC>,
+    ctrl_break: Option<tokio::signal::windows::CtrlBreak>,
+    close: Option<tokio::signal::windows::CtrlClose>,
+    logoff: Option<tokio::signal::windows::CtrlLogoff>,
+    shutdown: Option<tokio::signal::windows::CtrlShutdown>,
+}
+
+#[cfg(windows)]
+impl StopSignals {
+    fn watch() -> Self {
+        use tokio::signal::windows;
+        Self {
+            ctrl_c: windows::ctrl_c().ok(),
+            ctrl_break: windows::ctrl_break().ok(),
+            close: windows::ctrl_close().ok(),
+            logoff: windows::ctrl_logoff().ok(),
+            shutdown: windows::ctrl_shutdown().ok(),
+        }
+    }
+
+    async fn first(&mut self) -> (Stop, &'static str) {
+        let Self { ctrl_c, ctrl_break, close, logoff, shutdown } = self;
+        tokio::select! {
+            _ = next_signal!(ctrl_c) => (Stop::Graceful, "Ctrl+C"),
+            _ = next_signal!(ctrl_break) => (Stop::Graceful, "Ctrl+Break"),
+            _ = next_signal!(close) => (Stop::Hurried, "the console is closing"),
+            _ = next_signal!(logoff) => (Stop::Hurried, "the user is logging off"),
+            _ = next_signal!(shutdown) => (Stop::Hurried, "the system is shutting down"),
+        }
+    }
+}
+
+#[cfg(not(any(unix, windows)))]
+struct StopSignals;
+
+#[cfg(not(any(unix, windows)))]
+impl StopSignals {
+    fn watch() -> Self {
+        Self
+    }
+
+    async fn first(&mut self) -> (Stop, &'static str) {
+        if tokio::signal::ctrl_c().await.is_err() {
+            std::future::pending::<()>().await;
+        }
+        (Stop::Graceful, "Ctrl+C")
     }
 }
 
@@ -574,6 +998,17 @@ fn set_custom_bounds(p: &mut Value, start: Option<&str>, end: Option<&str>) {
 
 #[cfg(test)]
 mod format_tests {
+    /// `nohup` starts the server with SIGHUP ignored; Linux shows that in `SigIgn` (bit 0).
+    #[cfg(unix)]
+    #[test]
+    fn sighup_is_read_from_the_ignored_mask() {
+        assert!(super::sighup_in_mask("Name:\tfilmcraft-cli\nSigIgn:\t0000000000000001\nSigCgt:\t0000000000004002\n"));
+        assert!(super::sighup_in_mask("SigIgn:\t0000000000381001\n"));
+        assert!(!super::sighup_in_mask("SigIgn:\t0000000000001000\n"));
+        assert!(!super::sighup_in_mask("SigIgn:\tnot hex\n"));
+        assert!(!super::sighup_in_mask(""));
+    }
+
     #[test]
     fn render_reports_the_real_reason() {
         let mut s = filmcraft_engine::Session::default();

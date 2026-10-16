@@ -492,13 +492,19 @@ pub fn portable_data_dir(exe_dir: &Path) -> Option<PathBuf> {
 /// macOS `~/Library/Application Support/FilmCraft`, Windows `%APPDATA%\FilmCraft`,
 /// elsewhere `$XDG_DATA_HOME/filmcraft` or `~/.local/share/filmcraft`.
 pub fn default_data_dir() -> Option<PathBuf> {
-    let env = |k: &str| std::env::var_os(k).filter(|v| !v.is_empty()).map(PathBuf::from);
-    if let Some(d) = env("FILMCRAFT_DATA_DIR") {
-        return Some(d);
+    if let Some(d) = std::env::var_os("FILMCRAFT_DATA_DIR").filter(|v| !v.is_empty()) {
+        return Some(PathBuf::from(d));
     }
     if let Some(d) = std::env::current_exe().ok().and_then(|exe| exe.parent().and_then(portable_data_dir)) {
         return Some(d);
     }
+    per_user_data_dir()
+}
+
+/// The per-user data directory, whatever `FILMCRAFT_DATA_DIR` or a portable install says (see
+/// [`default_data_dir`]): where any FilmCraft run by this user looks when neither applies.
+pub fn per_user_data_dir() -> Option<PathBuf> {
+    let env = |k: &str| std::env::var_os(k).filter(|v| !v.is_empty()).map(PathBuf::from);
     if cfg!(target_os = "macos") {
         return env("HOME").map(|h| h.join("Library/Application Support/FilmCraft"));
     }
