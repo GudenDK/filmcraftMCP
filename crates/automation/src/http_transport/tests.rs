@@ -1822,6 +1822,70 @@ async fn a_batch_export_that_waits_is_a_long_call() {
     .await;
 }
 
+/// The playhead of the engine behind `mcp`.
+async fn playhead(mcp: &FilmcraftMcp) -> Value {
+    mcp.run("sequence.inspect", json!({})).await.unwrap()["playhead"].clone()
+}
+
+/// A `command_batch` that is cancelled runs no more steps: by `notifications/cancelled`, or by its
+/// session's `DELETE`, also while a step waits for the engine (another call holds it). A batch used
+/// to notice a cancel only in a step that exports with `wait: true`: its other steps (an edit, an
+/// export without `wait`) all ran once the engine was free.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_cancelled_batch_runs_no_more_steps() {
+    within(async {
+        let dir = crate::TestDir::new("http-batch-cancel");
+        let srv = Server::start(demo(), HttpOptions::default()).await;
+        let before = playhead(&srv.mcp).await;
+        for by_delete in [false, true] {
+            let (sid, _) = init(srv.addr, &[]).await;
+            let out = dir.join(format!("never-{by_delete}.mp4"));
+            let export = json!({"path": out.to_string_lossy(), "format": "h264", "width": 640, "height": 360, "audio": false});
+            let steps = json!({"steps": [{"id": "playhead.set", "params": {"seconds": 3.0}}, {"id": "file.exportMedia", "params": export}]});
+            // another call holds the engine
+            let session = srv.mcp.headless_session().unwrap();
+            let (release, released) = std::sync::mpsc::channel::<()>();
+            let (locked, is_locked) = tokio::sync::oneshot::channel();
+            let busy = tokio::task::spawn_blocking(move || {
+                let _busy = session.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+                let _ = locked.send(());
+                let _ = released.recv_timeout(Duration::from_secs(30));
+            });
+            is_locked.await.unwrap();
+            let batch = json!({"jsonrpc":"2.0","id":7,"method":"tools/call","params":{"name":"command_batch","arguments":steps}});
+            let r = post(srv.addr, Some(&sid), &[], &batch).await;
+            // it began, and its first step waits for the engine
+            let t0 = std::time::Instant::now();
+            while srv.mcp.long_calls.count() == 0 && t0.elapsed() < Duration::from_secs(10) {
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+            tokio::time::sleep(Duration::from_millis(200)).await;
+            if by_delete {
+                assert_eq!(send(srv.addr, "DELETE", &[("Mcp-Session-Id", &sid)], "").await.status, 202);
+            } else {
+                let c = post(srv.addr, Some(&sid), &[], &json!({"jsonrpc":"2.0","method":"notifications/cancelled","params":{"requestId":7}})).await;
+                assert_eq!(c.status, 202);
+            }
+            tokio::time::sleep(Duration::from_millis(200)).await;
+            let _ = release.send(());
+            busy.await.unwrap();
+            // what it would still run, it runs now that the engine is free
+            let t0 = std::time::Instant::now();
+            while srv.mcp.long_calls.count() > 0 && t0.elapsed() < Duration::from_secs(10) {
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+            tokio::time::sleep(Duration::from_millis(300)).await;
+            assert_eq!(playhead(&srv.mcp).await, before, "the batch's edit ran after the cancel (DELETE: {by_delete})");
+            let jobs = srv.mcp.run("jobs.list", json!({})).await.unwrap();
+            assert_eq!(jobs, json!([]), "the batch's export started after the cancel (DELETE: {by_delete})");
+            assert!(!out.exists());
+            assert_eq!(srv.mcp.long_calls.count(), 0, "the batch ended");
+            drop(r);
+        }
+    })
+    .await;
+}
+
 /// A stop that comes while an export's call waits for the engine (another call holds it, such as
 /// an export that waits in a batch) returns at once: the call starts no export once the engine is
 /// free. The stop used to wait for the engine, as long as its whole grace.

@@ -570,8 +570,10 @@ driven one app can drive the others.
 `command_run {"id": "file.exportMedia", "params": {…, "wait": true}}` in headless mode blocks until
 the file is written. It uses the MCP progress and cancellation utilities, so a client can show
 progress and stop it. A `command_batch` step that exports with `wait: true` runs the same way: its
-result is the same `{job, path, result, offlineMedia}`, the batch's progress token reports on through
-its exports (progress only increases), and a batch that is cancelled runs no more steps.
+result is the same `{job, path, result, offlineMedia}`, and the batch's progress token reports on
+through its exports (progress only increases). A batch that is cancelled (by its client, by its
+session closing, by a stop) runs no more steps, of any kind; a step still waiting for the engine
+(another client's call holds it) is not run either.
 
 - The export runs as the same background job `jobs.list` shows. The session is locked only for short
   polls, so other requests (`ping`, `doc_inspect`, `jobs.list`, …) are answered while it encodes.

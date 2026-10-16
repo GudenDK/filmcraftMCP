@@ -199,8 +199,8 @@ impl LongCalls {
     }
 }
 
-/// One running long call; dropping it ends it.
-struct LongCall {
+/// One running long call (or `command_batch`); dropping it ends it.
+pub(crate) struct LongCall {
     calls: Arc<LongCalls>,
     id: u64,
     /// Cancelled when the server stops or the call's session closes.
@@ -208,6 +208,12 @@ struct LongCall {
 }
 
 impl LongCall {
+    /// Whether the call is cancelled: by its client (`ct`, its request's token), by the server
+    /// stopping or by its session closing.
+    pub(crate) fn cancelled(&self, ct: &CancellationToken) -> bool {
+        ct.is_cancelled() || self.cancel.is_cancelled()
+    }
+
     /// The call's export writes `path`, from `since` on, as `job` (in a headless engine).
     fn writes(&self, path: &str, since: SystemTime, job: Option<&filmcraft_engine::Job>) {
         if let Some(c) = self.calls.lock().calls.get_mut(&self.id) {
@@ -215,8 +221,9 @@ impl LongCall {
         }
     }
 
-    /// The call's export finished and is whole: its file is never deleted.
-    fn kept(&self) {
+    /// The call's export finished and is whole (or is over, for a step of a batch): its file is
+    /// never deleted.
+    pub(crate) fn kept(&self) {
         if let Some(c) = self.calls.lock().calls.get_mut(&self.id) {
             c.output = None;
         }
@@ -316,13 +323,52 @@ const ABANDONED: u8 = 2;
 impl FilmcraftMcp {
     /// [`Self::long_call`] as a tool result.
     pub(crate) async fn run_long(&self, id: &str, params: Value, context: &RequestContext<RoleServer>) -> CallToolResult {
-        match self.long_call(id, params, context, &mut Reporter::new(context)).await {
+        let call = self.begin_long(context);
+        match self.long_call(&call, id, params, context, &mut Reporter::new(context)).await {
             Ok(v) => CallToolResult::success(vec![Content::text(serde_json::to_string_pretty(&v).unwrap_or_default())]),
             Err(e) => CallToolResult::error(vec![Content::text(e.to_string())]),
         }
     }
 
-    /// Run `id` (a [`LONG_COMMANDS`] entry, `wait: true`) as a job, reporting progress through
+    /// Count the request of `context` as a long call (a long export, or a whole `command_batch`)
+    /// while the returned guard lives: a stop, or its session closing, cancels it.
+    pub(crate) fn begin_long(&self, context: &RequestContext<RoleServer>) -> LongCall {
+        self.long_calls.enter(session_of(context))
+    }
+
+    /// A `command_batch` step that is no long call, run as [`Self::run_command_unless`] unless
+    /// `call` (the batch) is cancelled first: while it waits for the engine, which another client's
+    /// call may keep busy, a cancel returns at once, and the engine never runs the step. One that
+    /// comes just as the engine takes the step waits the moment the step takes (see `claim` in
+    /// [`Self::long_call`]).
+    pub(crate) async fn batch_step(&self, call: &LongCall, id: &str, params: Value, context: &RequestContext<RoleServer>) -> Result<Value, LongError> {
+        let claim = Arc::new(AtomicU8::new(WAITING));
+        let cancelled = {
+            let (by_client, by_stop, claim) = (context.ct.clone(), call.cancel.clone(), claim.clone());
+            move || {
+                by_client.is_cancelled() || by_stop.is_cancelled() || claim.compare_exchange(WAITING, STARTING, Ordering::AcqRel, Ordering::Acquire).is_err()
+            }
+        };
+        let run = self.run_command_unless(id, params, cancelled);
+        tokio::pin!(run);
+        let r = tokio::select! {
+            r = &mut run => r,
+            _ = either_cancelled(&context.ct, &call.cancel) => {
+                if claim.compare_exchange(WAITING, ABANDONED, Ordering::AcqRel, Ordering::Acquire).is_ok() {
+                    return Err(LongError::Cancelled);
+                }
+                run.await
+            }
+        };
+        match r {
+            Ok(v) => Ok(v),
+            Err(_) if call.cancelled(&context.ct) => Err(LongError::Cancelled),
+            Err(e) => Err(LongError::Failed(e.to_string())),
+        }
+    }
+
+    /// Run `id` (a [`LONG_COMMANDS`] entry, `wait: true`) as a job, for `call` (from
+    /// [`Self::begin_long`]: this request, or the batch it is a step of), reporting progress through
     /// `rep` and honouring cancellation (by the client, by the server stopping, or by the call's
     /// session closing). The result is a blocking export's: `{job, path, result, offlineMedia}`.
     ///
@@ -331,8 +377,14 @@ impl FilmcraftMcp {
     /// progress notifications this call sends (each would wait until rmcp's 5 s drain for the
     /// session is over), while the export goes on writing. In a headless engine the job is then
     /// stopped through its own handle, without waiting for the engine's lock either.
-    pub(crate) async fn long_call(&self, id: &str, mut params: Value, context: &RequestContext<RoleServer>, rep: &mut Reporter) -> Result<Value, LongError> {
-        let call = self.long_calls.enter(session_of(context));
+    pub(crate) async fn long_call(
+        &self,
+        call: &LongCall,
+        id: &str,
+        mut params: Value,
+        context: &RequestContext<RoleServer>,
+        rep: &mut Reporter,
+    ) -> Result<Value, LongError> {
         let started = SystemTime::now();
         if let Some(p) = params.as_object_mut() {
             p.insert("wait".into(), json!(false));

@@ -357,17 +357,17 @@ impl FilmcraftMcp {
         self.run_unless(id, params, || false).await
     }
 
-    /// [`Self::run`] for a client's command (`command_run`, a `command_batch` step). An export it
-    /// starts in a headless engine without `wait` goes on as a job after the call returns: it is
-    /// registered, so that a stop cancels it and deletes its partial output instead of leaving a
-    /// truncated file when the process exits. (The app's own jobs, in bridge mode, outlive this
-    /// server.)
-    async fn run_command(&self, id: &str, params: Value) -> Result<Value, AutomationError> {
+    /// [`Self::run_unless`] for a client's command (`command_run`, a `command_batch` step). An
+    /// export it starts in a headless engine without `wait` goes on as a job after the call
+    /// returns: it is registered, so that a stop cancels it and deletes its partial output instead
+    /// of leaving a truncated file when the process exits. (The app's own jobs, in bridge mode,
+    /// outlive this server.)
+    pub(crate) async fn run_command_unless(&self, id: &str, params: Value, cancelled: impl Fn() -> bool + Send + 'static) -> Result<Value, AutomationError> {
         if !crate::long_job::LONG_COMMANDS.contains(&id) {
-            return self.run(id, params).await;
+            return self.run_unless(id, params, cancelled).await;
         }
         let since = std::time::SystemTime::now();
-        let (v, job) = self.start_job_unless(id, params, || false).await?;
+        let (v, job) = self.start_job_unless(id, params, cancelled).await?;
         if let (Some(job), Some(path)) = (job, v.get("path").and_then(Value::as_str)) {
             self.long_calls.background(job, path, since);
         }
@@ -492,7 +492,7 @@ impl FilmcraftMcp {
         annotations(read_only_hint = false, destructive_hint = true, idempotent_hint = false, open_world_hint = false)
     )]
     async fn command_run(&self, Parameters(p): Parameters<RunParams>) -> Result<CallToolResult, McpError> {
-        wrap(self.run_command(&p.id, p.params.unwrap_or(json!({}))).await)
+        wrap(self.run_command_unless(&p.id, p.params.unwrap_or(json!({})), || false).await)
     }
 
     #[tool(
@@ -503,17 +503,27 @@ impl FilmcraftMcp {
     async fn command_batch(&self, Parameters(p): Parameters<BatchParams>, context: RequestContext<RoleServer>) -> Result<CallToolResult, McpError> {
         let stop = p.stop_on_error.unwrap_or(true);
         let (mut completed, mut failed, mut results) = (0u32, 0u32, Vec::new());
-        // a step that exports with `wait: true` is a long call, as it is from `command_run`
+        // The whole batch is one long call: cancelled by its client (`notifications/cancelled`, a
+        // 2026-07-28 client closing its stream), by its session closing or by the server stopping,
+        // it runs no more steps, also while a step waits for the engine. A step that exports with
+        // `wait: true` is a long call of its own, as from `command_run`.
+        let call = self.begin_long(&context);
         let mut rep = crate::long_job::Reporter::new(&context);
         for st in p.steps {
             let params = st.params.unwrap_or(json!({}));
-            let (r, cancelled) = if crate::long_job::is_long(&st.id, &params) {
-                let r = self.long_call(&st.id, params, &context, &mut rep).await;
+            let r = if call.cancelled(&context.ct) {
+                Err(LongError::Cancelled)
+            } else if crate::long_job::is_long(&st.id, &params) {
+                let r = self.long_call(&call, &st.id, params, &context, &mut rep).await;
                 rep.next_step();
-                (r.as_ref().map_err(ToString::to_string).cloned(), r == Err(LongError::Cancelled))
+                // the step is over: what it wrote is not the batch's to delete at a stop
+                call.kept();
+                r
             } else {
-                (self.run_command(&st.id, params).await.map_err(|e| e.to_string()), false)
+                self.batch_step(&call, &st.id, params, &context).await
             };
+            let cancelled = matches!(r, Err(LongError::Cancelled));
+            let r = r.map_err(|e| e.to_string());
             match r {
                 Ok(v) => {
                     completed += 1;
