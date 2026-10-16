@@ -115,12 +115,13 @@ off and shutting down. The server says which one it got. The port closes at once
 are cancelled and sessions closed, and exports get time to delete their partial files: 15 s, or
 3 s when Windows is closing the console, logging off or shutting down (it ends the process about
 5 s after telling it). That covers the exports clients started without `wait` (a headless
-`file.exportMedia` that returned `{job, path}`) as well: still running at the stop, they are
-cancelled and their output deleted; finished ones are kept. An export that finished just before the
-stop reached it is kept too, and one still waiting for the engine (another call holds it) gives up
-at once without starting. The output of an export still running at the end is deleted. Other
-engine jobs (the export queue, proxies, …) are not cancelled; they end with the process, so cancel
-a queue export with `jobs.cancel` first if you want its file gone. A second signal quits at once.
+`file.exportMedia` or `export.quick` that returned `{job, path}`) as well: still running at the
+stop, they are cancelled and their output deleted; finished ones are kept. An export that finished
+just before the stop reached it is kept too, and one still waiting for the engine (another call
+holds it) gives up at once without starting. The output of an export still running at the end is
+deleted. Other engine jobs (the export queue, proxies, …) are not cancelled; they end with the
+process, so cancel a queue export with `jobs.cancel` first if you want its file gone. A second
+signal quits at once.
 Stdio mode (`mcp` without `--http`) stops on the same signals. Signals are watched from before the
 first line is printed, so one sent right after it still stops the server cleanly. On Linux a
 server started with `nohup` (SIGHUP ignored) keeps running when its terminal closes; macOS gives no
@@ -569,11 +570,12 @@ driven one app can drive the others.
 
 `command_run {"id": "file.exportMedia", "params": {…, "wait": true}}` in headless mode blocks until
 the file is written. It uses the MCP progress and cancellation utilities, so a client can show
-progress and stop it. A `command_batch` step that exports with `wait: true` runs the same way: its
-result is the same `{job, path, result, offlineMedia}`, and the batch's progress token reports on
-through its exports (progress only increases). A batch that is cancelled (by its client, by its
-session closing, by a stop) runs no more steps, of any kind; a step still waiting for the engine
-(another client's call holds it) is not run either.
+progress and stop it. `export.quick` with `wait: true` runs the same way (its result also names the
+`preset`). A `command_batch` step that exports with `wait: true` runs the same way: its result is the
+same `{job, path, result, offlineMedia}`, and the batch's progress token reports on through its
+exports (progress only increases). A batch that is cancelled (by its client, by its session closing,
+by a stop) runs no more steps, of any kind; a step still waiting for the engine (another client's
+call holds it) is not run either.
 
 - The export runs as the same background job `jobs.list` shows. The session is locked only for short
   polls, so other requests (`ping`, `doc_inspect`, `jobs.list`, …) are answered while it encodes.
@@ -599,6 +601,10 @@ session closing, by a stop) runs no more steps, of any kind; a step still waitin
   with `jobs.cancel` (which leaves the partial file). When the MCP server stops (or a stdio client
   closes its input) while such an export runs, it is cancelled and its partial output deleted.
   Other exports (`file.exportFrame`, interchange formats, …) finish quickly and ignore the token.
+- The export queue is not a long call: `export.queue.start` (and `export.queue.add` or
+  `export.queue.retry` with `start`) with `wait: true` encodes the whole queue holding the engine,
+  so no other client is answered meanwhile and nothing cancels it. Over MCP start the queue without
+  `wait` and poll `export.queue.list`; `export.queue.cancel` stops it.
 - Bridge mode works the same way: the export runs as an app job (the app stays responsive and shows
   "Exporting… NN%" in its status bar) and the call returns when it is written, however long it
   takes. `filmcraft-cli --bridge … exec file.exportMedia … wait=true` blocks the same way.

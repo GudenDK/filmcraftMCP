@@ -1,5 +1,6 @@
-//! Long exports over MCP (docs/agents.md § Long exports): `file.exportMedia` with `wait: true`,
-//! from `command_run` or a `command_batch` step, runs as a background engine job; the server
+//! Long exports over MCP (docs/agents.md § Long exports): `file.exportMedia` or `export.quick`
+//! with `wait: true`, from `command_run` or a `command_batch` step, runs as a background engine
+//! job; the server
 //! reports its progress as MCP `notifications/progress` (when the request carried a
 //! `progressToken`) and stops it on `notifications/cancelled`, deleting the partial output. The
 //! session lock is only held for short polls, so other requests are answered while the export
@@ -19,8 +20,9 @@ use tokio_util::sync::CancellationToken;
 
 use crate::server::FilmcraftMcp;
 
-/// Engine commands that block until a render is written when called with `wait: true`.
-pub const LONG_COMMANDS: &[&str] = &["file.exportMedia"];
+/// Engine commands that block until a render is written when called with `wait: true`, and that
+/// return `{job, path, ...}` at once without it (their export goes on as a job).
+pub const LONG_COMMANDS: &[&str] = &["file.exportMedia", "export.quick"];
 
 /// How often the job is polled (and at most how often progress is reported).
 const POLL: Duration = Duration::from_millis(100);

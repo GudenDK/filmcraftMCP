@@ -1718,7 +1718,7 @@ async fn ending_a_session_cancels_its_export() {
 /// `{job, path}` at once) run on as jobs of the engine. A stop cancels those still running and
 /// deletes their partial output, as it does a waiting export's; one that finished before is kept.
 /// They used to go on encoding until the process exited, leaving a truncated file under the name
-/// the client asked for.
+/// the client asked for. `export.quick` too: it was not counted as an export at all.
 #[tokio::test(flavor = "multi_thread")]
 async fn a_stop_cancels_exports_started_without_wait() {
     within(async {
@@ -1745,18 +1745,21 @@ async fn a_stop_cancels_exports_started_without_wait() {
         let steps = json!({"steps": [{"id": "file.exportMedia", "params": params(&b, 30.0)}]});
         let r = tool_json(&call(srv.addr, &sid, 3, "command_batch", steps).await);
         assert_eq!(r["completed"], 1, "{r}");
-        while !(a.exists() && b.exists()) {
+        let q = dir.join("quick.mp4");
+        let r = tool_json(&call(srv.addr, &sid, 4, "command_run", json!({"id": "export.quick", "params": params(&q, 30.0)})).await);
+        assert!(r["job"].as_u64().is_some() && r["path"] == json!(q.to_string_lossy()), "{r}");
+        while !(a.exists() && b.exists() && q.exists()) {
             assert!(t0.elapsed() < Duration::from_secs(30), "both exports wrote");
             tokio::time::sleep(Duration::from_millis(20)).await;
         }
         let _ = srv.stop.take().unwrap().send(Stop::Graceful);
         let done = tokio::time::timeout(Duration::from_secs(20), &mut srv.done).await.expect("stopped").unwrap();
         assert!(done.is_ok(), "{done:?}");
-        assert!(!a.exists() && !b.exists(), "the partial exports are deleted");
+        assert!(!a.exists() && !b.exists() && !q.exists(), "the partial exports are deleted");
         assert!(whole.exists(), "a finished export is kept");
         let jobs = srv.mcp.run("jobs.list", json!({})).await.unwrap();
         let errors: Vec<Value> = jobs.as_array().unwrap().iter().map(|j| j["result"]["error"].clone()).collect();
-        assert_eq!(errors, [Value::Null, json!("cancelled"), json!("cancelled")], "{jobs}");
+        assert_eq!(errors, [Value::Null, json!("cancelled"), json!("cancelled"), json!("cancelled")], "{jobs}");
     })
     .await;
 }
@@ -1818,6 +1821,59 @@ async fn a_batch_export_that_waits_is_a_long_call() {
         let errors: Vec<Value> = jobs.as_array().unwrap().iter().map(|j| j["result"]["error"].clone()).collect();
         assert_eq!(errors, [Value::Null, Value::Null, json!("cancelled")], "{jobs}");
         drop(r);
+    })
+    .await;
+}
+
+/// `export.quick` exports as `file.exportMedia` does, and is a long call as that is: with `wait:
+/// true`, from `command_run` or a batch step, it reports progress, leaves the engine free for
+/// other calls, and a cancel or a stop deletes its partial file. It used to run the whole encode
+/// holding the engine (no other client was answered), with no progress, uncancellable, and a stop
+/// left its truncated file under the name asked for.
+#[tokio::test(flavor = "multi_thread")]
+async fn export_quick_that_waits_is_a_long_call() {
+    within(async {
+        let dir = crate::TestDir::new("http-quick");
+        let mut srv = Server::start(demo(), HttpOptions::default()).await;
+        let (sid, _) = init(srv.addr, &[]).await;
+        let quick = |path: &std::path::Path, seconds: f64| {
+            json!({"path": path.to_string_lossy(), "format": "h264", "width": 640, "height": 360, "audio": false, "range": "custom", "startSeconds": 0, "endSeconds": seconds, "wait": true})
+        };
+        // a whole one: a blocking export's result
+        let short = dir.join("short.mp4");
+        let r = tool_json(&call(srv.addr, &sid, 1, "command_run", json!({"id": "export.quick", "params": quick(&short, 0.25)})).await);
+        assert!(r["result"]["frames"].as_u64().is_some_and(|f| f > 0) && r["offlineMedia"].is_array() && r["preset"].is_string(), "{r}");
+        assert!(short.exists());
+        // from command_run: progress, the engine free meanwhile, and a cancel deletes the partial file
+        let a = dir.join("a.mp4");
+        let run = json!({"id": "export.quick", "params": quick(&a, 30.0)});
+        let msg = json!({"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"command_run","arguments":run,"_meta":{"progressToken":"q"}}});
+        let mut r = post(srv.addr, Some(&sid), &[], &msg).await;
+        first_progress(&mut r, 2).await;
+        let t = std::time::Instant::now();
+        let jobs = tool_json(&call(srv.addr, &sid, 3, "command_run", json!({"id": "jobs.list"})).await);
+        assert!(t.elapsed() < Duration::from_secs(10), "the engine was busy for {:?}", t.elapsed());
+        assert_eq!(jobs.as_array().and_then(|a| a.last()).map(|j| j["finished"].clone()), Some(json!(false)), "{jobs}");
+        let c = post(srv.addr, Some(&sid), &[], &json!({"jsonrpc":"2.0","method":"notifications/cancelled","params":{"requestId":2}})).await;
+        assert_eq!(c.status, 202);
+        wait_gone(&a).await;
+        // a batch step: a stop cancels it and deletes its partial file
+        let b = dir.join("b.mp4");
+        let steps = json!({"steps": [{"id": "export.quick", "params": quick(&b, 30.0)}]});
+        let msg = json!({"jsonrpc":"2.0","id":4,"method":"tools/call","params":{"name":"command_batch","arguments":steps,"_meta":{"progressToken":"qb"}}});
+        let mut rb = post(srv.addr, Some(&sid), &[], &msg).await;
+        first_progress(&mut rb, 4).await;
+        let job = job_handle(&srv.mcp, 2);
+        let _ = srv.stop.take().unwrap().send(Stop::Graceful);
+        told_to_stop_within(&job, Duration::from_secs(2)).await;
+        let stopped = tokio::time::timeout(Duration::from_secs(20), &mut srv.done).await.expect("stopped").unwrap();
+        assert!(stopped.is_ok(), "{stopped:?}");
+        assert!(!b.exists(), "the partial export is deleted");
+        assert!(short.exists(), "the finished one is kept");
+        let jobs = srv.mcp.run("jobs.list", json!({})).await.unwrap();
+        let errors: Vec<Value> = jobs.as_array().unwrap().iter().map(|j| j["result"]["error"].clone()).collect();
+        assert_eq!(errors, [Value::Null, json!("cancelled"), json!("cancelled")], "{jobs}");
+        drop((r, rb));
     })
     .await;
 }
