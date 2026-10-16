@@ -1518,13 +1518,24 @@ mod tests {
     /// <token>`: for a stored token in a folder with quotes (straight and typographic), `[ ]`, `$`,
     /// a backtick and spaces in its name, for token files as PowerShell, cmd.exe and Notepad write
     /// them, and from the variable. Runs Windows PowerShell 5.1 on Windows, PowerShell 7 (`pwsh`)
-    /// elsewhere when it is installed; skipped when there is neither.
+    /// elsewhere when it is installed; skipped when there is neither. PowerShell's caches and module
+    /// folders go in the test's folder: on Linux and macOS `pwsh` wrote them in the real home
+    /// (`~/.cache/powershell`, `~/.local/share/powershell`). (.NET keeps its own `/tmp/.dotnet`.)
     #[test]
     fn the_header_to_paste_works_in_powershell() {
-        let runs =
-            |p: &str| std::process::Command::new(p).args(["-NoProfile", "-NonInteractive", "-Command", "exit 0"]).output().is_ok_and(|o| o.status.success());
-        let Some(ps) = ["powershell", "pwsh"].into_iter().find(|p| runs(p)) else { return };
         let tmp = TempDir::new("powershell");
+        let shell = |p: &str| {
+            let mut c = std::process::Command::new(p);
+            c.env("HOME", &tmp.0)
+                .env("XDG_CACHE_HOME", tmp.0.join("cache"))
+                .env("XDG_DATA_HOME", tmp.0.join("data"))
+                .env("XDG_CONFIG_HOME", tmp.0.join("config"))
+                .env("POWERSHELL_TELEMETRY_OPTOUT", "1")
+                .env("POWERSHELL_UPDATECHECK", "Off");
+            c
+        };
+        let runs = |p: &str| shell(p).args(["-NoProfile", "-NonInteractive", "-Command", "exit 0"]).output().is_ok_and(|o| o.status.success());
+        let Some(ps) = ["powershell", "pwsh"].into_iter().find(|p| runs(p)) else { return };
         let dir = tmp.0.join("it's a $HOME `dir` [beta] O\u{2019}Brien");
         let path = dir.join(STORED_FILE);
         let token = load_or_create(&path).unwrap().token;
@@ -1553,12 +1564,8 @@ mod tests {
         // it as UTF-8 (the typographic quote); `-Command -` would echo terminal escapes in pwsh
         let ps1 = tmp.0.join("headers.ps1");
         std::fs::write(&ps1, [&[0xEF, 0xBB, 0xBF][..], script.as_bytes()].concat()).unwrap();
-        let out = std::process::Command::new(ps)
-            .args(["-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass", "-File"])
-            .arg(&ps1)
-            .env(TOKEN_ENV, "from-env")
-            .output()
-            .unwrap();
+        let out =
+            shell(ps).args(["-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass", "-File"]).arg(&ps1).env(TOKEN_ENV, "from-env").output().unwrap();
         let got: Vec<String> = String::from_utf8_lossy(&out.stdout).lines().map(str::to_string).collect();
         let want: Vec<String> = sources.iter().map(|(_, t)| format!("Authorization: Bearer {t}")).collect();
         assert_eq!(got, want, "{script}\nstderr: {}", String::from_utf8_lossy(&out.stderr));
