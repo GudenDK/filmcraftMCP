@@ -161,7 +161,28 @@ Ctrl), `Ctrl` (macOS ⌃), `Alt`, `Shift`. The dialog (Edit ▸ Keyboard Shortcu
 
 ## MCP
 `filmcraft-cli mcp` serves MCP on stdio: headless (in-process session; `--demo` / `--project p.fcproj`)
-or `--bridge 127.0.0.1:9876` to drive the running app. Tools: `command_list`, `command_run`,
+or `--bridge 127.0.0.1:9876` to drive the running app. With `--http 127.0.0.1:9877` it serves MCP
+over Streamable HTTP at `http://127.0.0.1:9877/mcp` instead, for any number of clients that share
+the one backend. Unlike this control channel, that endpoint requires a bearer token on every
+request, on loopback too (401 without it; 429 for wrong tokens for a while after 10 of them): it
+is `FILMCRAFT_MCP_TOKEN`, else the first line of `--token-file`, else a random 64-hex-digit token
+the server stores as `mcp-token` in the data directory on first use (`filmcraft-cli mcp-token`
+prints it, `--new` replaces it, `--path` says where it is). The server prints where it is, never
+the token, and the line to register it:
+`claude mcp add --transport http --scope user filmcraft-http http://127.0.0.1:9877/mcp --header "Authorization: Bearer $(cat '<path>/mcp-token')"`
+(on Windows, for PowerShell: `$((Get-Content -LiteralPath '<path>\mcp-token' -TotalCount 1).Trim())`).
+`--no-token` turns it off, on a loopback address only and not with `--allow-host` or with an
+`--allow-origin` that is `null` or another machine's. A non-loopback address, an `--allow-host`
+name that is not this machine (a tunnel or proxy), `--allow-origin null` and requests relayed by a
+proxy or tunnel (they carry forwarding headers such as `X-Forwarded-For` or `Via`; 403 otherwise)
+need a token of 32+ characters, which the stored one is. Since it speaks
+HTTP, a web page can address it too: it checks `Host` and `Origin` (a browser's request gets 403
+unless its origin is listed with `--allow-origin`, which also turns on CORS for it). It caps connections
+per address and in all (closing ones that never sent a valid request to make room), times out slow
+clients, closes idle sessions and logs what it refuses. Those checks guard
+only the HTTP endpoint: in bridge mode this control channel stays as it is, without
+authentication, so any local process can still drive the app through `--control` directly.
+Details: [agents.md § HTTP transport](agents.md#http-transport). Tools: `command_list`, `command_run`,
 `command_batch`, `doc_inspect`, `render_preview`, `project_inspect`, `sequence_inspect`, `media_import`,
 `render_frame`, `ui_inspect`, `ui_elements`, `ui_click`, `ui_drag`, `ui_key`, `ui_type`, `ui_screenshot`,
 `ui_control`; resources `filmcraft://document` and `filmcraft://commands`. `.mcp.json` registers both.

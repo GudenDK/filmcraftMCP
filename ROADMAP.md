@@ -5,7 +5,7 @@
 
 **Stage: alpha** · next: beta, ~19 points of ready-for-real-work and ~400–700 h away, plus opening Premiere's `.prproj` ([why](docs/target-app-parity.md#stage); passes the [core-workflow gate](docs/roadmap.md#alpha-gate))
 
-> **Last reviewed:** 2026-10-10 · **Last updated:** 2026-10-11 · **Change:** minor (language table: German ships the menus, #630) · **Target:** Adobe Premiere Pro 2026 (26.5.2)
+> **Last reviewed:** 2026-10-10 · **Last updated:** 2026-10-16 · **Change:** trivial (progress log: MCP over Streamable HTTP) · **Target:** Adobe Premiere Pro 2026 (26.5.2)
 
 Progress toward parity with Adobe Premiere Pro. This page is the summary; the detail is in
 [docs/target-app-parity.md](docs/target-app-parity.md) (assessment, methodology, calibration),
@@ -107,6 +107,7 @@ Ranked; detail and "done when" in [docs/roadmap.md](docs/roadmap.md) and [docs/g
 
 ## Progress log
 
+- **2026-10-16:** MCP over Streamable HTTP: `filmcraft-cli mcp --http 127.0.0.1:PORT` serves the same tools and resources at `http://127.0.0.1:PORT/mcp` as one long-running server that any number of clients connect to by URL and share (headless, or `--bridge` to the live app). A bearer token is required by default, on loopback too: a random one stored per user in the data directory (`filmcraft-cli mcp-token` prints it, `--new` replaces it), or `FILMCRAFT_MCP_TOKEN` / `--token-file`; `--no-token` is loopback-only. `Host`, `Origin` and proxy-header checks, opt-in CORS (`--allow-origin`), connection, session, body and wrong-token limits; long exports report progress on the call's SSE stream and stop and delete their partial file when cancelled or when the server stops ([agents.md § HTTP transport](docs/agents.md#http-transport)). Beyond Premiere; no change to the parity numbers.
 - **2026-10-12:** Transform's motion-blur shutter on adjustment layers uses the sequence frame rate instead of 24 fps, so a 360° shutter in a 60 fps sequence spans one frame, not 2.5 (#1088)
 - **2026-10-10 (changed media):** Settings ▸ Media ▸ Automatically refresh growing files works: media files that change on disk while the project is open (a recording still being written, a render written over the file a clip uses) are read again every *Refresh growing files every* seconds and as soon as the window comes back to the front: the new length, picture and identity, without an undo step (`media.refreshChanged`, `media_watch`).
 - **2026-10-10 (re-measure):** full parity re-measure against Premiere Pro 26.5.2: menu label diff 338 / 366 (92%), installed bundle listings (10 UI languages, exporter and codec frameworks), 188 open issues. Breadth ~86% (file formats now counted), ready ~55%, stage **alpha**; progress docs reorganized per the craftrules standard ([target-app-parity](docs/target-app-parity.md), [gaps](docs/gaps.md), [roadmap](docs/roadmap.md), [codec](docs/codec-parity.md), [file-format](docs/file-format-parity.md), [hardware](docs/hardware-parity.md), [UI](docs/ui-parity.md), [localization](docs/localization-parity.md)).
@@ -166,6 +167,7 @@ Ranked; detail and "done when" in [docs/roadmap.md](docs/roadmap.md) and [docs/g
 
 | Date | Change | Summary |
 |---|---|---|
+| 2026-10-16 | trivial | Progress log: MCP over Streamable HTTP (`filmcraft-cli mcp --http`, `mcp-token`) |
 | 2026-10-12 | trivial | Progress log: Transform shutter on adjustment layers (#1088) |
 | 2026-10-11 | minor | Language table: German ships the menus (#630, 10.6%) |
 | 2026-10-10 | minor | Readiness-by-audience table with hours to ~95% per audience |
